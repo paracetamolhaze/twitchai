@@ -101,7 +101,7 @@ Access token не бывает бессрочным. Backend обновляет 
 
 ## PostgreSQL и миграции
 
-`migrations/001_initial.sql` создаёт таблицы персон, метаданных ботов, ReactionMemory, истории сообщений, событий стрима, runtime settings и usage snapshots. `migrations/002_twitch_oauth.sql` добавляет зашифрованное хранилище refreshable Twitch credentials; открытые токены в таблицу не записываются.
+`migrations/001_initial.sql` создаёт таблицы персон, метаданных ботов, ReactionMemory, истории сообщений, событий стрима, runtime settings и usage snapshots. `migrations/002_twitch_oauth.sql` добавляет зашифрованное хранилище обновляемых учётных данных Twitch; открытые токены в таблицу не записываются. `migrations/003_twitch_oauth_credential_version.sql` добавляет версию записи, чтобы устаревший экземпляр Railway не мог затереть результат успешного обновления токена.
 
 ```powershell
 $env:DATABASE_URL='postgresql://...'
