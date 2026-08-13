@@ -19,10 +19,21 @@ class FakeClient extends EventEmitter {
 }
 
 describe('TwitchBotManager isolation', () => {
-  async function setup(accounts: Array<{ username: string; oauthToken: string; enabled: boolean }>) {
+  async function setup(
+    accounts: Array<{ username: string; oauthToken: string; enabled: boolean }>,
+    storedPersonaId?: string,
+    storedEnabled?: boolean,
+  ) {
     const repository = new MemoryRepository();
     const personas = new PersonaStore(repository);
     await personas.initialize();
+    if (storedPersonaId && accounts[0]) {
+      await repository.upsertBot({
+        username: accounts[0].username, personaId: storedPersonaId,
+        enabled: storedEnabled ?? accounts[0].enabled,
+        connectionState: 'DISCONNECTED', chatConnected: false, messagesSent: 0,
+      });
+    }
     const clients = new Map<string, FakeClient>();
     const validator: TwitchTokenValidator = {
       async validate(token) {
@@ -50,8 +61,9 @@ describe('TwitchBotManager isolation', () => {
     const { manager } = await setup([
       { username: 'good', oauthToken: 'good', enabled: true },
       { username: 'broken', oauthToken: 'bad', enabled: true },
-    ]);
+    ], 'persona-that-no-longer-exists');
     expect(manager.listStatuses().find((bot) => bot.username === 'good')?.connectionState).toBe('CONNECTED');
+    expect(manager.listStatuses().find((bot) => bot.username === 'good')?.personaId).toBe('analyst');
     expect(manager.listStatuses().find((bot) => bot.username === 'broken')?.connectionState).toBe('ERROR');
     await manager.stop();
   });
@@ -72,6 +84,20 @@ describe('TwitchBotManager isolation', () => {
     const { manager } = await setup([{ username: 'disabled', oauthToken: 'disabled', enabled: false }]);
     expect(manager.listStatuses()[0]?.connectionState).toBe('DISABLED');
     expect(await manager.send('disabled', 'hello')).toBe(false);
+    await manager.stop();
+  });
+
+  it('does not let stale persisted state re-enable a config-disabled account', async () => {
+    const { manager } = await setup(
+      [{ username: 'legacy', oauthToken: 'legacy', enabled: false }],
+      'analyst',
+      true,
+    );
+    expect(manager.listStatuses()[0]).toMatchObject({
+      enabled: false,
+      connectionState: 'DISABLED',
+      chatConnected: false,
+    });
     await manager.stop();
   });
 });

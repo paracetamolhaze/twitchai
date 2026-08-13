@@ -19,6 +19,8 @@ export class PersonaStore {
 
   list(): BotPersona[] { return [...this.personas.values()].map((persona) => structuredClone(persona)); }
 
+  has(id: string): boolean { return this.personas.has(id); }
+
   get(id: string, fallbackIndex = 0): BotPersona {
     return structuredClone(this.personas.get(id) ?? personaForIndex(fallbackIndex));
   }

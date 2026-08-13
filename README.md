@@ -120,6 +120,14 @@ npm run db:import:legacy -- C:\path\to\config-channel.json
 
 Старый `markov-data.json` остаётся архивом и не импортируется в production: цепочки Markov не содержат надёжной связи `событие → реальные реакции` и возвращать их в генерацию нельзя. Новая `ReactionMemory` начинает собирать корректные пары автоматически. Если старый файл находился только на эфемерном Railway filesystem и уже исчез после redeploy, восстановить его технически невозможно; проверьте вкладки Volumes/Backups старого проекта до удаления.
 
+Если аккаунты экспортированы в локальный `twitchaccs.txt`, файл уже исключён через `.gitignore`. Безопасный импорт выполняется командой:
+
+```powershell
+npm run railway:import:twitch-accounts -- twitchaccs.txt
+```
+
+Скрипт распознаёт явно помеченные `oauth:`/`token:` значения и bare-token только в последней строке известного трёхстрочного legacy-блока. Затем он отправляет access token в официальный Twitch `/oauth2/validate`, получает настоящий login и загружает в Railway только `BOTn_USERNAME`, `BOTn_OAUTH_TOKEN`, persona и enabled-state. Неиспользуемые `BOTn_*` слоты очищаются. Email и password не отправляются и не загружаются. Аккаунты без текущих IRC scopes `chat:read` + `chat:edit` импортируются выключенными до повторной OAuth-авторизации. Подключение к Twitch IRC означает участие в чате; оно не имитирует просмотр видеопотока и не гарантирует увеличение `viewer_count`.
+
 ## Railway: backend
 
 1. Создайте service из этого репозитория и подключите PostgreSQL.

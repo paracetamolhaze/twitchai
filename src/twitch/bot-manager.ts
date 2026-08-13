@@ -58,16 +58,26 @@ export class TwitchBotManager extends EventEmitter {
 
   async initialize(): Promise<void> {
     const stored = new Map((await this.options.repository.listBots()).map((bot) => [bot.username, bot]));
-    for (const bot of this.bots.values()) {
+    for (const [index, bot] of [...this.bots.values()].entries()) {
+      const configuredPersonaId = this.options.personas.get(bot.config.personaId, index).id;
       const previous = stored.get(bot.config.username);
-      if (!previous) continue;
-      bot.config.enabled = previous.enabled;
-      bot.config.personaId = previous.personaId || bot.config.personaId;
+      if (!previous) {
+        bot.config.personaId = configuredPersonaId;
+        bot.status.personaId = configuredPersonaId;
+        continue;
+      }
+      // Environment configuration is the safety ceiling: an account imported as
+      // ineligible (for example, because its token lacks modern chat scopes)
+      // must not be re-enabled by stale persisted dashboard state.
+      bot.config.enabled = bot.config.enabled && previous.enabled;
+      bot.config.personaId = this.options.personas.has(previous.personaId)
+        ? previous.personaId
+        : configuredPersonaId;
       bot.status = {
         ...bot.status,
         personaId: bot.config.personaId,
-        enabled: previous.enabled,
-        connectionState: previous.enabled ? 'DISCONNECTED' : 'DISABLED',
+        enabled: bot.config.enabled,
+        connectionState: bot.config.enabled ? 'DISCONNECTED' : 'DISABLED',
         messagesSent: previous.messagesSent,
         ...(previous.lastMessage ? { lastMessage: previous.lastMessage } : {}),
         ...(previous.lastReactionAt ? { lastReactionAt: previous.lastReactionAt } : {}),
