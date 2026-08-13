@@ -1,897 +1,443 @@
-<script setup>
-// Learn tab added
-import { ref, reactive, onMounted, computed, h } from 'vue'
-import { 
-  NConfigProvider, NLayout, NLayoutSider, NLayoutContent, NMenu, 
-  NButton, NInput, NList, NListItem, NThing, NAvatar, NTag, 
-  NCard, NGrid, NGridItem, NSpace, NScrollbar, NBadge, NIcon,
-  NSwitch, NInputNumber, NModal, NForm, NFormItem, NSelect, NAlert,
-  NPopover, NTooltip, NProgress, NDivider
-} from 'naive-ui'
-import { 
-  Chatbubbles, People, ColorPalette, Mic, Settings as SettingsIcon,
-  Send, Exit, Refresh, ChevronDown, ChevronUp, Add, Trash
-} from '@vicons/ionicons5'
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { io, Socket } from 'socket.io-client'
 
-const socket = ref(null)
-const activeKey = ref('chat')
-const bots = reactive({})
-const chatMessages = reactive([])
-const personas = reactive({})
-const phrases = reactive({
-  'ахахха': ['ахахха', 'KEKW', 'хахаха', 'лол'],
-  'привет': ['привет!', 'здарова', 'хай!'],
-  'оски': ['оски?', 'Pog', '👀'],
-  'gg': ['GG', 'gg wp', 'красавчик'],
-  'хайп': ["LET'S GO!", 'давай!', '🔥']
+type Page = 'overview' | 'bots' | 'brain' | 'chat' | 'settings'
+type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'DISABLED'
+
+interface BrainStatus {
+  state: ConnectionState
+  mediaConnected: boolean
+  geminiConnected: boolean
+  lastEventAt?: number
+  lastError?: string
+}
+interface Overview {
+  channel: string
+  category: string
+  isLive: boolean
+  twitchConnected: boolean
+  streamBrain: BrainStatus
+  activeBots: number
+  totalBots: number
+  uptimeSeconds: number
+}
+interface Bot {
+  username: string
+  personaId: string
+  enabled: boolean
+  connectionState: ConnectionState
+  chatConnected: boolean
+  messagesSent: number
+  lastMessage?: string
+  lastReactionAt?: number
+  lastError?: string
+}
+interface StreamEvent {
+  id: string
+  timestamp: number
+  type: string
+  summary: string
+  speech?: string
+  visualContext?: string
+  gameContext?: string
+  category?: string
+  importance: number
+  confidence: number
+  source: 'gemini-live' | 'chat' | 'fallback-transcription'
+  directMentions: string[]
+}
+interface ChatMessage {
+  id: string
+  timestamp: number
+  username: string
+  displayName: string
+  message: string
+  kind: 'viewer' | 'bot' | 'system'
+}
+interface Usage {
+  uptimeSeconds: number
+  streamMinutes: number
+  audioMinutes: number
+  videoMinutes: number
+  geminiReconnects: number
+  geminiInputTokens: number
+  geminiOutputTokens: number
+  generatedResponses: number
+  skippedResponses: number
+}
+interface Persona {
+  id: string
+  name: string
+  description: string
+  styleInstructions: string
+  verbosity: { minWords: number; maxWords: number }
+  reactionProbability: number
+  uppercaseProbability: number
+  questionProbability: number
+  emojiProbability: number
+  slangLevel: number
+  sarcasmLevel: number
+  toxicityLimit: number
+  interests: string[]
+  temperature: number
+  minimumIntervalMs: number
+}
+
+const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3000').replace(/\/$/, '')
+const activePage = ref<Page>('overview')
+const authToken = ref(sessionStorage.getItem('dashboardToken') || '')
+const draftToken = ref('')
+const authenticated = ref(Boolean(authToken.value))
+const backendOnline = ref(false)
+const realtimeOnline = ref(false)
+const loading = ref(false)
+const errorMessage = ref('')
+const saveMessage = ref('')
+const overview = reactive<Overview>({
+  channel: '', category: '', isLive: false, twitchConnected: false,
+  streamBrain: { state: 'DISCONNECTED', mediaConnected: false, geminiConnected: false },
+  activeBots: 0, totalBots: 0, uptimeSeconds: 0,
 })
-const botsPerTranscript = ref(2)
-const totalBots = ref(0)
-const presenceCount = ref(0)
-const channelName = ref('')
-const streamLive = ref(false)
-const streamViewers = ref(0)
-const streamGame = ref('')
-const uptime = ref('00:00:00')
-const startTime = ref(null)
-const errorsList = reactive([])
-const sendMode = ref('selected')
-const selectedBots = reactive(new Set())
-const manualMessage = ref('')
-const replyingTo = ref(null)
-const currentTranscript = ref('')
-const transcriptHistory = reactive([])
-const learning = ref(false)
-const learnStats = reactive({ messages: 0, words: 0 })
-const learnLogs = reactive([])
+const usage = reactive<Usage>({
+  uptimeSeconds: 0, streamMinutes: 0, audioMinutes: 0, videoMinutes: 0,
+  geminiReconnects: 0, geminiInputTokens: 0, geminiOutputTokens: 0,
+  generatedResponses: 0, skippedResponses: 0,
+})
+const bots = ref<Bot[]>([])
+const events = ref<StreamEvent[]>([])
+const chat = ref<ChatMessage[]>([])
+const personas = ref<Persona[]>([])
+const settings = reactive({ channel: '', streamContext: '', visionFps: 1, eventThreshold: 0.45 })
+let socket: Socket | undefined
+let pollTimer: number | undefined
 
-function startLearning() {
-  learning.value = true
-  learnStats.messages = 0
-  learnStats.words = 0
-  learnLogs.length = 0
-  learnLogs.push('Запуск обучения...')
-  socket.value.emit('learn:start')
-}
+const pages: Array<{ id: Page; label: string; glyph: string }> = [
+  { id: 'overview', label: 'Overview', glyph: '◫' },
+  { id: 'bots', label: 'Bots', glyph: '◎' },
+  { id: 'brain', label: 'Stream Brain', glyph: '◇' },
+  { id: 'chat', label: 'Chat', glyph: '≡' },
+  { id: 'settings', label: 'Settings', glyph: '⚙' },
+]
 
-function stopLearning() {
-  learning.value = false
-  socket.value.emit('learn:stop')
-  learnLogs.push('Обучение остановлено')
-}
+const timeline = computed(() => [
+  ...events.value.map((event) => ({
+    id: `event-${event.id}`, timestamp: event.timestamp, kind: 'event' as const,
+    title: event.summary, meta: `${event.type} · importance ${event.importance.toFixed(2)}`,
+    tone: event.importance >= .8 ? 'strong' : event.importance >= .55 ? 'medium' : 'quiet',
+  })),
+  ...chat.value.map((message) => ({
+    id: `chat-${message.id}`, timestamp: message.timestamp, kind: message.kind,
+    title: `${message.displayName}: ${message.message}`, meta: message.kind === 'bot' ? 'bot reaction' : 'Twitch chat',
+    tone: message.kind === 'bot' ? 'bot' : 'quiet',
+  })),
+].sort((a, b) => b.timestamp - a.timestamp).slice(0, 80))
 
-const COLORS = ['#7c3aed', '#2563eb', '#059669', '#d97706', '#dc2626', '#0891b2', '#9333ea', '#c2410c']
-const colorMap = new Map()
-let colorIdx = 0
-
-function getBotColor(name) {
-  if (!colorMap.has(name)) colorMap.set(name, COLORS[colorIdx++ % COLORS.length])
-  return colorMap.get(name)
-}
-
-const menuOptions = computed(() => [
-  { label: 'Чат', key: 'chat', icon: () => h(NIcon, null, { default: () => h(Chatbubbles) }) },
-  { label: 'Аккаунты', key: 'accounts', icon: () => h(NIcon, null, { default: () => h(People) }) },
-  { label: 'Фразы', key: 'phrases', icon: () => h(NIcon, null, { default: () => h(ColorPalette) }) },
-  { label: 'Транскрипция', key: 'transcript', icon: () => h(NIcon, null, { default: () => h(Mic) }) },
-  { label: 'Обучение', key: 'learn', icon: () => h(NIcon, null, { default: () => h(SettingsIcon) }) },
+const healthItems = computed(() => [
+  { label: 'Backend', ok: backendOnline.value, detail: backendOnline.value ? 'API reachable' : 'Unavailable' },
+  { label: 'Twitch chat', ok: overview.twitchConnected, detail: `${overview.activeBots}/${overview.totalBots} bots online` },
+  { label: 'Media pipeline', ok: overview.streamBrain.mediaConnected, detail: overview.streamBrain.mediaConnected ? 'Audio + sampled video' : overview.streamBrain.state },
+  { label: 'Gemini Live', ok: overview.streamBrain.geminiConnected, detail: overview.streamBrain.geminiConnected ? 'Live session connected' : overview.streamBrain.lastError || 'Disconnected' },
 ])
 
-function esc(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+function requestHeaders(extra?: HeadersInit): Headers {
+  const value = new Headers(extra)
+  value.set('Authorization', `Bearer ${authToken.value}`)
+  value.set('Content-Type', 'application/json')
+  return value
 }
 
-function formatUptime() {
-  if (!startTime.value) return '00:00:00'
-  const d = Date.now() - startTime.value
-  const h = String(Math.floor(d / 3600000)).padStart(2, '0')
-  const m = String(Math.floor((d % 3600000) / 60000)).padStart(2, '0')
-  const s = String(Math.floor((d % 60000) / 1000)).padStart(2, '0')
-  return `${h}:${m}:${s}`
+async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(`${API_URL}${path}`, { ...options, headers: requestHeaders(options.headers) })
+  if (response.status === 401 || response.status === 503) {
+    logout()
+    throw new Error(response.status === 503 ? 'На backend не настроен DASHBOARD_TOKEN' : 'Неверный dashboard token')
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ error: `HTTP ${response.status}` })) as { error?: string }
+    throw new Error(body.error || `HTTP ${response.status}`)
+  }
+  return response.json() as Promise<T>
 }
+
+async function loadDashboard(): Promise<void> {
+  if (!authToken.value) return
+  loading.value = true
+  try {
+    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData] = await Promise.all([
+      api<Overview>('/api/overview'), api<Bot[]>('/api/bots'), api<StreamEvent[]>('/api/events?limit=100'),
+      api<ChatMessage[]>('/api/chat'), api<Usage>('/api/usage'), api<Record<string, unknown>>('/api/settings'),
+      api<Persona[]>('/api/personas'),
+    ])
+    Object.assign(overview, overviewData)
+    Object.assign(usage, usageData)
+    bots.value = botData
+    events.value = eventData
+    chat.value = chatData
+    personas.value = personaData
+    settings.channel = String(settingsData.channel || '')
+    settings.streamContext = String(settingsData.streamContext || '')
+    settings.visionFps = Number(settingsData.visionFps || 1)
+    settings.eventThreshold = Number(settingsData.eventThreshold || .45)
+    backendOnline.value = true
+    errorMessage.value = ''
+    connectRealtime()
+  } catch (error) {
+    backendOnline.value = false
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    loading.value = false
+  }
+}
+
+function connectRealtime(): void {
+  socket?.disconnect()
+  socket = io(API_URL, { auth: { token: authToken.value }, transports: ['websocket', 'polling'] })
+  socket.on('connect', () => { realtimeOnline.value = true })
+  socket.on('disconnect', () => { realtimeOnline.value = false })
+  socket.on('connect_error', () => { realtimeOnline.value = false })
+  socket.on('overview', (value: Overview) => Object.assign(overview, value))
+  socket.on('brain', (value: BrainStatus) => { overview.streamBrain = value })
+  socket.on('bots', (value: Bot[]) => { bots.value = value })
+  socket.on('events:init', (value: StreamEvent[]) => { events.value = value })
+  socket.on('event', (value: StreamEvent) => { events.value = [value, ...events.value.filter((item) => item.id !== value.id)].slice(0, 200) })
+  socket.on('chat:init', (value: ChatMessage[]) => { chat.value = value })
+  socket.on('chat', (value: ChatMessage) => { chat.value = [...chat.value.filter((item) => item.id !== value.id), value].slice(-300) })
+}
+
+function login(): void {
+  if (!draftToken.value.trim()) return
+  authToken.value = draftToken.value.trim()
+  sessionStorage.setItem('dashboardToken', authToken.value)
+  authenticated.value = true
+  draftToken.value = ''
+  void loadDashboard()
+}
+
+function logout(): void {
+  sessionStorage.removeItem('dashboardToken')
+  authToken.value = ''
+  authenticated.value = false
+  realtimeOnline.value = false
+  socket?.disconnect()
+}
+
+async function toggleBot(bot: Bot): Promise<void> {
+  try {
+    await api(`/api/bots/${encodeURIComponent(bot.username)}`, { method: 'PATCH', body: JSON.stringify({ enabled: !bot.enabled }) })
+    saveMessage.value = `${bot.username}: ${!bot.enabled ? 'enabled' : 'disabled'}`
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+}
+
+async function saveSettings(): Promise<void> {
+  saveMessage.value = ''
+  try {
+    const result = await api<{ restartRequired: string[] }>('/api/settings', { method: 'PATCH', body: JSON.stringify(settings) })
+    saveMessage.value = result.restartRequired.length
+      ? `Сохранено. Перезапустите backend для: ${result.restartRequired.join(', ')}`
+      : 'Настройки применены'
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+}
+
+async function savePersona(persona: Persona): Promise<void> {
+  try {
+    await api(`/api/personas/${encodeURIComponent(persona.id)}`, { method: 'PUT', body: JSON.stringify(persona) })
+    saveMessage.value = `Persona «${persona.name}» сохранена`
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+}
+
+function formatTime(timestamp?: number): string {
+  return timestamp ? new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(timestamp) : '—'
+}
+function formatDuration(seconds: number): string {
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  return `${hours}h ${minutes}m`
+}
+function stateClass(state: ConnectionState): string { return state.toLowerCase() }
 
 onMounted(() => {
-  const s = io()
-  socket.value = s
-  
-  s.on('connect', () => {
-    console.log('[socket] connected')
-    s.emit('get:config')
-    s.emit('get:personas')
-    s.emit('get:phrases')
-  })
-
-  s.on('config', cfg => {
-    channelName.value = cfg.channel || ''
-    if (cfg.botsPerTranscript) botsPerTranscript.value = cfg.botsPerTranscript
-  })
-
-  s.on('bots:started', d => {
-    totalBots.value = d.bots.length
-    d.bots.forEach(u => {
-      const k = u.toLowerCase()
-      bots[k] = { username: u, state: 'connecting', messages: 0, selected: true }
-      selectedBots.add(k)
-    })
-    if (!startTime.value) {
-      startTime.value = Date.now()
-      setInterval(() => { uptime.value = formatUptime() }, 1000)
-    }
-    addSystemMessage(`✅ ${d.bots.length} ботов запущено`)
-  })
-
-  s.on('bot:status', d => {
-    const k = d.username.toLowerCase()
-    if (bots[k]) {
-      bots[k].state = d.state
-      bots[k].displayState = d.message
-    }
-  })
-
-  s.on('chat:message', d => {
-    addChatMessage(d.username, d.message, d.isBot, d.color, d.displayName)
-  })
-
-  s.on('bot:message', d => {
-    const k = d.username.toLowerCase()
-    if (bots[k]) bots[k].messages = (bots[k].messages || 0) + 1
-  })
-
-  s.on('transcription:new', d => {
-    currentTranscript.value = d.text
-    addSystemMessage(`🎙 Услышал: ${d.text.slice(0, 80)}${d.text.length > 80 ? '...' : ''}`)
-    transcriptHistory.unshift({ text: d.text, timestamp: d.timestamp, responses: [] })
-    if (transcriptHistory.length > 50) transcriptHistory.pop()
-  })
-
-  s.on('transcript:entry', d => {
-    const session = transcriptHistory.find(s => Math.abs(s.timestamp - d.timestamp) < 60000)
-    if (session) session.responses.push({ username: d.username, message: d.message })
-  })
-
-  s.on('presence:update', data => {
-    presenceCount.value = Object.values(data).filter(Boolean).length
-    Object.keys(data).forEach(k => {
-      if (bots[k]) bots[k].presence = data[k]
-    })
-  })
-
-  s.on('presence:active', d => {
-    const k = d.username.toLowerCase()
-    if (bots[k]) bots[k].presence = true
-  })
-
-  s.on('stream:info', d => {
-    streamLive.value = d.live
-    streamGame.value = d.game || ''
-    streamViewers.value = d.viewers != null ? d.viewers : 0
-    // Update bots live status
-    socket.emit('set:live', { live: d.live })
-  })
-
-  s.on('bot:error', d => {
-    errorsList.push({ time: new Date().toTimeString().slice(0, 8), username: d.username, message: d.message })
-    if (errorsList.length > 50) errorsList.shift()
-  })
-
-  s.on('personas:update', data => {
-    Object.assign(personas, data || {})
-  })
-
-  s.on('phrases:update', data => {
-    if (data && Object.keys(data).length) Object.assign(phrases, data)
-  })
-  
-  s.on('learn:status', data => {
-    learning.value = data.running
-    learnStats.messages = data.messages
-    learnStats.words = data.words
-  })
-  
-  s.on('learn:log', msg => {
-    learnLogs.unshift(msg)
-    if (learnLogs.length > 50) learnLogs.pop()
-  })
+  if (authenticated.value) void loadDashboard()
+  pollTimer = window.setInterval(() => {
+    if (!authenticated.value) return
+    void Promise.all([
+      api<Overview>('/api/overview').then((value) => Object.assign(overview, value)),
+      api<Usage>('/api/usage').then((value) => Object.assign(usage, value)),
+    ]).then(() => { backendOnline.value = true }).catch(() => { backendOnline.value = false })
+  }, 15_000)
 })
-
-function addChatMessage(username, text, isBot, color, displayName) {
-  chatMessages.push({
-    username, text, isBot, color: color || getBotColor(username), 
-    displayName: displayName || username, time: Date.now()
-  })
-  if (chatMessages.length > 300) chatMessages.shift()
-}
-
-function addSystemMessage(text) {
-  chatMessages.push({ username: 'system', text, isSystem: true, time: Date.now() })
-  if (chatMessages.length > 300) chatMessages.shift()
-}
-
-function sendManual() {
-  if (!manualMessage.value.trim()) return
-  const targets = getSelectedBots()
-  if (!targets.length) return
-  socket.value.emit('send:manual', { targets, message: manualMessage.value.trim() })
-  manualMessage.value = ''
-}
-
-function sendPhrase(key) {
-  const ph = phrases[key]
-  if (!ph || !ph.length) return
-  const txt = ph[Math.floor(Math.random() * ph.length)]
-  const targets = getSelectedBots()
-  if (!targets.length) return
-  socket.value.emit('send:manual', { targets, message: txt })
-}
-
-function getSelectedBots() {
-  const connected = Object.keys(bots).filter(k => bots[k].state === 'connected')
-  if (!connected.length) return []
-  if (sendMode.value === 'selected') {
-    const selected = connected.filter(k => selectedBots.has(k))
-    return selected.length ? selected : connected
-  }
-  if (sendMode.value === 'random') return [connected[Math.floor(Math.random() * connected.length)]]
-  if (sendMode.value === 'round') {
-    const idx = bots.roundIdx || 0
-    bots.roundIdx = (idx + 1) % connected.length
-    return [connected[idx]]
-  }
-  return connected
-}
-
-function toggleBotSelection(k) {
-  if (selectedBots.has(k)) selectedBots.delete(k)
-  else selectedBots.add(k)
-}
-
-function setBotsPerTranscript(n) {
-  botsPerTranscript.value = n
-  socket.value.emit('set:bots_per_transcript', { n })
-}
-
-// points disabled
-
-const themeOverrides = {
-  common: {
-    primaryColor: '#7c3aed',
-    primaryColorHover: '#9d5cf6',
-    primaryColorPressed: '#6d28d9',
-    borderRadius: '8px',
-    borderRadiusSmall: '6px'
-  },
-  Card: {
-    borderRadius: '10px'
-  },
-  Button: {
-    borderRadiusMedium: '7px'
-  }
-}
+onBeforeUnmount(() => {
+  socket?.disconnect()
+  if (pollTimer) window.clearInterval(pollTimer)
+})
 </script>
 
 <template>
-  <n-config-provider :theme-overrides="themeOverrides">
-    <n-layout class="app-layout" has-sider>
-      <n-layout-sider bordered collapse-mode="width" :collapsed-width="0" :width="220" :collapsed="false" show-trigger="bar">
-        <div class="logo-area">
-          <div class="logo-icon">🤖</div>
-          <span class="logo-text">Boostex</span>
-        </div>
-        <n-menu :collapsed="false" :collapsed-width="0" :collapsed-icon-size="22" :options="menuOptions" v-model:value="activeKey" />
-      </n-layout-sider>
-      
-      <n-layout>
-        <div class="top-bar">
-          <div class="top-info">
-            <n-tag :type="streamLive ? 'success' : 'default'" size="small">
-              {{ streamLive ? 'LIVE' : 'OFFLINE' }}
-            </n-tag>
-            <span class="channel-name">{{ channelName || '—' }}</span>
-            <span class="game-name" v-if="streamGame">· {{ streamGame }}</span>
-          </div>
-          <div class="top-stats">
-            <span class="stat-item">👥 {{ presenceCount }}/{{ totalBots }}</span>
-            <span class="stat-item">👁 {{ streamViewers.toLocaleString() }}</span>
-            <span class="stat-item">⏱ {{ uptime }}</span>
-            <!--points disabled-->
-          </div>
-        </div>
+  <div v-if="!authenticated" class="auth-shell">
+    <form class="auth-card" @submit.prevent="login">
+      <div class="brand-mark">TV</div>
+      <p class="eyebrow">TWITCH AI VIEWERS</p>
+      <h1>Operations dashboard</h1>
+      <p class="muted">Введите <code>DASHBOARD_TOKEN</code>. Он хранится только в sessionStorage этой вкладки.</p>
+      <label>
+        Dashboard token
+        <input v-model="draftToken" type="password" autocomplete="current-password" autofocus placeholder="••••••••••••••••" />
+      </label>
+      <button class="primary wide" type="submit">Connect securely</button>
+      <p v-if="errorMessage" class="notice error">{{ errorMessage }}</p>
+    </form>
+  </div>
 
-        <n-layout class="main-content" has-sider>
-          <n-layout-sider bordered :width="320">
-            <div class="panel-chat">
-              <div class="chat-header">
-                <span>Чат Twitch</span>
-                <n-button-group size="tiny">
-                  <n-button @click="errorsList.length = 0">Очистить</n-button>
-                </n-button-group>
-              </div>
-              <n-scrollbar style="max-height: calc(100vh - 280px)">
-                <div class="chat-messages">
-                  <div v-for="(msg, idx) in chatMessages" :key="idx" 
-                       class="chat-message" :class="{ system: msg.isSystem, bot: msg.isBot }">
-                    <n-avatar v-if="!msg.isSystem" :size="24" :style="{ background: msg.color }">
-                      {{ msg.displayName[0].toUpperCase() }}
-                    </n-avatar>
-                    <div class="msg-content">
-                      <span class="msg-username" :style="{ color: msg.color }">{{ msg.displayName }}</span>
-                      <span class="msg-text">{{ msg.text }}</span>
-                    </div>
-                  </div>
-                  <div v-if="!chatMessages.length" class="empty-chat">
-                    💬 Сообщения появятся здесь
-                  </div>
-                </div>
-              </n-scrollbar>
-              
-              <div class="phrase-bar">
-                <n-button v-for="(plist, key) in phrases" :key="key" size="small" @click="sendPhrase(key)">
-                  {{ key }}
-                </n-button>
-                <n-button size="small" tertiary>+ Фраза</n-button>
-              </div>
-              
-              <div class="chat-input">
-                <n-input v-model:value="manualMessage" placeholder="Написать сообщение..." 
-                         @keydown.enter="sendManual" />
-                <n-button type="primary" @click="sendManual">
-                  <template #icon><n-icon><Send /></n-icon></template>
-                </n-button>
-              </div>
-            </div>
-          </n-layout-sider>
-          
-          <n-layout-content>
-            <div class="content-area">
-              <template v-if="activeKey === 'chat'">
-                <div class="stream-embed">
-                  <iframe v-if="channelName" 
-                    :src="`https://player.twitch.tv/?channel=${channelName}&parent=${window.location.hostname}&muted=false&autoplay=true`"
-                    frameborder="0" allowfullscreen allow="autoplay"></iframe>
-                  <div v-else class="no-stream">Выберите канал в настройках</div>
-                </div>
-              </template>
-              
-              <template v-else-if="activeKey === 'accounts'">
-                <div class="accounts-panel">
-                  <div class="accounts-header">
-                    <n-alert type="info">
-                      👁 <b>Присутствие 100%</b> — каждый бот смотрит стрим как залогиненный пользователь
-                    </n-alert>
-                  </div>
-                  
-                  <div class="bots-config" style="flex-wrap: wrap;">
-                    <span>Отвечают:</span>
-                    <n-button-group size="small">
-                      <n-button v-for="i in 6" :key="i" size="tiny"
-                               :type="botsPerTranscript === i ? 'primary' : 'default'"
-                               @click="setBotsPerTranscript(i)">{{ i }}</n-button>
-                      <n-button size="tiny"
-                               :type="botsPerTranscript === 99 ? 'primary' : 'default'"
-                               @click="setBotsPerTranscript(99)">Все</n-button>
-                    </n-button-group>
-                  </div>
-                  
-                  <n-scrollbar style="max-height: calc(100vh - 320px)">
-                    <n-list hoverable clickable>
-                      <n-list-item v-for="(bot, k) in bots" :key="k">
-                        <n-thing>
-                          <template #header>
-                            <div class="bot-item">
-                              <n-avatar :size="32" :style="{ background: getBotColor(k) }">
-                                {{ bot.username[0].toUpperCase() }}
-                              </n-avatar>
-                              <div class="bot-info">
-                                <span class="bot-name">{{ bot.username }}</span>
-                                <span class="bot-status" :class="bot.state">{{ bot.displayState || bot.state }}</span>
-                                <span class="bot-points" v-if="false">🪙 {{ bot.points }} pts</span>
-                              </div>
-                            </div>
-                          </template>
-                          <template #header-extra>
-                            <div class="bot-actions">
-                              <n-tag :type="bot.state === 'connected' ? 'success' : 'warning'" size="small">
-                                {{ bot.state }}
-                              </n-tag>
-                              <n-button size="small" @click="toggleBotSelection(k)">
-                                {{ selectedBots.has(k) ? '✓' : '○' }}
-                              </n-button>
-                            </div>
-                          </template>
-                        </n-thing>
-                      </n-list-item>
-                    </n-list>
-                  </n-scrollbar>
-                </div>
-              </template>
-              
-              <template v-else-if="activeKey === 'phrases'">
-                <div class="phrases-panel">
-                  <div class="phrases-header">
-                    <n-button type="primary">+ Добавить группу</n-button>
-                    <span class="hint">Сохраняется автоматически</span>
-                  </div>
-                  <n-grid :cols="4" :x-gap="12" :y-gap="12">
-                    <n-grid-item v-for="(plist, key) in phrases" :key="key">
-                      <n-card size="small" :title="key">
-                        <template #header-extra>
-                          <n-button-group size="tiny">
-                            <n-button size="small">✎</n-button>
-                            <n-button size="small">✕</n-button>
-                          </n-button-group>
-                        </template>
-                        <div class="phrase-list">
-                          <div v-for="p in plist" :key="p" class="phrase-item">· {{ p }}</div>
-                        </div>
-                        <n-button block size="small" @click="sendPhrase(key)">Отправить</n-button>
-                      </n-card>
-                    </n-grid-item>
-                  </n-grid>
-                </div>
-              </template>
-              
-              <template v-else-if="activeKey === 'transcript'">
-                <div class="transcript-panel">
-                  <div class="transcript-header">
-                    <n-button @click="socket.emit('get:transcript')">Обновить</n-button>
-                  </div>
-                  <n-scrollbar style="max-height: calc(100vh - 200px)">
-                    <n-card v-for="(sess, idx) in transcriptHistory" :key="idx" size="small" class="transcript-card">
-                      <template #header>
-                        <span class="heard-label">🎙 {{ new Date(sess.timestamp).toTimeString().slice(0, 8) }}</span>
-                      </template>
-                      <div class="heard-text">{{ sess.text }}</div>
-                      <n-divider>Ответы ботов</n-divider>
-                      <div v-for="resp in sess.responses" :key="resp.username" class="response-item">
-                        <span class="resp-name" :style="{ color: getBotColor(resp.username) }">{{ resp.username }}</span>
-                        <span class="resp-msg">{{ resp.message }}</span>
-                      </div>
-                      <div v-if="!sess.responses.length" class="no-responses">Боты ещё не ответили...</div>
-                    </n-card>
-                  </n-scrollbar>
-                </div>
-              </template>
-              
-              <template v-else-if="activeKey === 'learn'">
-                <div class="learn-panel">
-                  <div class="learn-header">
-                    <n-alert type="info">
-                      🤖 <b>Обучение Markov</b> — боты обучаются на сообщениях из другого канала пока вы стримите
-                    </n-alert>
-                  </div>
-                  
-                  <n-card title="Настройка обучения">
-                    <n-alert type="warning">
-                      Настройки берутся из Variables: LEARN_CHANNEL и LEARN_OAUTH
-                    </n-alert>
-                    <n-divider />
-                    <n-space>
-                      <n-button type="primary" @click="startLearning" :disabled="learning">Старт</n-button>
-                      <n-button type="error" @click="stopLearning" :disabled="!learning">Стоп</n-button>
-                    </n-space>
-                  </n-card>
-                  
-                  <n-card v-if="learning" title="Статус обучения">
-                    <div class="learn-stats">
-                      <n-statistic label="Сообщений изучено">{{ learnStats.messages }}</n-statistic>
-                      <n-statistic label="Слов в базе">{{ learnStats.words }}</n-statistic>
-                    </div>
-                    <n-divider />
-                    <div class="learn-log">
-                      <n-scrollbar style="max-height: 200px">
-                        <div v-for="(msg, idx) in learnLogs" :key="idx" class="learn-msg">
-                          {{ msg }}
-                        </div>
-                      </n-scrollbar>
-                    </div>
-                  </n-card>
-                </div>
-              </template>
-            </div>
-          </n-layout-content>
-        </n-layout>
-      </n-layout>
-    </n-layout>
-    
-    <div v-if="errorsList.length" class="error-bar">
-      <div class="error-header" @click="errorsList.length = 0">
-        <span>⚠ Ошибки: {{ errorsList.length }}</span>
+  <div v-else class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark small">TV</span><span>Twitch AI<br><b>Viewers</b></span></div>
+      <nav aria-label="Dashboard sections">
+        <button v-for="page in pages" :key="page.id" :class="{ active: activePage === page.id }" @click="activePage = page.id">
+          <span class="nav-glyph">{{ page.glyph }}</span><span>{{ page.label }}</span>
+        </button>
+      </nav>
+      <div class="sidebar-foot">
+        <span :class="['connection-dot', realtimeOnline ? 'ok' : '']"></span>
+        <span>{{ realtimeOnline ? 'Realtime connected' : 'Realtime offline' }}</span>
+        <button class="text-button" @click="logout">Log out</button>
       </div>
-      <div class="error-list">
-        <div v-for="(e, idx) in errorsList" :key="idx" class="error-item">
-          {{ e.time }} {{ e.username }}: {{ e.message }}
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">{{ overview.category || 'CATEGORY UNKNOWN' }}</p>
+          <h2>{{ overview.channel || 'Channel not configured' }}</h2>
         </div>
-      </div>
+        <div class="topbar-actions">
+          <span :class="['live-pill', overview.isLive ? 'live' : '']"><i></i>{{ overview.isLive ? 'LIVE' : 'OFFLINE' }}</span>
+          <button class="icon-button" title="Refresh" :disabled="loading" @click="loadDashboard">↻</button>
+        </div>
+      </header>
+
+      <main>
+        <p v-if="errorMessage" class="notice error">{{ errorMessage }}</p>
+        <p v-if="saveMessage" class="notice success">{{ saveMessage }}</p>
+
+        <template v-if="activePage === 'overview'">
+          <div class="page-heading"><div><p class="eyebrow">CONTROL ROOM</p><h1>Overview</h1></div><p class="muted">One stream, one multimodal brain, {{ overview.totalBots }} independent personas.</p></div>
+          <section class="health-grid" aria-label="System health">
+            <article v-for="item in healthItems" :key="item.label" class="health-card">
+              <div><span :class="['status-light', item.ok ? 'ok' : '']"></span><span>{{ item.label }}</span></div>
+              <strong>{{ item.ok ? 'Operational' : 'Degraded' }}</strong>
+              <small>{{ item.detail }}</small>
+            </article>
+          </section>
+
+          <section class="metric-strip">
+            <div><span>Uptime</span><strong>{{ formatDuration(usage.uptimeSeconds) }}</strong></div>
+            <div><span>Stream analyzed</span><strong>{{ usage.streamMinutes.toFixed(1) }} min</strong></div>
+            <div><span>Responses sent</span><strong>{{ usage.generatedResponses }}</strong></div>
+            <div><span>Natural skips</span><strong>{{ usage.skippedResponses }}</strong></div>
+            <div><span>Gemini reconnects</span><strong>{{ usage.geminiReconnects }}</strong></div>
+          </section>
+
+          <div class="overview-grid">
+            <section class="panel timeline-panel">
+              <div class="panel-heading"><div><p class="eyebrow">CAUSE → EFFECT</p><h3>Unified timeline</h3></div><span class="subtle-chip">live</span></div>
+              <div v-if="timeline.length" class="timeline">
+                <article v-for="item in timeline" :key="item.id" :class="['timeline-item', item.tone]">
+                  <time>{{ formatTime(item.timestamp) }}</time>
+                  <span class="timeline-node"></span>
+                  <div><p>{{ item.title }}</p><small>{{ item.meta }}</small></div>
+                </article>
+              </div>
+              <div v-else class="empty-state">Events and chat will appear here when the stream starts.</div>
+            </section>
+            <section class="panel">
+              <div class="panel-heading"><div><p class="eyebrow">ACCOUNTS</p><h3>Bot fleet</h3></div><button class="text-button" @click="activePage = 'bots'">View all</button></div>
+              <div class="compact-bots">
+                <article v-for="bot in bots.slice(0, 8)" :key="bot.username">
+                  <span class="avatar">{{ bot.username.slice(0, 2).toUpperCase() }}</span>
+                  <div><strong>{{ bot.username }}</strong><small>{{ bot.personaId }}</small></div>
+                  <span :class="['state-badge', stateClass(bot.connectionState)]">{{ bot.connectionState }}</span>
+                </article>
+                <div v-if="!bots.length" class="empty-state">No BOTn credentials configured.</div>
+              </div>
+            </section>
+          </div>
+        </template>
+
+        <template v-else-if="activePage === 'bots'">
+          <div class="page-heading"><div><p class="eyebrow">OFFICIAL TWITCH CHAT</p><h1>Bot accounts</h1></div><p class="muted">Connection state is isolated per account. No viewer-count simulation.</p></div>
+          <section class="panel table-panel">
+            <div class="bot-table table-head"><span>Account</span><span>State</span><span>Persona</span><span>Messages</span><span>Last reaction</span><span>Enabled</span></div>
+            <div v-for="bot in bots" :key="bot.username" class="bot-table table-row">
+              <div class="account-cell"><span class="avatar">{{ bot.username.slice(0, 2).toUpperCase() }}</span><div><strong>{{ bot.username }}</strong><small>{{ bot.chatConnected ? 'chat joined' : bot.lastError || 'chat offline' }}</small></div></div>
+              <span :class="['state-badge', stateClass(bot.connectionState)]">{{ bot.connectionState }}</span>
+              <span>{{ bot.personaId }}</span><span>{{ bot.messagesSent }}</span><span>{{ formatTime(bot.lastReactionAt) }}</span>
+              <button :class="['toggle', bot.enabled ? 'on' : '']" :aria-label="`Toggle ${bot.username}`" @click="toggleBot(bot)"><i></i></button>
+            </div>
+            <div v-if="!bots.length" class="empty-state">Configure BOT1_USERNAME and BOT1_OAUTH_TOKEN on Railway.</div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage === 'brain'">
+          <div class="page-heading"><div><p class="eyebrow">MULTIMODAL UNDERSTANDING</p><h1>Stream Brain</h1></div><p class="muted">Normalized events, not raw transcripts.</p></div>
+          <section class="brain-summary">
+            <div><span>Live session</span><strong>{{ overview.streamBrain.state }}</strong></div>
+            <div><span>Audio</span><strong>{{ usage.audioMinutes.toFixed(1) }} min</strong></div>
+            <div><span>Video sampled</span><strong>{{ usage.videoMinutes.toFixed(1) }} min</strong></div>
+            <div><span>Last event</span><strong>{{ formatTime(overview.streamBrain.lastEventAt) }}</strong></div>
+          </section>
+          <section class="event-grid">
+            <article v-for="event in events" :key="event.id" class="event-card">
+              <div class="event-top"><time>{{ formatTime(event.timestamp) }}</time><span>{{ event.category || overview.category || 'Unknown' }}</span><b>{{ event.type }}</b></div>
+              <h3>{{ event.summary }}</h3><p v-if="event.speech">“{{ event.speech }}”</p>
+              <div class="event-bars"><label>importance <meter min="0" max="1" :value="event.importance"></meter><b>{{ event.importance.toFixed(2) }}</b></label><label>confidence <meter min="0" max="1" :value="event.confidence"></meter><b>{{ event.confidence.toFixed(2) }}</b></label></div>
+              <small>{{ event.source }}<template v-if="event.directMentions.length"> · @{{ event.directMentions.join(', @') }}</template></small>
+            </article>
+            <div v-if="!events.length" class="empty-state panel">No normalized events yet.</div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage === 'chat'">
+          <div class="page-heading"><div><p class="eyebrow">REALTIME CONTEXT</p><h1>Twitch chat</h1></div><p class="muted">Viewer, bot and system messages are marked separately.</p></div>
+          <section class="panel chat-feed">
+            <article v-for="message in [...chat].reverse()" :key="message.id" :class="['chat-line', message.kind]">
+              <time>{{ formatTime(message.timestamp) }}</time><span class="kind-chip">{{ message.kind }}</span><strong>{{ message.displayName }}</strong><p>{{ message.message }}</p>
+            </article>
+            <div v-if="!chat.length" class="empty-state">Chat messages will appear after a bot joins the channel.</div>
+          </section>
+        </template>
+
+        <template v-else>
+          <div class="page-heading"><div><p class="eyebrow">SAFE RUNTIME CONTROL</p><h1>Settings</h1></div><p class="muted">API keys and OAuth tokens never pass through this dashboard.</p></div>
+          <section class="settings-grid">
+            <form class="panel settings-form" @submit.prevent="saveSettings">
+              <div class="panel-heading"><div><p class="eyebrow">STREAM</p><h3>Understanding</h3></div></div>
+              <label>Channel<input v-model="settings.channel" autocomplete="off" /></label>
+              <label>Stream context<textarea v-model="settings.streamContext" rows="4" placeholder="Стример играет рейтинговую Dota 2 с друзьями"></textarea></label>
+              <label>Vision FPS <span>{{ settings.visionFps }}</span><input v-model.number="settings.visionFps" type="range" min="0.05" max="1" step="0.05" /></label>
+              <label>Event threshold <span>{{ settings.eventThreshold.toFixed(2) }}</span><input v-model.number="settings.eventThreshold" type="range" min="0" max="1" step="0.05" /></label>
+              <button class="primary" type="submit">Save settings</button>
+              <small class="muted">Channel and Vision FPS changes are persisted but require a backend restart.</small>
+            </form>
+            <section class="panel security-panel">
+              <div class="panel-heading"><div><p class="eyebrow">SECURITY</p><h3>Deployment boundary</h3></div></div>
+              <ul><li><span>Gemini key</span><b>Railway only</b></li><li><span>Twitch OAuth</span><b>Railway only</b></li><li><span>Dashboard auth</span><b>Bearer + Socket auth</b></li><li><span>CORS</span><b>FRONTEND_URL allowlist</b></li></ul>
+            </section>
+          </section>
+
+          <div class="section-heading"><div><p class="eyebrow">VOICE & BEHAVIOR</p><h2>Personas</h2></div></div>
+          <section class="persona-grid">
+            <form v-for="persona in personas" :key="persona.id" class="panel persona-card" @submit.prevent="savePersona(persona)">
+              <div class="panel-heading"><div><span class="persona-id">{{ persona.id }}</span><h3>{{ persona.name }}</h3></div></div>
+              <label>Description<textarea v-model="persona.description" rows="2"></textarea></label>
+              <label>Style instructions<textarea v-model="persona.styleInstructions" rows="3"></textarea></label>
+              <div class="two-fields"><label>Min words<input v-model.number="persona.verbosity.minWords" type="number" min="1" max="50" /></label><label>Max words<input v-model.number="persona.verbosity.maxWords" type="number" min="1" max="100" /></label></div>
+              <label>Reaction probability <span>{{ persona.reactionProbability.toFixed(2) }}</span><input v-model.number="persona.reactionProbability" type="range" min="0" max="1" step="0.05" /></label>
+              <label>Sarcasm <span>{{ persona.sarcasmLevel.toFixed(2) }}</span><input v-model.number="persona.sarcasmLevel" type="range" min="0" max="1" step="0.05" /></label>
+              <button class="secondary" type="submit">Save persona</button>
+            </form>
+          </section>
+        </template>
+      </main>
     </div>
-  </n-config-provider>
+  </div>
 </template>
-
-<style>
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
-
-:root {
-  --bg: #111114;
-  --sf: #18181c;
-  --ca: #1e1e24;
-  --b1: #2a2a32;
-  --b2: #333340;
-  --pu: #7c3aed;
-  --pl: #9d5cf6;
-  --pd: rgba(124, 58, 237, 0.15);
-  --tx: #e8e8f0;
-  --tx2: #9898b0;
-  --tx3: #55556a;
-  --gr: #22c55e;
-  --rd: #ef4444;
-  --yw: #f59e0b;
-}
-
-body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  background: var(--bg);
-  color: var(--tx);
-  overflow: hidden;
-}
-
-.app-layout {
-  height: 100vh;
-}
-
-.logo-area {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--b1);
-}
-
-.logo-icon {
-  width: 28px;
-  height: 28px;
-  background: linear-gradient(135deg, var(--pu), #ec4899);
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-}
-
-.logo-text {
-  font-weight: 700;
-  font-size: 15px;
-}
-
-.top-bar {
-  height: 44px;
-  background: var(--sf);
-  border-bottom: 1px solid var(--b1);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 16px;
-}
-
-.top-info {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.channel-name {
-  font-weight: 600;
-  font-size: 14px;
-}
-
-.game-name {
-  color: var(--tx3);
-  font-size: 13px;
-}
-
-.top-stats {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 13px;
-  color: var(--tx2);
-}
-
-.stat-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.main-content {
-  height: calc(100vh - 44px);
-}
-
-.panel-chat {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  background: var(--sf);
-  border-right: 1px solid var(--b1);
-}
-
-.chat-header {
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--b1);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--tx2);
-}
-
-.chat-messages {
-  padding: 8px;
-}
-
-.chat-message {
-  display: flex;
-  gap: 8px;
-  padding: 4px 8px;
-  border-radius: 6px;
-}
-
-.chat-message:hover {
-  background: rgba(255, 255, 255, 0.03);
-}
-
-.chat-message.system {
-  color: var(--tx3);
-  font-style: italic;
-  font-size: 12px;
-}
-
-.msg-content {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.msg-username {
-  font-weight: 600;
-  font-size: 12px;
-}
-
-.msg-text {
-  font-size: 13px;
-  line-height: 1.4;
-  word-break: break-word;
-}
-
-.empty-chat {
-  text-align: center;
-  padding: 40px;
-  color: var(--tx3);
-  font-size: 13px;
-}
-
-.phrase-bar {
-  padding: 8px 12px;
-  border-top: 1px solid var(--b1);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.chat-input {
-  padding: 10px 12px;
-  border-top: 1px solid var(--b1);
-  display: flex;
-  gap: 8px;
-}
-
-.content-area {
-  height: 100%;
-  background: var(--bg);
-}
-
-.stream-embed {
-  width: 100%;
-  height: 100%;
-  background: #0a0a0c;
-}
-
-.stream-embed iframe {
-  width: 100%;
-  height: 100%;
-  border: none;
-}
-
-.no-stream {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  color: var(--tx3);
-}
-
-.accounts-panel {
-  padding: 16px;
-}
-
-.accounts-header {
-  margin-bottom: 16px;
-}
-
-.bots-config {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 16px;
-  padding: 10px;
-  background: rgba(34, 197, 94, 0.06);
-  border: 1px solid rgba(34, 197, 94, 0.15);
-  border-radius: 8px;
-}
-
-.bot-item {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-
-.bot-info {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.bot-name {
-  font-weight: 600;
-  font-size: 13px;
-}
-
-.bot-status {
-  font-size: 11px;
-  color: var(--tx3);
-}
-
-.bot-status.connected {
-  color: var(--gr);
-}
-
-.bot-status.connecting {
-  color: var(--yw);
-}
-
-.bot-status.error {
-  color: var(--rd);
-}
-
-.bot-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.phrases-panel {
-  padding: 16px;
-}
-
-.phrases-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-
-.hint {
-  color: var(--tx3);
-  font-size: 12px;
-}
-
-.phrase-list {
-  font-size: 11px;
-  color: var(--tx2);
-  line-height: 1.6;
-  margin-bottom: 10px;
-}
-
-.transcript-panel,
-.learn-panel {
-  padding: 16px;
-}
-
-.learn-header {
-  margin-bottom: 16px;
-}
-
-.learn-stats {
-  display: flex;
-  gap: 24px;
-}
-
-.learn-log {
-  font-size: 11px;
-  font-family: monospace;
-}
-
-.learn-msg {
-  padding: 2px 0;
-}
-
-.transcript-header {
-  margin-bottom: 16px;
-}
-
-.transcript-card {
-  margin-bottom: 12px;
-}
-
-.heard-label {
-  font-size: 11px;
-  color: var(--pl);
-}
-
-.heard-text {
-  font-size: 13px;
-  color: var(--tx2);
-  line-height: 1.5;
-}
-
-.response-item {
-  display: flex;
-  gap: 8px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--b1);
-}
-
-.response-item:last-child {
-  border-bottom: none;
-}
-
-.resp-name {
-  font-weight: 600;
-  font-size: 12px;
-  min-width: 80px;
-}
-
-.resp-msg {
-  font-size: 12px;
-}
-
-.no-responses {
-  color: var(--tx3);
-  font-style: italic;
-  font-size: 12px;
-}
-
-.error-bar {
-  position: fixed;
-  bottom: 0;
-  left: 220px;
-  right: 0;
-  background: rgba(239, 68, 68, 0.1);
-  border-top: 1px solid rgba(239, 68, 68, 0.3);
-  z-index: 100;
-}
-
-.error-header {
-  padding: 8px 16px;
-  cursor: pointer;
-  color: var(--rd);
-  font-weight: 600;
-}
-
-.error-list {
-  padding: 0 16px 12px;
-  max-height: 120px;
-  overflow-y: auto;
-}
-
-.error-item {
-  font-size: 11px;
-  color: var(--rd);
-  padding: 2px 0;
-  font-family: monospace;
-}
-</style>

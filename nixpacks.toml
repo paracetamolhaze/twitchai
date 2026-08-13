@@ -1,11 +1,14 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "python311", "ffmpeg", "python311Packages.pip"]
+nixPkgs = ["nodejs_20", "python311", "python311Packages.pip", "ffmpeg"]
 
 [phases.install]
-cmds = ["pip install streamlink --break-system-packages", "npm install --omit=dev"]
+cmds = [
+  "python -m pip install streamlink --break-system-packages",
+  "npm ci"
+]
 
 [phases.build]
-cmds = ["npm run build"]
+cmds = ["npm run build:backend", "npm prune --omit=dev"]
 
-[phases.start]
-cmd = ["npm run start"]
+[start]
+cmd = "npm run start"

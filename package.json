@@ -1,36 +1,52 @@
 {
-  "name": "boostex",
-  "version": "1.0.0",
-  "description": "Boostex - AI Chat Bots for Twitch",
-  "main": "src/main.ts",
+  "name": "twitch-ai-viewers",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Event-driven multimodal AI viewers for Twitch",
+  "main": "dist/main.js",
   "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
-    "build": "tsc && npm run build:fe",
-    "build:fe": "cd frontend && npm install && npm run build",
-    "start": "ts-node src/main.ts",
-    "postinstall": "pip install streamlink --break-system-packages || pip3 install streamlink --break-system-packages || true"
+    "dev": "tsx watch src/main.ts",
+    "build": "npm run build:backend && npm run build:frontend",
+    "build:backend": "tsc -p tsconfig.json",
+    "build:frontend": "npm --prefix frontend ci && npm --prefix frontend run build",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && npm --prefix frontend run typecheck",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "verify": "npm run lint && npm run typecheck && npm test && npm run build",
+    "db:migrate": "tsx src/persistence/migrate.ts"
   },
   "dependencies": {
-    "@ffmpeg-installer/ffmpeg": "^1.1.0",
-    "axios": "^1.6.7",
-    "colors": "^1.4.0",
+    "@google/genai": "^1.31.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.2",
-    "groq-sdk": "^0.4.0",
-    "socket.io": "^4.6.1",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "groq-sdk": "^0.37.0",
+    "helmet": "^8.1.0",
+    "pg": "^8.16.3",
+    "socket.io": "^4.8.1",
     "tmi.js": "^1.8.5",
-    "ws": "^8.16.0"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.11.19",
+    "@eslint/js": "^9.33.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.3.0",
+    "@types/pg": "^8.15.5",
+    "@types/supertest": "^6.0.3",
     "@types/tmi.js": "^1.8.6",
-    "@types/express": "^4.17.21",
-    "@types/cors": "^2.8.17",
-    "@types/ws": "^8.5.10",
-    "ts-node": "^10.9.2",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^4.9.5"
+    "eslint": "^9.33.0",
+    "eslint-plugin-vue": "^10.4.0",
+    "globals": "^16.3.0",
+    "supertest": "^7.1.4",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.40.0",
+    "vitest": "^3.2.4"
   }
 }

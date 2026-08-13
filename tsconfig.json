@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ES2022",
     "module": "CommonJS",
     "moduleResolution": "node",
     "esModuleInterop": true,
@@ -8,8 +8,11 @@
     "outDir": "dist",
     "rootDir": "src",
     "sourceMap": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules"]
-} 
+  "exclude": ["node_modules", "dist", "tests"]
+}

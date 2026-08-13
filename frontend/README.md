@@ -1,5 +1,10 @@
-# Vue 3 + Vite
+# Twitch AI Viewers Dashboard
 
-This template should help get you started developing with Vue 3 in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+The dashboard is a standalone Vue/Vite application intended for Vercel. It never opens Twitch, FFmpeg, or Gemini connections.
 
-Learn more about IDE Support for Vue in the [Vue Docs Scaling up Guide](https://vuejs.org/guide/scaling-up/tooling.html#ide-support).
+```bash
+npm ci
+VITE_API_URL=http://localhost:3000 npm run dev
+```
+
+Configure `VITE_API_URL` in Vercel with the public Railway backend origin. The operator enters `DASHBOARD_TOKEN` at runtime; it is kept in `sessionStorage`, not bundled into the frontend.

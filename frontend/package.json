@@ -1,22 +1,22 @@
 {
-  "name": "boostex",
+  "name": "twitch-ai-viewers-dashboard",
   "private": true,
-  "version": "0.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
-    "@vicons/ionicons5": "^0.12.0",
-    "naive-ui": "^2.38.0",
-    "socket.io-client": "^4.6.0",
-    "vue": "^3.4.0",
-    "vue-router": "^4.2.0"
+    "socket.io-client": "^4.8.1",
+    "vue": "^3.5.20"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.0.0",
-    "vite": "^5.1.0"
+    "@vitejs/plugin-vue": "^6.0.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.1.3",
+    "vue-tsc": "^3.0.6"
   }
 }

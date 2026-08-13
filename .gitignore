@@ -1,6 +1,8 @@
 # Logs
 logs
 *.log
+.lazyweb/
+data/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -90,6 +92,7 @@ out
 # Nuxt.js build / generate output
 .nuxt
 dist
+frontend/dist
 
 # Gatsby files
 .cache/

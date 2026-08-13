@@ -1,0 +1,204 @@
+import { createServer, Server as HttpServer } from 'node:http';
+import cors from 'cors';
+import express, { Express } from 'express';
+import helmet from 'helmet';
+import { Server as SocketServer } from 'socket.io';
+import { z } from 'zod';
+import { Logger } from '../logger';
+import { BotPersona } from '../personas/types';
+import { BotAccountRecord } from '../persistence/repository';
+import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
+import { UsageSnapshot } from '../usage/usage-tracker';
+import { dashboardAuth, tokenMatches } from './auth';
+
+export interface HealthPayload {
+  status: 'ok' | 'degraded';
+  twitch: boolean;
+  streamBrain: boolean;
+  gemini: boolean;
+  database: boolean;
+}
+
+export interface OverviewPayload {
+  channel: string;
+  category: string;
+  isLive: boolean;
+  twitchConnected: boolean;
+  streamBrain: StreamBrainStatus;
+  activeBots: number;
+  totalBots: number;
+  uptimeSeconds: number;
+}
+
+export interface ApiServerDependencies {
+  port: number;
+  frontendUrls: string[];
+  dashboardToken?: string;
+  logger: Logger;
+  health: () => HealthPayload;
+  overview: () => OverviewPayload;
+  bots: () => BotAccountRecord[];
+  setBotEnabled: (username: string, enabled: boolean) => Promise<boolean>;
+  events: (limit: number) => Promise<StreamEvent[]>;
+  chat: () => ChatMessage[];
+  usage: () => UsageSnapshot;
+  settings: () => Promise<Record<string, unknown>>;
+  updateSettings: (settings: Record<string, unknown>) => Promise<{ restartRequired: string[] }>;
+  personas: () => BotPersona[];
+  updatePersona: (persona: BotPersona) => Promise<void>;
+}
+
+export interface ApiServer {
+  app: Express;
+  http: HttpServer;
+  io: SocketServer;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  emitChat(message: ChatMessage): void;
+  emitEvent(event: StreamEvent): void;
+  emitBots(bots: BotAccountRecord[]): void;
+  emitBrain(status: StreamBrainStatus): void;
+  emitOverview(): void;
+}
+
+const settingsSchema = z.object({
+  channel: z.string().trim().min(1).max(50).optional(),
+  streamContext: z.string().max(2_000).optional(),
+  visionFps: z.number().min(0.05).max(1).optional(),
+  eventThreshold: z.number().min(0).max(1).optional(),
+}).strict();
+
+const personaSchema: z.ZodType<BotPersona> = z.object({
+  id: z.string().trim().min(1).max(80),
+  name: z.string().trim().min(1).max(100),
+  description: z.string().trim().min(1).max(1_000),
+  styleInstructions: z.string().trim().min(1).max(2_000),
+  verbosity: z.object({ minWords: z.number().int().min(1).max(50), maxWords: z.number().int().min(1).max(100) }),
+  reactionProbability: z.number().min(0).max(1),
+  uppercaseProbability: z.number().min(0).max(1),
+  questionProbability: z.number().min(0).max(1),
+  emojiProbability: z.number().min(0).max(1),
+  slangLevel: z.number().min(0).max(1),
+  sarcasmLevel: z.number().min(0).max(1),
+  toxicityLimit: z.number().min(0).max(1),
+  interests: z.array(z.string().trim().min(1).max(80)).max(30),
+  temperature: z.number().min(0).max(2),
+  minimumIntervalMs: z.number().int().min(1_000).max(3_600_000),
+});
+
+export function createApiServer(dependencies: ApiServerDependencies): ApiServer {
+  const logger = dependencies.logger.child('API');
+  const app = express();
+  const http = createServer(app);
+  const allowedOrigins = new Set(dependencies.frontendUrls.map((url) => url.replace(/\/$/, '')));
+  const originAllowed = (origin?: string): boolean => !origin || allowedOrigins.has(origin.replace(/\/$/, ''));
+  const corsOptions: cors.CorsOptions = {
+    origin(origin, callback) {
+      if (originAllowed(origin)) callback(null, true);
+      else callback(new Error('Origin is not allowed'));
+    },
+    methods: ['GET', 'PATCH', 'PUT', 'OPTIONS'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'X-Dashboard-Token'],
+  };
+  const io = new SocketServer(http, {
+    cors: corsOptions,
+    transports: ['websocket', 'polling'],
+  });
+
+  app.disable('x-powered-by');
+  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(cors(corsOptions));
+  app.use(express.json({ limit: '64kb' }));
+  app.get('/', (_request, response) => response.json({ name: 'Twitch AI Viewers backend', version: 2 }));
+  app.get('/health', (_request, response) => {
+    const health = dependencies.health();
+    response.status(health.status === 'ok' ? 200 : 503).json(health);
+  });
+  app.use('/api', dashboardAuth(dependencies.dashboardToken));
+  app.get('/api/overview', (_request, response) => response.json(dependencies.overview()));
+  app.get('/api/bots', (_request, response) => response.json(dependencies.bots()));
+  app.patch('/api/bots/:username', async (request, response, next) => {
+    try {
+      const body = z.object({ enabled: z.boolean() }).parse(request.body);
+      const updated = await dependencies.setBotEnabled(request.params.username, body.enabled);
+      if (!updated) return response.status(404).json({ error: 'Bot not found' });
+      return response.json({ ok: true });
+    } catch (error) { return next(error); }
+  });
+  app.get('/api/events', async (request, response, next) => {
+    try {
+      const limit = z.coerce.number().int().min(1).max(200).default(50).parse(request.query.limit);
+      response.json(await dependencies.events(limit));
+    } catch (error) { next(error); }
+  });
+  app.get('/api/chat', (_request, response) => response.json(dependencies.chat()));
+  app.get('/api/usage', (_request, response) => response.json(dependencies.usage()));
+  app.get('/api/settings', async (_request, response, next) => {
+    try { response.json(await dependencies.settings()); } catch (error) { next(error); }
+  });
+  app.patch('/api/settings', async (request, response, next) => {
+    try {
+      const settings = settingsSchema.parse(request.body);
+      response.json({ ok: true, ...(await dependencies.updateSettings(settings)) });
+    } catch (error) { next(error); }
+  });
+  app.get('/api/personas', (_request, response) => response.json(dependencies.personas()));
+  app.put('/api/personas/:id', async (request, response, next) => {
+    try {
+      const persona = personaSchema.parse({ ...request.body, id: request.params.id });
+      if (persona.verbosity.minWords > persona.verbosity.maxWords) {
+        return response.status(400).json({ error: 'minWords must not exceed maxWords' });
+      }
+      await dependencies.updatePersona(persona);
+      return response.json({ ok: true });
+    } catch (error) { return next(error); }
+  });
+
+  app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
+    void _next;
+    if (error instanceof z.ZodError) {
+      response.status(400).json({ error: 'Invalid request', issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })) });
+      return;
+    }
+    logger.warn('API request failed', { error });
+    response.status(500).json({ error: 'Internal server error' });
+  });
+
+  io.use((socket, next) => {
+    if (!originAllowed(socket.handshake.headers.origin)) return next(new Error('Origin is not allowed'));
+    const token = socket.handshake.auth?.token;
+    return tokenMatches(dependencies.dashboardToken, token) ? next() : next(new Error('Unauthorized'));
+  });
+  io.on('connection', (socket) => {
+    socket.emit('overview', dependencies.overview());
+    socket.emit('bots', dependencies.bots());
+    socket.emit('chat:init', dependencies.chat());
+    void dependencies.events(50)
+      .then((events) => socket.emit('events:init', events))
+      .catch((error: unknown) => logger.warn('Initial realtime event load failed', { error }));
+  });
+
+  return {
+    app,
+    http,
+    io,
+    start: () => new Promise<void>((resolve, reject) => {
+      http.once('error', reject);
+      http.listen(dependencies.port, () => {
+        http.off('error', reject);
+        logger.info('Backend listening', { port: dependencies.port });
+        resolve();
+      });
+    }),
+    stop: () => new Promise<void>((resolve) => {
+      io.close();
+      if (!http.listening) return resolve();
+      return http.close(() => resolve());
+    }),
+    emitChat: (message) => io.emit('chat', message),
+    emitEvent: (event) => io.emit('event', event),
+    emitBots: (bots) => io.emit('bots', bots),
+    emitBrain: (status) => io.emit('brain', status),
+    emitOverview: () => io.emit('overview', dependencies.overview()),
+  };
+}

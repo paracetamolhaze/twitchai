@@ -1,72 +1,61 @@
-import colors from 'colors';
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+type LogFields = Record<string, unknown>;
 
-export enum LogLevel {
-  DEBUG = 'DEBUG',
-  INFO = 'INFO',
-  WARN = 'WARN',
-  ERROR = 'ERROR'
+const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
+const SENSITIVE_KEY = /(authorization|api[_-]?key|client[_-]?secret|password|oauth|token|cookie)/i;
+const SECRET_VALUE = /(oauth:[a-z0-9_-]+|bearer\s+[a-z0-9._-]+)/gi;
+const KNOWN_SECRETS = Object.entries(process.env)
+  .filter(([key, value]) => SENSITIVE_KEY.test(key) && typeof value === 'string' && value.length >= 6)
+  .map(([, value]) => value as string);
+
+function redact(value: unknown, key = ''): unknown {
+  if (SENSITIVE_KEY.test(key)) return '[REDACTED]';
+  if (typeof value === 'string') {
+    let safe = value.replace(SECRET_VALUE, '[REDACTED]');
+    for (const secret of KNOWN_SECRETS) safe = safe.replaceAll(secret, '[REDACTED]');
+    return safe;
+  }
+  if (value instanceof Error) {
+    return { name: value.name, message: redact(value.message), stack: redact(value.stack) };
+  }
+  if (Array.isArray(value)) return value.map((item) => redact(item));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([childKey, child]) => [childKey, redact(child, childKey)]),
+    );
+  }
+  return value;
 }
 
 export class Logger {
-  private static instance: Logger;
-  private isDebug: boolean;
+  constructor(
+    private readonly component: string,
+    private readonly minimumLevel: LogLevel = 'info',
+    private readonly base: LogFields = {},
+  ) {}
 
-  private constructor() {
-    this.isDebug = process.env.DEBUG === 'true';
+  child(component: string, fields: LogFields = {}): Logger {
+    return new Logger(component, this.minimumLevel, { ...this.base, ...fields });
   }
 
-  public static getInstance(): Logger {
-    if (!Logger.instance) {
-      Logger.instance = new Logger();
-    }
-    return Logger.instance;
-  }
+  debug(message: string, fields: LogFields = {}): void { this.write('debug', message, fields); }
+  info(message: string, fields: LogFields = {}): void { this.write('info', message, fields); }
+  warn(message: string, fields: LogFields = {}): void { this.write('warn', message, fields); }
+  error(message: string, fields: LogFields = {}): void { this.write('error', message, fields); }
 
-  private formatMessage(level: LogLevel, message: string, ...args: any[]): string {
-    const timestamp = new Date().toISOString();
-    const formattedArgs = args.map(arg => 
-      typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg
-    ).join(' ');
-
-    return `[${timestamp}] [${level}] ${message} ${formattedArgs}`;
-  }
-
-  private log(level: LogLevel, message: string, ...args: any[]) {
-    const formattedMessage = this.formatMessage(level, message, ...args);
-    
-    switch (level) {
-      case LogLevel.DEBUG:
-        if (this.isDebug) {
-          console.debug(colors.gray(formattedMessage));
-        }
-        break;
-      case LogLevel.INFO:
-        console.log(colors.blue(formattedMessage));
-        break;
-      case LogLevel.WARN:
-        console.warn(colors.yellow(formattedMessage));
-        break;
-      case LogLevel.ERROR:
-        console.error(colors.red(formattedMessage));
-        break;
-    }
-  }
-
-  public debug(message: string, ...args: any[]) {
-    this.log(LogLevel.DEBUG, message, ...args);
-  }
-
-  public info(message: string, ...args: any[]) {
-    this.log(LogLevel.INFO, message, ...args);
-  }
-
-  public warn(message: string, ...args: any[]) {
-    this.log(LogLevel.WARN, message, ...args);
-  }
-
-  public error(message: string, ...args: any[]) {
-    this.log(LogLevel.ERROR, message, ...args);
+  private write(level: LogLevel, message: string, fields: LogFields): void {
+    if (LEVELS[level] < LEVELS[this.minimumLevel]) return;
+    const entry = redact({
+      timestamp: new Date().toISOString(),
+      level,
+      component: this.component,
+      message,
+      ...this.base,
+      ...fields,
+    });
+    const line = JSON.stringify(entry);
+    if (level === 'error') console.error(line);
+    else if (level === 'warn') console.warn(line);
+    else console.log(line);
   }
 }
-
-export const logger = Logger.getInstance(); 
