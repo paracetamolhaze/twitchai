@@ -3,6 +3,9 @@ logs
 *.log
 .lazyweb/
 data/
+.railway/
+.vercel/
+frontend/.vercel/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
