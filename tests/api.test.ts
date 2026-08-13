@@ -12,7 +12,13 @@ const event: StreamEvent = {
 };
 let servers: ApiServer[] = [];
 
-function server(): ApiServer {
+function server(twitchOAuth?: {
+  status: () => Promise<{ configured: boolean; callbackUrl: string; accounts: never[] }>;
+  startAuthorization: () => Promise<string>;
+  launchAuthorization: (ticket: string) => Promise<{ authorizationUrl: string; browserState: string }>;
+  abandonAuthorization: (state: string, browserState: string) => Promise<void>;
+  completeAuthorization: (code: string, state: string, browserState: string) => Promise<{ username: string }>;
+}): ApiServer {
   const api = createApiServer({
     port: 0, frontendUrls: ['http://localhost:5173'], dashboardToken: token, logger: new Logger('TEST', 'error'),
     health: () => ({ status: 'ok', twitch: true, streamBrain: true, gemini: true, database: true }),
@@ -28,6 +34,7 @@ function server(): ApiServer {
       eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0 }),
     settings: async () => ({}), updateSettings: async () => ({ restartRequired: [] }),
     personas: () => DEFAULT_PERSONAS, updatePersona: async () => undefined,
+    twitchOAuth,
   });
   servers.push(api);
   return api;
@@ -64,5 +71,57 @@ describe('dashboard API', () => {
     const events = await request(api.app).get('/api/events').set('Authorization', `Bearer ${token}`).expect(200);
     expect(bots.body[0]).toMatchObject({ username: 'bot', connectionState: 'CONNECTED', chatConnected: true });
     expect(events.body[0]).toMatchObject({ id: event.id, summary: event.summary });
+  });
+
+  it('starts OAuth behind dashboard auth and completes the public Twitch callback without exposing tokens', async () => {
+    const completed: Array<{ code: string; state: string; browserState: string }> = [];
+    const abandoned: Array<{ state: string; browserState: string }> = [];
+    const api = server({
+      status: async () => ({ configured: true, callbackUrl: 'https://backend.example/api/twitch/oauth/callback', accounts: [] }),
+      startAuthorization: async () => 'http://backend.test/api/twitch/oauth/launch?ticket=one-time-ticket',
+      launchAuthorization: async () => ({
+        authorizationUrl: 'https://id.twitch.tv/oauth2/authorize?state=browser-bound-state',
+        browserState: 'browser-bound-state',
+      }),
+      abandonAuthorization: async (state, browserState) => { abandoned.push({ state, browserState }); },
+      completeAuthorization: async (code, state, browserState) => {
+        completed.push({ code, state, browserState });
+        return { username: 'refreshable_bot' };
+      },
+    });
+
+    await request(api.app).post('/api/twitch/oauth/start').expect(401);
+    const started = await request(api.app)
+      .post('/api/twitch/oauth/start')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    expect(started.body).toEqual({ authorizationUrl: 'http://backend.test/api/twitch/oauth/launch?ticket=one-time-ticket' });
+
+    const launched = await request(api.app)
+      .get('/api/twitch/oauth/launch?ticket=one-time-ticket')
+      .expect(302);
+    expect(launched.headers.location).toBe('https://id.twitch.tv/oauth2/authorize?state=browser-bound-state');
+    const oauthCookie = launched.headers['set-cookie']?.[0]?.split(';')[0];
+    expect(oauthCookie).toContain('twitchai_oauth_state=browser-bound-state');
+
+    const callback = await request(api.app)
+      .get('/api/twitch/oauth/callback?code=one-time-code&state=browser-bound-state')
+      .set('Cookie', oauthCookie!)
+      .expect(302);
+    expect(callback.headers.location).toBe('http://localhost:5173/?twitchOAuth=success&username=refreshable_bot');
+    expect(completed).toEqual([{ code: 'one-time-code', state: 'browser-bound-state', browserState: 'browser-bound-state' }]);
+    expect(callback.text).not.toContain('access_token');
+
+    const denied = await request(api.app)
+      .get('/api/twitch/oauth/callback?error=access_denied&state=browser-bound-state')
+      .set('Cookie', oauthCookie!)
+      .expect(302);
+    const deniedRedirect = new URL(denied.headers.location);
+    expect(deniedRedirect.origin + deniedRedirect.pathname).toBe('http://localhost:5173/');
+    expect(Object.fromEntries(deniedRedirect.searchParams)).toEqual({
+      twitchOAuth: 'error',
+      reason: 'access_denied',
+    });
+    expect(abandoned).toEqual([{ state: 'browser-bound-state', browserState: 'browser-bound-state' }]);
   });
 });

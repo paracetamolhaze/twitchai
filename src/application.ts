@@ -4,7 +4,7 @@ import { ReactionMemory } from './learning/reaction-memory';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
 import { PersonaStore } from './personas/persona-store';
-import { AppRepository } from './persistence/repository';
+import { AppRepository, BotAccountRecord } from './persistence/repository';
 import { MemoryRepository } from './persistence/memory-repository';
 import { PostgresRepository } from './persistence/postgres-repository';
 import { ReactionCoordinator } from './reaction/reaction-coordinator';
@@ -19,7 +19,13 @@ import { ChatMessage, StreamEvent, StreamEventCandidate } from './stream-brain/t
 import { GroqWhisperFallback } from './transcription/groq-whisper-fallback';
 import { TwitchBotManager } from './twitch/bot-manager';
 import { TwitchHelixClient } from './twitch/helix-client';
+import { OfficialTwitchOAuthGateway } from './twitch/oauth-client';
+import { AuthorizedTwitchAccount, TwitchOAuthService } from './twitch/oauth-service';
+import { OfficialTwitchTokenValidator } from './twitch/oauth-validator';
 import { UsageTracker } from './usage/usage-tracker';
+
+const TWITCH_OAUTH_REFRESH_INTERVAL_MS = 60_000;
+const TWITCH_OAUTH_REFRESH_LEAD_MS = 5 * 60_000;
 
 export class Application {
   private readonly logger: Logger;
@@ -37,9 +43,11 @@ export class Application {
   private api!: ApiServer;
   private gemini?: GeminiLiveClient;
   private transcriber?: GroqWhisperFallback;
+  private twitchOAuth?: TwitchOAuthService;
   private categoryTimer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
   private healthTimer?: NodeJS.Timeout;
+  private oauthRefreshTimer?: NodeJS.Timeout;
   private databaseReady = false;
   private stopping = false;
   private runtimeSettings: Record<string, unknown> = {};
@@ -71,6 +79,8 @@ export class Application {
     this.databaseReady = true;
     if (!this.config.database.url) this.logger.warn('DATABASE_URL is not configured; using non-persistent in-memory storage');
     await this.personas.initialize();
+    this.configureTwitchOAuth();
+    await this.mergeStoredTwitchAccounts();
     this.runtimeSettings = await this.repository.getSettings();
     this.config.twitch.channel = normalizeChannel(stringSetting(this.runtimeSettings.channel, this.config.twitch.channel));
     this.config.stream.visionFps = boundedNumberSetting(this.runtimeSettings.visionFps, this.config.stream.visionFps, 0.05, 1);
@@ -87,6 +97,7 @@ export class Application {
       repository: this.repository,
       personas: this.personas,
       logger: this.logger,
+      credentialProvider: this.twitchOAuth,
     });
     await this.botManager.initialize();
 
@@ -211,6 +222,17 @@ export class Application {
       updateSettings: (settings) => this.updateSettings(settings),
       personas: () => this.personas.list(),
       updatePersona: (persona) => this.personas.update(persona),
+      ...(this.twitchOAuth ? {
+        twitchOAuth: {
+          status: () => this.twitchOAuth!.status(),
+          startAuthorization: () => this.twitchOAuth!.startAuthorization(),
+          launchAuthorization: (ticket: string) => this.twitchOAuth!.launchAuthorization(ticket),
+          abandonAuthorization: (state: string, browserState: string) =>
+            this.twitchOAuth!.abandonAuthorization(state, browserState),
+          completeAuthorization: (code: string, state: string, browserState: string) =>
+            this.completeTwitchAuthorization(code, state, browserState),
+        },
+      } : {}),
     });
 
     this.wireEvents();
@@ -220,6 +242,12 @@ export class Application {
     this.startCategoryMonitor();
     this.usageTimer = setInterval(() => { void this.persistUsage(); }, 60_000);
     this.healthTimer = setInterval(() => { void this.refreshDatabaseHealth(); }, 30_000);
+    if (this.twitchOAuth) {
+      void this.refreshExpiringTwitchCredentials();
+      this.oauthRefreshTimer = setInterval(() => {
+        void this.refreshExpiringTwitchCredentials();
+      }, TWITCH_OAUTH_REFRESH_INTERVAL_MS);
+    }
   }
 
   async stop(): Promise<void> {
@@ -228,9 +256,11 @@ export class Application {
     if (this.categoryTimer) clearInterval(this.categoryTimer);
     if (this.usageTimer) clearInterval(this.usageTimer);
     if (this.healthTimer) clearInterval(this.healthTimer);
+    if (this.oauthRefreshTimer) clearInterval(this.oauthRefreshTimer);
     this.categoryTimer = undefined;
     this.usageTimer = undefined;
     this.healthTimer = undefined;
+    this.oauthRefreshTimer = undefined;
     await this.api?.stop();
     await this.coordinator?.stop();
     await this.memory.stop();
@@ -257,7 +287,8 @@ export class Application {
       if (this.decisions.length > 100) this.decisions.shift();
       this.api.emitDecision(decision);
     });
-    this.botManager.on('status', (bots) => {
+    this.botManager.on('status', (bots: BotAccountRecord[]) => {
+      this.contextStore.configure({ botUsernames: bots.map((bot) => bot.username) });
       this.api.emitBots(bots);
       this.api.emitOverview();
     });
@@ -271,7 +302,7 @@ export class Application {
     this.memory.recordChat(message);
     this.api.emitChat(message);
     if (message.kind !== 'viewer') return;
-    const mentions = this.config.twitch.accounts
+    const mentions = this.botManager.listStatuses()
       .map((account) => account.username)
       .filter((username) => new RegExp(`@${escapeRegex(username)}\\b`, 'i').test(message.message));
     if (mentions.length === 0) return;
@@ -354,10 +385,121 @@ export class Application {
   private async refreshDatabaseHealth(): Promise<void> {
     this.databaseReady = Boolean(this.config.database.url && await this.repository.healthCheck());
   }
+
+  private configureTwitchOAuth(): void {
+    const { clientId, clientSecret, oauthRedirectUri, tokenEncryptionKey } = this.config.twitch;
+    if (!clientId || !clientSecret || !oauthRedirectUri || !tokenEncryptionKey) {
+      this.logger.warn('Refreshable Twitch OAuth is disabled; client credentials, redirect URI and encryption key are required');
+      return;
+    }
+    this.twitchOAuth = new TwitchOAuthService({
+      repository: this.repository,
+      gateway: new OfficialTwitchOAuthGateway(clientId, clientSecret, oauthRedirectUri),
+      validator: new OfficialTwitchTokenValidator(),
+      encryptionKey: tokenEncryptionKey,
+      callbackUrl: oauthRedirectUri,
+    });
+  }
+
+  private async mergeStoredTwitchAccounts(): Promise<void> {
+    if (!this.twitchOAuth) return;
+    const storedBots = new Map((await this.repository.listBots()).map((bot) => [bot.username, bot]));
+    const configured = new Map(this.config.twitch.accounts.map((account) => [account.username, account]));
+    const statuses = await this.twitchOAuth.listAuthorizedAccounts();
+    const outcomes = await settledInBatches(statuses, 10, (status) => this.twitchOAuth!.loadAuthorizedAccount(status.username));
+    outcomes.forEach((outcome, index) => {
+      const status = statuses[index]!;
+      if (outcome.status === 'rejected') {
+        this.logger.warn('Stored Twitch authorization could not be loaded', { bot: status.username, cause: outcome.reason });
+        return;
+      }
+      const authorized = outcome.value;
+      if (!authorized) return;
+      const priorUsername = authorized.previousUsername ?? status.username;
+      const priorConfig = configured.get(authorized.username) ?? configured.get(priorUsername);
+      const priorStatus = storedBots.get(authorized.username) ?? storedBots.get(priorUsername);
+      if (priorUsername !== authorized.username) configured.delete(priorUsername);
+      configured.set(authorized.username, {
+        username: authorized.username,
+        oauthToken: authorized.accessToken,
+        personaId: priorStatus?.personaId ?? priorConfig?.personaId ?? 'analyst',
+        // A validated refreshable credential is safe to enable; persisted dashboard state remains authoritative.
+        enabled: true,
+      });
+    });
+    this.config.twitch.accounts = [...configured.values()];
+  }
+
+  private async completeTwitchAuthorization(code: string, state: string, browserState: string): Promise<{ username: string }> {
+    if (!this.twitchOAuth) throw new Error('Refreshable Twitch OAuth is not configured');
+    const authorized = await this.twitchOAuth.completeAuthorization(code, state, browserState);
+    const priorUsername = authorized.previousUsername ?? authorized.username;
+    const previous = this.botManager.listStatuses().find((bot) =>
+      bot.username === authorized.username || bot.username === priorUsername);
+    await this.botManager.upsertAuthorizedAccount({
+      username: authorized.username,
+      oauthToken: authorized.accessToken,
+      personaId: previous?.personaId ?? 'analyst',
+      enabled: previous?.enabled ?? true,
+    }, authorized.previousUsername);
+    const existingIndex = this.config.twitch.accounts.findIndex((account) =>
+      account.username === authorized.username || account.username === priorUsername);
+    const runtimeAccount = {
+      username: authorized.username,
+      oauthToken: authorized.accessToken,
+      personaId: previous?.personaId ?? 'analyst',
+      enabled: previous?.enabled ?? true,
+    };
+    if (existingIndex >= 0) this.config.twitch.accounts[existingIndex] = runtimeAccount;
+    else this.config.twitch.accounts.push(runtimeAccount);
+    this.contextStore.configure({ botUsernames: this.botManager.listStatuses().map((bot) => bot.username) });
+    return { username: authorized.username };
+  }
+
+  private async refreshExpiringTwitchCredentials(): Promise<void> {
+    if (!this.twitchOAuth) return;
+    try {
+      const refreshBefore = Date.now() + TWITCH_OAUTH_REFRESH_LEAD_MS;
+      const accounts = (await this.twitchOAuth.listAuthorizedAccounts()).filter((account) =>
+        account.expiresAt <= refreshBefore && account.refreshState !== 'RECONNECT_REQUIRED');
+      const outcomes = await Promise.allSettled(accounts.map(async (account): Promise<AuthorizedTwitchAccount> => {
+        const refreshed = await this.twitchOAuth!.refreshAccount(account.username);
+        const priorUsername = refreshed.previousUsername ?? account.username;
+        const current = this.botManager.listStatuses().find((bot) =>
+          bot.username === refreshed.username || bot.username === priorUsername);
+        await this.botManager.upsertAuthorizedAccount({
+          username: refreshed.username,
+          oauthToken: refreshed.accessToken,
+          personaId: current?.personaId ?? 'analyst',
+          enabled: current?.enabled ?? true,
+        }, refreshed.previousUsername);
+        return refreshed;
+      }));
+      outcomes.forEach((outcome, index) => {
+        if (outcome.status === 'rejected') {
+          this.logger.warn('Twitch token refresh failed', { bot: accounts[index]?.username, cause: outcome.reason });
+        }
+      });
+    } catch (cause) {
+      this.logger.warn('Twitch token refresh cycle failed', { cause });
+    }
+  }
 }
 
 function escapeRegex(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 function stringSetting(value: unknown, fallback: string): string { return typeof value === 'string' ? value : fallback; }
 function boundedNumberSetting(value: unknown, fallback: number, minimum: number, maximum: number): number {
   return typeof value === 'number' && value >= minimum && value <= maximum ? value : fallback;
+}
+
+async function settledInBatches<T, R>(
+  values: T[],
+  batchSize: number,
+  operation: (value: T) => Promise<R>,
+): Promise<Array<PromiseSettledResult<R>>> {
+  const outcomes: Array<PromiseSettledResult<R>> = [];
+  for (let index = 0; index < values.length; index += batchSize) {
+    outcomes.push(...await Promise.allSettled(values.slice(index, index + batchSize).map(operation)));
+  }
+  return outcomes;
 }

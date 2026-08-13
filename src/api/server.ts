@@ -10,6 +10,7 @@ import { BotAccountRecord } from '../persistence/repository';
 import { ReactionDecisionRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
+import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
 import { createDashboardAuth } from './auth';
 
 export interface HealthPayload {
@@ -50,6 +51,13 @@ export interface ApiServerDependencies {
   updateSettings: (settings: Record<string, unknown>) => Promise<{ restartRequired: string[] }>;
   personas: () => BotPersona[];
   updatePersona: (persona: BotPersona) => Promise<void>;
+  twitchOAuth?: {
+    status: () => Promise<TwitchOAuthStatus>;
+    startAuthorization: () => Promise<string>;
+    launchAuthorization: (ticket: string) => Promise<LaunchedTwitchAuthorization>;
+    abandonAuthorization: (state: string, browserState: string) => Promise<void>;
+    completeAuthorization: (code: string, state: string, browserState: string) => Promise<{ username: string }>;
+  };
 }
 
 export interface ApiServer {
@@ -141,7 +149,88 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     auth.clearSession(response);
     response.json({ authenticated: false });
   });
+  app.get('/api/twitch/oauth/launch', async (request, response) => {
+    const redirect = dashboardRedirect(dependencies.frontendUrls[0]);
+    const ticket = typeof request.query.ticket === 'string' ? request.query.ticket : '';
+    if (!dependencies.twitchOAuth || !ticket) {
+      redirect.searchParams.set('twitchOAuth', 'error');
+      redirect.searchParams.set('reason', dependencies.twitchOAuth ? 'invalid_launch' : 'not_configured');
+      return response.redirect(302, redirect.toString());
+    }
+    try {
+      const launched = await dependencies.twitchOAuth.launchAuthorization(ticket);
+      response.append('Set-Cookie', serializeOAuthStateCookie(
+        launched.browserState,
+        10 * 60,
+        dependencies.secureCookies ?? false,
+      ));
+      return response.redirect(302, launched.authorizationUrl);
+    } catch (cause) {
+      logger.warn('Twitch OAuth launch failed', { cause });
+      redirect.searchParams.set('twitchOAuth', 'error');
+      redirect.searchParams.set('reason', 'invalid_launch');
+      return response.redirect(302, redirect.toString());
+    }
+  });
+  app.get('/api/twitch/oauth/callback', async (request, response) => {
+    const redirect = dashboardRedirect(dependencies.frontendUrls[0]);
+    const browserState = parseCookie(request.headers.cookie, TWITCH_OAUTH_STATE_COOKIE) ?? '';
+    response.append('Set-Cookie', serializeOAuthStateCookie('', 0, dependencies.secureCookies ?? false));
+    if (!dependencies.twitchOAuth) {
+      redirect.searchParams.set('twitchOAuth', 'error');
+      redirect.searchParams.set('reason', 'not_configured');
+      return response.redirect(302, redirect.toString());
+    }
+    if (typeof request.query.error === 'string') {
+      const state = typeof request.query.state === 'string' ? request.query.state : '';
+      try {
+        await dependencies.twitchOAuth.abandonAuthorization(state, browserState);
+        redirect.searchParams.set('reason', 'access_denied');
+      } catch (cause) {
+        logger.warn('Twitch OAuth denial had invalid state', { cause });
+        redirect.searchParams.set('reason', 'invalid_state');
+      }
+      redirect.searchParams.set('twitchOAuth', 'error');
+      return response.redirect(302, redirect.toString());
+    }
+    const query = z.object({ code: z.string().min(1).max(1_000), state: z.string().min(1).max(2_000) }).safeParse(request.query);
+    if (!query.success) {
+      const state = typeof request.query.state === 'string' ? request.query.state : '';
+      if (state && browserState) {
+        try { await dependencies.twitchOAuth.abandonAuthorization(state, browserState); }
+        catch (cause) { logger.warn('Malformed Twitch OAuth callback had invalid state', { cause }); }
+      }
+      redirect.searchParams.set('twitchOAuth', 'error');
+      redirect.searchParams.set('reason', 'invalid_callback');
+      return response.redirect(302, redirect.toString());
+    }
+    try {
+      const account = await dependencies.twitchOAuth.completeAuthorization(query.data.code, query.data.state, browserState);
+      redirect.searchParams.set('twitchOAuth', 'success');
+      redirect.searchParams.set('username', account.username);
+    } catch (cause) {
+      logger.warn('Twitch OAuth callback failed', { cause });
+      redirect.searchParams.set('twitchOAuth', 'error');
+      redirect.searchParams.set('reason', cause instanceof Error && cause.message.includes('OAuth state')
+        ? 'invalid_state'
+        : 'authorization_failed');
+    }
+    return response.redirect(302, redirect.toString());
+  });
   app.use('/api', auth.middleware);
+  app.get('/api/twitch/oauth/status', async (_request, response, next) => {
+    try {
+      response.json(dependencies.twitchOAuth
+        ? await dependencies.twitchOAuth.status()
+        : { configured: false, accounts: [] });
+    } catch (error) { next(error); }
+  });
+  app.post('/api/twitch/oauth/start', async (_request, response, next) => {
+    if (!dependencies.twitchOAuth) return response.status(503).json({ error: 'OAuth Twitch не настроен на сервере' });
+    try {
+      return response.json({ authorizationUrl: await dependencies.twitchOAuth.startAuthorization() });
+    } catch (error) { return next(error); }
+  });
   app.get('/api/overview', (_request, response) => response.json(dependencies.overview()));
   app.get('/api/bots', (_request, response) => response.json(dependencies.bots()));
   app.patch('/api/bots/:username', async (request, response, next) => {
@@ -236,4 +325,27 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     emitDecision: (decision) => io.emit('decision', decision),
     emitOverview: () => io.emit('overview', dependencies.overview()),
   };
+}
+
+function dashboardRedirect(frontendUrl: string | undefined): URL {
+  return new URL('/', frontendUrl || 'http://localhost:5173');
+}
+
+const TWITCH_OAUTH_STATE_COOKIE = 'twitchai_oauth_state';
+
+function serializeOAuthStateCookie(value: string, maxAgeSeconds: number, secure: boolean): string {
+  return [
+    `${TWITCH_OAUTH_STATE_COOKIE}=${encodeURIComponent(value)}`,
+    'Path=/api/twitch/oauth',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${maxAgeSeconds}`,
+    ...(secure ? ['Secure'] : []),
+  ].join('; ');
+}
+
+function parseCookie(header: string | undefined, name: string): string | undefined {
+  const raw = header?.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`));
+  if (!raw) return undefined;
+  try { return decodeURIComponent(raw.slice(name.length + 1)); } catch { return undefined; }
 }

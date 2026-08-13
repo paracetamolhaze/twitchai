@@ -26,6 +26,8 @@ PostgreSQL ─ events / history / ReactionMemory ───┤
                        natural delays → official Twitch chat
 
 Railway backend ← authenticated HTTPS + Socket.IO → Vercel dashboard
+       │                 │
+       └─ Twitch OAuth code → encrypted access + refresh tokens
                          │
                      PostgreSQL
 ```
@@ -53,7 +55,7 @@ Backend: `http://localhost:3000`, dashboard: `http://localhost:5173`. Без `DA
 Полный шаблон находится в [.env.example](.env.example). Основные группы:
 
 - приложение: `PORT`, `LOG_LEVEL`, `DASHBOARD_TOKEN`, `DASHBOARD_SESSION_DAYS`, `FRONTEND_URL`;
-- Twitch: необязательный стартовый `TWITCH_CHANNEL`, Client ID/Secret и `BOTn_*`;
+- Twitch: необязательный стартовый `TWITCH_CHANNEL`, Client ID/Secret, OAuth callback, ключ шифрования и legacy `BOTn_*`;
 - Gemini: `GEMINI_API_KEY`, централизованный `GEMINI_LIVE_MODEL`;
 - медиа: `STREAM_CONTEXT`, `VISION_FPS`, `VISION_FRAME_WIDTH`;
 - hard policy: задержки, общий rate limit и `MAX_REACTIONS_PER_EVENT`;
@@ -71,11 +73,21 @@ Production CORS принимает только точные адреса из `
 
 ## Настройка Twitch OAuth
 
-1. Создайте приложение в [Twitch Developer Console](https://dev.twitch.tv/console).
-2. Задайте `TWITCH_CLIENT_ID` и `TWITCH_CLIENT_SECRET` для автоматического обновления категории.
-3. Получите отдельный user access token каждого bot-аккаунта со scope `chat:read` и `chat:edit`.
-4. Добавьте `BOT1_USERNAME` и `BOT1_OAUTH_TOKEN`, затем следующие аккаунты. Для миграции поддерживается старое имя `BOTn_OAUTH`.
-5. Token каждого аккаунта проверяется официальным endpoint Twitch; один сломанный аккаунт не останавливает остальные.
+1. Создайте **Confidential** приложение в [Twitch Developer Console](https://dev.twitch.tv/console).
+2. Добавьте точный callback: локально `http://localhost:3000/api/twitch/oauth/callback`, в production — `https://your-backend.up.railway.app/api/twitch/oauth/callback`.
+3. Задайте `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET` и тот же адрес в `TWITCH_OAUTH_REDIRECT_URI`.
+4. Один раз сгенерируйте `TWITCH_TOKEN_ENCRYPTION_KEY`:
+
+```powershell
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+5. Откройте страницу «Боты» в dashboard, нажмите «Подключить или обновить аккаунт» и войдите в конкретный bot-аккаунт. Для каждого аккаунта это делается один раз.
+6. Backend использует Authorization Code Grant только со scopes `chat:read` и `chat:edit`, проверяет реального владельца через Twitch `/validate`, шифрует access/refresh tokens AES-256-GCM и сохраняет их в PostgreSQL.
+
+Access token не бывает бессрочным. Backend обновляет его через refresh token заранее перед истечением и реактивно при невалидном access token. Новый refresh token сохраняется атомарно. Повторный ручной вход понадобится только после отзыва приложения, смены пароля, потери ключа шифрования или другого отзыва Twitch. Один сломанный аккаунт не останавливает остальные.
+
+`BOTn_USERNAME`/`BOTn_OAUTH_TOKEN` остаются только как legacy/bootstrap путь. Токены из Implicit Flow (например, сторонних генераторов) refresh token не имеют и автоматически продлеваться не могут.
 
 Состояния: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `ERROR`, `DISABLED`. Backend применяет дополнительный локальный Twitch rate limiter.
 
@@ -89,7 +101,7 @@ Production CORS принимает только точные адреса из `
 
 ## PostgreSQL и миграции
 
-`migrations/001_initial.sql` создаёт таблицы персон, метаданных ботов, ReactionMemory, истории сообщений, событий стрима, runtime settings и usage snapshots.
+`migrations/001_initial.sql` создаёт таблицы персон, метаданных ботов, ReactionMemory, истории сообщений, событий стрима, runtime settings и usage snapshots. `migrations/002_twitch_oauth.sql` добавляет зашифрованное хранилище refreshable Twitch credentials; открытые токены в таблицу не записываются.
 
 ```powershell
 $env:DATABASE_URL='postgresql://...'
@@ -132,9 +144,10 @@ npm run railway:import:twitch-accounts -- twitchaccs.txt
 
 1. Создайте service из этого репозитория и подключите PostgreSQL.
 2. Добавьте backend-переменные из `.env.example`; `DATABASE_URL` лучше задавать ссылкой `${{Postgres.DATABASE_URL}}`.
-3. Укажите точный Vercel origin в `FRONTEND_URL`.
-4. `nixpacks.toml` ставит Node 20, FFmpeg и Streamlink; Railway запускает `node dist/main.js` как long-running process.
-5. Healthcheck: `GET /health`. Ответ не содержит секретов.
+3. Укажите точный Vercel origin в `FRONTEND_URL`, а публичный backend callback — в `TWITCH_OAUTH_REDIRECT_URI` и Twitch Developer Console.
+4. Создайте стабильный `TWITCH_TOKEN_ENCRYPTION_KEY` и не меняйте его между deploy/restart.
+5. `nixpacks.toml` ставит Node 20, FFmpeg и Streamlink; Railway запускает `node dist/main.js` как long-running process.
+6. Healthcheck: `GET /health`. Ответ не содержит секретов.
 
 ## Vercel: dashboard
 
@@ -144,7 +157,7 @@ Root Directory: `frontend/`, Framework: Vite, Output: `dist`. Единствен
 VITE_API_URL=https://your-backend.up.railway.app
 ```
 
-Dashboard показывает состояние backend/Twitch/Gemini, аккаунты, события, чат, решения AI, usage, настройки канала и персон. Постоянные Twitch/Gemini/FFmpeg соединения на Vercel не создаются.
+Dashboard показывает состояние backend/Twitch/Gemini, аккаунты и их refreshable OAuth-статус, события, чат, решения AI, usage, настройки канала и персон. Кнопка OAuth только начинает защищённый переход; Client Secret и полученные токены никогда не проходят через Vercel frontend. Постоянные Twitch/Gemini/FFmpeg соединения на Vercel не создаются.
 
 ## Проверка
 
@@ -159,6 +172,8 @@ npm run verify
 - **Мозг стрима выключен:** проверьте `GEMINI_API_KEY` и модель; канал можно задать в dashboard.
 - **Медиапоток offline/error:** проверьте Streamlink, FFmpeg и активность канала.
 - **Bot ERROR:** проверьте владельца токена и scopes `chat:read`/`chat:edit`.
+- **OAuth redirect mismatch:** адрес в Twitch Developer Console должен посимвольно совпадать с `TWITCH_OAUTH_REDIRECT_URI`.
+- **Refresh token недействителен:** переподключите только этот аккаунт кнопкой в dashboard; остальные продолжат работу.
 - **Категория не обновляется:** нужны Twitch Client ID/Secret.
 - **Dashboard снова просит токен:** cookie истекла/очищена, `DASHBOARD_TOKEN` сменился или браузер блокирует cross-site cookies.
 - **CORS:** `FRONTEND_URL` должен точно совпадать с origin браузера.
@@ -170,6 +185,7 @@ npm run verify
 - [ ] Старые/показанные где-либо credentials отозваны и заменены.
 - [ ] PostgreSQL подключён, migration применена, `/health` показывает `database: true`.
 - [ ] У каждого Twitch token правильный username и scopes.
+- [ ] OAuth callback совпадает в Twitch Console/Railway, а `TWITCH_TOKEN_ENCRYPTION_KEY` сохранён как стабильный secret.
 - [ ] `GEMINI_LIVE_MODEL` доступна, reconnect/usage отслеживаются.
 - [ ] `FRONTEND_URL` и `VITE_API_URL` указывают друг на друга корректно.
 - [ ] Вход по HttpOnly-сессии и Socket.IO проверены с production-origin.

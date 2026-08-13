@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Pool, PoolClient } from 'pg';
 
-const MIGRATIONS = ['001_initial.sql'];
+const MIGRATIONS = ['001_initial.sql', '002_twitch_oauth.sql', '003_twitch_oauth_credential_version.sql'];
 
 export async function runMigrations(pool: Pool): Promise<void> {
   const client = await pool.connect();

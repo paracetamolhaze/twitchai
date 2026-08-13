@@ -22,6 +22,8 @@ export interface AppConfig {
     channel: string;
     clientId?: string;
     clientSecret?: string;
+    oauthRedirectUri?: string;
+    tokenEncryptionKey?: string;
     accounts: BotAccountConfig[];
     categoryRefreshMs: number;
   };
@@ -69,6 +71,8 @@ const envSchema = z.object({
   TWITCH_CHANNEL: z.string().default(''),
   TWITCH_CLIENT_ID: z.string().trim().optional(),
   TWITCH_CLIENT_SECRET: z.string().trim().optional(),
+  TWITCH_OAUTH_REDIRECT_URI: z.string().trim().url().optional(),
+  TWITCH_TOKEN_ENCRYPTION_KEY: z.string().min(32).optional(),
   TWITCH_CATEGORY_REFRESH_SECONDS: z.coerce.number().min(30).max(3600).default(120),
   GEMINI_API_KEY: z.string().trim().optional(),
   GEMINI_LIVE_MODEL: z.string().trim().default('gemini-3.1-flash-live-preview'),
@@ -142,6 +146,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       channel: normalizeChannel(parsed.TWITCH_CHANNEL),
       clientId: parsed.TWITCH_CLIENT_ID,
       clientSecret: parsed.TWITCH_CLIENT_SECRET,
+      oauthRedirectUri: parsed.TWITCH_OAUTH_REDIRECT_URI,
+      tokenEncryptionKey: parsed.TWITCH_TOKEN_ENCRYPTION_KEY,
       accounts: readBotAccounts(env),
       categoryRefreshMs: parsed.TWITCH_CATEGORY_REFRESH_SECONDS * 1000,
     },

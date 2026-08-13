@@ -8,6 +8,7 @@ import { AppRepository, BotAccountRecord } from '../persistence/repository';
 import { ReactionBotCandidate } from '../reaction/types';
 import { ChatMessage } from '../stream-brain/types';
 import { OfficialTwitchTokenValidator, TwitchTokenValidator } from './oauth-validator';
+import { TwitchAccessTokenProvider } from './oauth-service';
 
 interface ManagedBot {
   config: BotAccountConfig;
@@ -23,6 +24,7 @@ export interface TwitchBotManagerOptions {
   personas: PersonaStore;
   logger: Logger;
   validator?: TwitchTokenValidator;
+  credentialProvider?: TwitchAccessTokenProvider;
   clientFactory?: (options: tmi.Options) => TwitchChatClient;
 }
 
@@ -138,6 +140,42 @@ export class TwitchBotManager extends EventEmitter {
     return true;
   }
 
+  async upsertAuthorizedAccount(account: BotAccountConfig, previousUsername?: string): Promise<void> {
+    const username = account.username.toLowerCase();
+    const existing = this.bots.get(username) ?? (previousUsername ? this.bots.get(previousUsername.toLowerCase()) : undefined);
+    if (!existing) {
+      const personaId = this.options.personas.get(account.personaId, this.bots.size).id;
+      const bot: ManagedBot = {
+        config: { ...account, username, personaId },
+        sentAt: [],
+        status: {
+          username,
+          personaId,
+          enabled: account.enabled,
+          connectionState: account.enabled ? 'DISCONNECTED' : 'DISABLED',
+          chatConnected: false,
+          messagesSent: 0,
+        },
+      };
+      this.bots.set(username, bot);
+      await this.persist(bot);
+      this.emit('status', this.listStatuses());
+      if (this.channel && account.enabled) await this.connectBot(bot);
+      return;
+    }
+
+    if (existing.config.username !== username) this.renameManagedBot(existing, username);
+    try { await existing.client?.disconnect(); } catch { /* already disconnected */ }
+    existing.client = undefined;
+    existing.config.oauthToken = account.oauthToken;
+    await this.patch(existing, {
+      connectionState: existing.config.enabled ? 'DISCONNECTED' : 'DISABLED',
+      chatConnected: false,
+      lastError: undefined,
+    });
+    if (this.channel && existing.config.enabled) await this.connectBot(existing);
+  }
+
   async send(username: string, message: string): Promise<boolean> {
     const bot = this.bots.get(username.toLowerCase());
     if (!bot?.client || bot.status.connectionState !== 'CONNECTED' || !bot.status.chatConnected) return false;
@@ -168,13 +206,35 @@ export class TwitchBotManager extends EventEmitter {
     if (!bot.config.enabled || bot.client) return;
     await this.patch(bot, { connectionState: 'CONNECTING', chatConnected: false, lastError: undefined });
     try {
-      const validated = await this.validator.validate(bot.config.oauthToken);
+      let resolved = this.options.credentialProvider
+        ? await this.options.credentialProvider.resolveCredential(bot.config.username, bot.config.oauthToken)
+        : { username: bot.config.username, accessToken: bot.config.oauthToken };
+      if (resolved.username !== bot.config.username) this.renameManagedBot(bot, resolved.username);
+      let validated;
+      try {
+        validated = await this.validator.validate(resolved.accessToken);
+      } catch (validationError) {
+        const refreshed = await this.options.credentialProvider?.forceRefresh(bot.config.username);
+        if (!refreshed) throw validationError;
+        resolved = refreshed;
+        if (resolved.username !== bot.config.username) this.renameManagedBot(bot, resolved.username);
+        validated = await this.validator.validate(resolved.accessToken);
+      }
+      if (validated.login !== bot.config.username && this.options.credentialProvider) {
+        const refreshed = await this.options.credentialProvider.forceRefresh(bot.config.username);
+        if (refreshed) {
+          resolved = refreshed;
+          if (resolved.username !== bot.config.username) this.renameManagedBot(bot, resolved.username);
+          validated = await this.validator.validate(resolved.accessToken);
+        }
+      }
       if (validated.login !== bot.config.username) throw new Error(`OAuth token belongs to ${validated.login}, not ${bot.config.username}`);
+      bot.config.oauthToken = resolved.accessToken;
       const clientOptions: tmi.Options = {
         options: { debug: false, skipUpdatingEmotesets: true },
         identity: {
           username: bot.config.username,
-          password: bot.config.oauthToken.startsWith('oauth:') ? bot.config.oauthToken : `oauth:${bot.config.oauthToken}`,
+          password: resolved.accessToken.startsWith('oauth:') ? resolved.accessToken : `oauth:${resolved.accessToken}`,
         },
         channels: [this.channel],
         connection: {
@@ -234,6 +294,19 @@ export class TwitchBotManager extends EventEmitter {
     this.readerUsername = [...this.bots.values()].find((candidate) =>
       candidate.config.username !== excluding && candidate.status.connectionState === 'CONNECTED' && candidate.status.chatConnected,
     )?.config.username;
+  }
+
+  private renameManagedBot(bot: ManagedBot, nextUsername: string): void {
+    const normalized = nextUsername.toLowerCase();
+    const previous = bot.config.username;
+    const collision = this.bots.get(normalized);
+    if (collision && collision !== bot) throw new Error(`Twitch account ${normalized} is already configured`);
+    this.bots.delete(previous);
+    bot.config.username = normalized;
+    bot.status.username = normalized;
+    this.bots.set(normalized, bot);
+    if (this.readerUsername === previous) this.readerUsername = normalized;
+    this.emit('status', this.listStatuses());
   }
 
   private async patch(bot: ManagedBot, patch: Partial<BotAccountRecord>): Promise<void> {

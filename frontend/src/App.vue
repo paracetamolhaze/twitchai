@@ -35,6 +35,20 @@ interface Bot {
   lastReactionAt?: number
   lastError?: string
 }
+interface TwitchOAuthAccount {
+  username: string
+  scopes: string[]
+  expiresAt: number
+  refreshable: boolean
+  refreshState: 'HEALTHY' | 'ERROR' | 'RECONNECT_REQUIRED'
+  lastRefreshAt?: number
+  lastRefreshError?: string
+}
+interface TwitchOAuthStatus {
+  configured: boolean
+  callbackUrl?: string
+  accounts: TwitchOAuthAccount[]
+}
 interface StreamEvent {
   id: string
   timestamp: number
@@ -115,6 +129,7 @@ const realtimeOnline = ref(false)
 const loading = ref(false)
 const errorMessage = ref('')
 const saveMessage = ref('')
+const oauthConnecting = ref(false)
 const overview = reactive<Overview>({
   channel: '', category: '', isLive: false, twitchConnected: false,
   streamBrain: { state: 'DISCONNECTED', mediaConnected: false, geminiConnected: false },
@@ -131,6 +146,7 @@ const events = ref<StreamEvent[]>([])
 const chat = ref<ChatMessage[]>([])
 const personas = ref<Persona[]>([])
 const decisions = ref<ReactionDecision[]>([])
+const twitchOAuth = reactive<TwitchOAuthStatus>({ configured: false, accounts: [] })
 const settings = reactive({ channel: '', streamContext: '', visionFps: 1 })
 let socket: Socket | undefined
 let pollTimer: number | undefined
@@ -163,6 +179,9 @@ const healthItems = computed(() => [
   { label: 'Медиапоток', ok: overview.streamBrain.mediaConnected, detail: overview.streamBrain.mediaConnected ? 'Аудио и выбранные видеокадры' : stateLabel(overview.streamBrain.state) },
   { label: 'Gemini Live', ok: overview.streamBrain.geminiConnected, detail: overview.streamBrain.geminiConnected ? 'Единая Live-сессия подключена' : overview.streamBrain.lastError || 'Отключено' },
 ])
+const refreshableUsernames = computed(() => new Set(
+  twitchOAuth.accounts.filter((account) => account.refreshable).map((account) => account.username),
+))
 
 function requestHeaders(extra?: HeadersInit, hasBody = false): Headers {
   const value = new Headers(extra)
@@ -204,10 +223,10 @@ async function loadDashboard(): Promise<void> {
   if (!authenticated.value) return
   loading.value = true
   try {
-    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData, decisionData] = await Promise.all([
+    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData, decisionData, oauthData] = await Promise.all([
       api<Overview>('/api/overview'), api<Bot[]>('/api/bots'), api<StreamEvent[]>('/api/events?limit=100'),
       api<ChatMessage[]>('/api/chat'), api<Usage>('/api/usage'), api<Record<string, unknown>>('/api/settings'),
-      api<Persona[]>('/api/personas'), api<ReactionDecision[]>('/api/decisions'),
+      api<Persona[]>('/api/personas'), api<ReactionDecision[]>('/api/decisions'), api<TwitchOAuthStatus>('/api/twitch/oauth/status'),
     ])
     Object.assign(overview, overviewData)
     Object.assign(usage, usageData)
@@ -216,6 +235,7 @@ async function loadDashboard(): Promise<void> {
     chat.value = chatData
     personas.value = personaData
     decisions.value = decisionData
+    Object.assign(twitchOAuth, oauthData)
     settings.channel = String(settingsData.channel || '')
     settings.streamContext = String(settingsData.streamContext || '')
     settings.visionFps = Number(settingsData.visionFps || 1)
@@ -284,6 +304,22 @@ async function toggleBot(bot: Bot): Promise<void> {
   } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
 }
 
+async function connectTwitchAccount(): Promise<void> {
+  oauthConnecting.value = true
+  errorMessage.value = ''
+  try {
+    const result = await api<{ authorizationUrl: string }>('/api/twitch/oauth/start', { method: 'POST' })
+    const authorizationUrl = new URL(result.authorizationUrl)
+    if (authorizationUrl.origin !== new URL(API_URL).origin || authorizationUrl.pathname !== '/api/twitch/oauth/launch') {
+      throw new Error('Сервер вернул недопустимый адрес авторизации Twitch')
+    }
+    window.location.assign(authorizationUrl.toString())
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+    oauthConnecting.value = false
+  }
+}
+
 async function saveSettings(): Promise<void> {
   saveMessage.value = ''
   try {
@@ -301,6 +337,9 @@ async function savePersona(persona: Persona): Promise<void> {
 
 function formatTime(timestamp?: number): string {
   return timestamp ? new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(timestamp) : '—'
+}
+function formatDate(timestamp?: number): string {
+  return timestamp ? new Intl.DateTimeFormat('ru-RU', { dateStyle: 'medium', timeStyle: 'short' }).format(timestamp) : '—'
 }
 function formatDuration(seconds: number): string {
   const hours = Math.floor(seconds / 3600)
@@ -345,7 +384,34 @@ function translateApiError(message: string): string {
   return labels[message] || message
 }
 
+function consumeOAuthResult(): void {
+  const url = new URL(window.location.href)
+  const result = url.searchParams.get('twitchOAuth')
+  if (!result) return
+  activePage.value = 'bots'
+  if (result === 'success') {
+    const username = url.searchParams.get('username') || 'аккаунт'
+    saveMessage.value = `Учётная запись Twitch ${username} подключена. Токен будет обновляться автоматически.`
+  } else {
+    const reason = url.searchParams.get('reason') || 'authorization_failed'
+    const labels: Record<string, string> = {
+      access_denied: 'Вы отменили доступ в Twitch.',
+      invalid_state: 'Срок безопасной сессии авторизации истёк. Запустите подключение ещё раз.',
+      invalid_callback: 'Twitch вернул неполный ответ авторизации.',
+      invalid_launch: 'Ссылка подключения уже использована или истекла. Нажмите кнопку ещё раз.',
+      not_configured: 'Авторизация Twitch ещё не настроена на сервере.',
+      authorization_failed: 'Не удалось завершить авторизацию Twitch. Проверьте адрес возврата и повторите.',
+    }
+    errorMessage.value = labels[reason] || labels.authorization_failed
+  }
+  url.searchParams.delete('twitchOAuth')
+  url.searchParams.delete('username')
+  url.searchParams.delete('reason')
+  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+}
+
 onMounted(() => {
+  consumeOAuthResult()
   void checkSession()
   pollTimer = window.setInterval(() => {
     if (!authenticated.value) return
@@ -436,10 +502,31 @@ onBeforeUnmount(() => {
 
         <template v-else-if="activePage === 'bots'">
           <div class="page-heading"><div><p class="eyebrow">ОФИЦИАЛЬНЫЙ ЧАТ TWITCH</p><h1>Аккаунты ботов</h1></div><p class="muted">Сбой одного аккаунта не останавливает остальные. Накрутка просмотров не используется.</p></div>
+          <section class="panel oauth-panel">
+            <div class="panel-heading">
+              <div><p class="eyebrow">АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ</p><h3>Подключение через Twitch</h3></div>
+              <span :class="['state-badge', twitchOAuth.configured ? 'connected' : 'error']">{{ twitchOAuth.configured ? 'настроено' : 'не настроено' }}</span>
+            </div>
+            <div class="oauth-layout">
+              <div>
+                <p class="muted">Войдите в нужную учётную запись бота Twitch и подтвердите только чтение и отправку сообщений. Токены доступа и обновления сохраняются в PostgreSQL в зашифрованном виде и не попадают в клиентскую часть.</p>
+                <button class="primary" type="button" :disabled="!twitchOAuth.configured || oauthConnecting" @click="connectTwitchAccount">
+                  {{ oauthConnecting ? 'Переходим в Twitch…' : 'Подключить или обновить аккаунт' }}
+                </button>
+              </div>
+              <div class="oauth-summary">
+                <span>С автообновлением</span><strong>{{ twitchOAuth.accounts.filter((account) => account.refreshable).length }} из {{ bots.length }}</strong>
+                <small v-if="twitchOAuth.callbackUrl">Адрес возврата для панели разработчика Twitch:<br><code>{{ twitchOAuth.callbackUrl }}</code></small>
+              </div>
+            </div>
+            <div v-if="twitchOAuth.accounts.length" class="oauth-accounts">
+              <span v-for="account in twitchOAuth.accounts" :key="account.username" :class="['subtle-chip', account.refreshable ? '' : 'danger-chip']" :title="account.lastRefreshError || `Следующее обновление до ${formatDate(account.expiresAt)}`">{{ account.username }} · {{ account.refreshState === 'RECONNECT_REQUIRED' ? 'переподключить' : account.refreshState === 'ERROR' ? 'повтор' : 'авто' }}</span>
+            </div>
+          </section>
           <section class="panel table-panel">
             <div class="bot-table table-head"><span>Аккаунт</span><span>Состояние</span><span>Персона</span><span>Сообщения</span><span>Последняя реакция</span><span>Включён</span></div>
             <div v-for="bot in bots" :key="bot.username" class="bot-table table-row">
-              <div class="account-cell"><span class="avatar">{{ bot.username.slice(0, 2).toUpperCase() }}</span><div><strong>{{ bot.username }}</strong><small>{{ bot.chatConnected ? 'вошёл в чат' : bot.lastError || 'чат отключён' }}</small></div></div>
+              <div class="account-cell"><span class="avatar">{{ bot.username.slice(0, 2).toUpperCase() }}</span><div><strong>{{ bot.username }}</strong><small>{{ refreshableUsernames.has(bot.username) ? 'авторизация с автообновлением' : bot.chatConnected ? 'вошёл в чат' : bot.lastError || 'нужно переподключить через Twitch' }}</small></div></div>
               <span :class="['state-badge', stateClass(bot.connectionState)]">{{ stateLabel(bot.connectionState) }}</span><span>{{ bot.personaId }}</span><span>{{ bot.messagesSent }}</span><span>{{ formatTime(bot.lastReactionAt) }}</span>
               <button :class="['toggle', bot.enabled ? 'on' : '']" :aria-label="`Переключить ${bot.username}`" @click="toggleBot(bot)"><i></i></button>
             </div>
@@ -479,7 +566,7 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else>
-          <div class="page-heading"><div><p class="eyebrow">БЕЗОПАСНОЕ УПРАВЛЕНИЕ</p><h1>Настройки</h1></div><p class="muted">API-ключи и OAuth-токены никогда не передаются в панель.</p></div>
+          <div class="page-heading"><div><p class="eyebrow">БЕЗОПАСНОЕ УПРАВЛЕНИЕ</p><h1>Настройки</h1></div><p class="muted">Ключи доступа и токены Twitch никогда не передаются в панель.</p></div>
           <section class="settings-grid">
             <form class="panel settings-form" @submit.prevent="saveSettings">
               <div class="panel-heading"><div><p class="eyebrow">СТРИМ</p><h3>Источник и контекст</h3></div></div>
