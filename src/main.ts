@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { Application } from './application';
 import { loadConfig } from './config';
+import { Logger } from './logger';
 
 async function main(): Promise<void> {
   const application = new Application(loadConfig());
@@ -17,6 +18,6 @@ async function main(): Promise<void> {
 }
 
 void main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
+  new Logger('MAIN', 'error').error('Application startup failed', { cause: error });
   process.exitCode = 1;
 });

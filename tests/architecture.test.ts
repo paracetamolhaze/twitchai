@@ -1,0 +1,23 @@
+import { readFileSync, readdirSync } from 'node:fs';
+import { extname, join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+
+function sourceText(directory: string): string {
+  return readdirSync(directory, { withFileTypes: true })
+    .flatMap((entry) => {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) return [sourceText(path)];
+      return extname(path) === '.ts' ? [readFileSync(path, 'utf8')] : [];
+    })
+    .join('\n');
+}
+
+describe('single Stream Brain architecture', () => {
+  it('does not reintroduce per-bot text generation or the legacy reaction tool', () => {
+    const source = sourceText(join(process.cwd(), 'src'));
+    expect(source).not.toContain('.generateContent(');
+    expect(source).not.toContain('GeminiResponseProvider');
+    expect(source).not.toContain('gemini-3.1-flash-lite');
+    expect(source).not.toContain('record_stream_event');
+  });
+});

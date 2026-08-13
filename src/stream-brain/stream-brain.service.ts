@@ -22,6 +22,7 @@ export interface StreamBrainServiceOptions {
   logger: Logger;
   contextRefreshMs: number;
   enabled: boolean;
+  model?: string;
 }
 
 export class StreamBrainService extends EventEmitter {
@@ -37,6 +38,7 @@ export class StreamBrainService extends EventEmitter {
       state: options.enabled ? 'DISCONNECTED' : 'DISABLED',
       mediaConnected: false,
       geminiConnected: false,
+      ...(options.model ? { model: options.model } : {}),
     };
   }
 
@@ -48,7 +50,7 @@ export class StreamBrainService extends EventEmitter {
     this.patchStatus({ state: 'CONNECTING' });
     try {
       await this.options.gemini?.start();
-      this.options.media?.start();
+      if (this.options.contextStore.snapshot().channel) this.options.media?.start();
       this.pushContext();
       this.contextTimer = setInterval(() => this.pushContext(), this.options.contextRefreshMs);
     } catch (cause) {
@@ -84,12 +86,13 @@ export class StreamBrainService extends EventEmitter {
   onGeminiStatus(connected: boolean, error?: string): void {
     this.patchStatus({
       geminiConnected: connected,
+      sessionStartedAt: connected ? this.options.gemini?.getSessionStartedAt?.() : undefined,
       state: this.deriveState(this.status.mediaConnected, connected, error),
       lastError: error,
     });
   }
 
-  async acceptCandidate(candidate: StreamEventCandidate, source: StreamEventSource = 'gemini-live'): Promise<void> {
+  async acceptCandidate(candidate: StreamEventCandidate, source: StreamEventSource = 'gemini-live'): Promise<StreamEvent | undefined> {
     const snapshot = this.options.contextStore.snapshot();
     const event = this.options.eventDetector.normalize(candidate, {
       category: snapshot.category,
@@ -98,16 +101,27 @@ export class StreamBrainService extends EventEmitter {
     });
     if (!event) {
       this.logger.debug('Rejected invalid or low-confidence event');
-      return;
+      return undefined;
     }
     this.options.contextStore.addEvent(event);
+    this.options.usage.recordEventDetected();
     this.patchStatus({ lastEventAt: event.timestamp });
     this.logger.info('Normalized stream event', { type: event.type, importance: event.importance, confidence: event.confidence });
     this.emit('event', event);
     if (this.options.eventSink) {
-      void this.options.eventSink.saveStreamEvent(event)
+      await this.options.eventSink.saveStreamEvent(event)
         .catch((cause: unknown) => this.logger.warn('Stream event persistence failed', { eventId: event.id, cause }));
     }
+    return event;
+  }
+
+  requestReaction(candidate: StreamEventCandidate): void { this.options.gemini?.requestReaction(candidate); }
+
+  async reconfigureMedia(channel: string, visionFps: number): Promise<void> {
+    this.options.contextStore.configure({ channel });
+    await this.options.media?.reconfigure(channel, visionFps);
+    if (this.running && channel) this.options.media?.start();
+    this.pushContext();
   }
 
   sendAudio(pcm: Buffer, durationMs: number): void {

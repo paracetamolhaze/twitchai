@@ -7,9 +7,10 @@ import { z } from 'zod';
 import { Logger } from '../logger';
 import { BotPersona } from '../personas/types';
 import { BotAccountRecord } from '../persistence/repository';
+import { ReactionDecisionRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
-import { dashboardAuth, tokenMatches } from './auth';
+import { createDashboardAuth } from './auth';
 
 export interface HealthPayload {
   status: 'ok' | 'degraded';
@@ -34,6 +35,8 @@ export interface ApiServerDependencies {
   port: number;
   frontendUrls: string[];
   dashboardToken?: string;
+  dashboardSessionDays?: number;
+  secureCookies?: boolean;
   logger: Logger;
   health: () => HealthPayload;
   overview: () => OverviewPayload;
@@ -42,6 +45,7 @@ export interface ApiServerDependencies {
   events: (limit: number) => Promise<StreamEvent[]>;
   chat: () => ChatMessage[];
   usage: () => UsageSnapshot;
+  decisions?: () => ReactionDecisionRecord[];
   settings: () => Promise<Record<string, unknown>>;
   updateSettings: (settings: Record<string, unknown>) => Promise<{ restartRequired: string[] }>;
   personas: () => BotPersona[];
@@ -58,6 +62,7 @@ export interface ApiServer {
   emitEvent(event: StreamEvent): void;
   emitBots(bots: BotAccountRecord[]): void;
   emitBrain(status: StreamBrainStatus): void;
+  emitDecision(decision: ReactionDecisionRecord): void;
   emitOverview(): void;
 }
 
@@ -65,7 +70,6 @@ const settingsSchema = z.object({
   channel: z.string().trim().min(1).max(50).optional(),
   streamContext: z.string().max(2_000).optional(),
   visionFps: z.number().min(0.05).max(1).optional(),
-  eventThreshold: z.number().min(0).max(1).optional(),
 }).strict();
 
 const personaSchema: z.ZodType<BotPersona> = z.object({
@@ -97,9 +101,15 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
       if (originAllowed(origin)) callback(null, true);
       else callback(new Error('Origin is not allowed'));
     },
-    methods: ['GET', 'PATCH', 'PUT', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'OPTIONS'],
+    credentials: true,
     allowedHeaders: ['Authorization', 'Content-Type', 'X-Dashboard-Token'],
   };
+  const auth = createDashboardAuth({
+    token: dependencies.dashboardToken,
+    sessionDays: dependencies.dashboardSessionDays ?? 30,
+    secureCookies: dependencies.secureCookies ?? false,
+  });
   const io = new SocketServer(http, {
     cors: corsOptions,
     transports: ['websocket', 'polling'],
@@ -114,14 +124,31 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     const health = dependencies.health();
     response.status(health.status === 'ok' ? 200 : 503).json(health);
   });
-  app.use('/api', dashboardAuth(dependencies.dashboardToken));
+  app.post('/api/auth/login', (request, response) => {
+    if (!auth.configured()) return response.status(503).json({ error: 'Авторизация панели не настроена на сервере' });
+    const body = z.object({ token: z.string().min(1).max(1_000) }).safeParse(request.body);
+    if (!body.success || !auth.authenticate(request, body.data.token)) return response.status(401).json({ error: 'Неверный токен' });
+    auth.issueSession(response);
+    return response.json({ authenticated: true });
+  });
+  app.get('/api/auth/session', (request, response) => {
+    if (!auth.configured()) return response.status(503).json({ error: 'Авторизация панели не настроена на сервере' });
+    return auth.authenticate(request)
+      ? response.json({ authenticated: true })
+      : response.status(401).json({ authenticated: false });
+  });
+  app.post('/api/auth/logout', (_request, response) => {
+    auth.clearSession(response);
+    response.json({ authenticated: false });
+  });
+  app.use('/api', auth.middleware);
   app.get('/api/overview', (_request, response) => response.json(dependencies.overview()));
   app.get('/api/bots', (_request, response) => response.json(dependencies.bots()));
   app.patch('/api/bots/:username', async (request, response, next) => {
     try {
       const body = z.object({ enabled: z.boolean() }).parse(request.body);
       const updated = await dependencies.setBotEnabled(request.params.username, body.enabled);
-      if (!updated) return response.status(404).json({ error: 'Bot not found' });
+      if (!updated) return response.status(404).json({ error: 'Бот не найден' });
       return response.json({ ok: true });
     } catch (error) { return next(error); }
   });
@@ -133,6 +160,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
   });
   app.get('/api/chat', (_request, response) => response.json(dependencies.chat()));
   app.get('/api/usage', (_request, response) => response.json(dependencies.usage()));
+  app.get('/api/decisions', (_request, response) => response.json(dependencies.decisions?.() ?? []));
   app.get('/api/settings', async (_request, response, next) => {
     try { response.json(await dependencies.settings()); } catch (error) { next(error); }
   });
@@ -147,7 +175,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     try {
       const persona = personaSchema.parse({ ...request.body, id: request.params.id });
       if (persona.verbosity.minWords > persona.verbosity.maxWords) {
-        return response.status(400).json({ error: 'minWords must not exceed maxWords' });
+        return response.status(400).json({ error: 'Минимальное число слов не может быть больше максимального' });
       }
       await dependencies.updatePersona(persona);
       return response.json({ ok: true });
@@ -157,17 +185,23 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
   app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
     void _next;
     if (error instanceof z.ZodError) {
-      response.status(400).json({ error: 'Invalid request', issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })) });
+      response.status(400).json({ error: 'Некорректный запрос', issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })) });
       return;
     }
     logger.warn('API request failed', { error });
-    response.status(500).json({ error: 'Internal server error' });
+    response.status(500).json({ error: 'Внутренняя ошибка сервера' });
   });
 
   io.use((socket, next) => {
     if (!originAllowed(socket.handshake.headers.origin)) return next(new Error('Origin is not allowed'));
-    const token = socket.handshake.auth?.token;
-    return tokenMatches(dependencies.dashboardToken, token) ? next() : next(new Error('Unauthorized'));
+    const requestLike = {
+      headers: { cookie: socket.handshake.headers.cookie },
+      header: (name: string) => {
+        const value = socket.handshake.headers[name.toLowerCase()];
+        return Array.isArray(value) ? value[0] : value;
+      },
+    };
+    return auth.authenticate(requestLike, socket.handshake.auth?.token) ? next() : next(new Error('Unauthorized'));
   });
   io.on('connection', (socket) => {
     socket.emit('overview', dependencies.overview());
@@ -199,6 +233,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     emitEvent: (event) => io.emit('event', event),
     emitBots: (bots) => io.emit('bots', bots),
     emitBrain: (status) => io.emit('brain', status),
+    emitDecision: (decision) => io.emit('decision', decision),
     emitOverview: () => io.emit('overview', dependencies.overview()),
   };
 }

@@ -56,6 +56,8 @@ export interface StreamBrainStatus {
   state: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'DISABLED';
   mediaConnected: boolean;
   geminiConnected: boolean;
+  model?: string;
+  sessionStartedAt?: number;
   lastEventAt?: number;
   lastError?: string;
 }

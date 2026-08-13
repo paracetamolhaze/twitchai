@@ -18,7 +18,9 @@
     "lint": "eslint . --max-warnings=0",
     "test": "vitest run",
     "verify": "npm run lint && npm run typecheck && npm test && npm run build",
-    "db:migrate": "tsx src/persistence/migrate.ts"
+    "db:migrate": "tsx src/persistence/migrate.ts",
+    "db:import:legacy": "tsx src/persistence/import-legacy-config.ts",
+    "railway:migrate:variables": "node scripts/migrate-railway-variables.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.31.0",

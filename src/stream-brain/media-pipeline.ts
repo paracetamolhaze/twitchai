@@ -30,7 +30,8 @@ const AUDIO_CHUNK_BYTES = 1_280; // 40ms, mono 16-bit PCM at 16kHz.
 export class MediaPipeline {
   private readonly backoff: ExponentialBackoff;
   private readonly logger: Logger;
-  private readonly visionFrameDurationMs: number;
+  private channel: string;
+  private visionFps: number;
   private abortController?: AbortController;
   private streamlink?: ChildProcess;
   private ffmpeg?: ChildProcess;
@@ -42,7 +43,8 @@ export class MediaPipeline {
       options.reconnectMinimumMs ?? 3_000,
       options.reconnectMaximumMs ?? 60_000,
     );
-    this.visionFrameDurationMs = 1_000 / options.visionFps;
+    this.channel = options.channel;
+    this.visionFps = options.visionFps;
   }
 
   getState(): MediaPipelineState { return this.state; }
@@ -59,6 +61,15 @@ export class MediaPipeline {
     controller?.abort();
     await this.terminateChildren();
     this.setState('STOPPED');
+  }
+
+  async reconfigure(channel: string, visionFps: number): Promise<void> {
+    const wasRunning = Boolean(this.abortController);
+    await this.stop();
+    this.channel = channel;
+    this.visionFps = visionFps;
+    this.backoff.reset();
+    if (wasRunning && channel) this.start();
   }
 
   private async run(signal: AbortSignal): Promise<void> {
@@ -81,7 +92,7 @@ export class MediaPipeline {
 
   private captureOnce(signal: AbortSignal): Promise<{ offline: boolean; error: string }> {
     return new Promise((resolve) => {
-      const streamUrl = `https://www.twitch.tv/${this.options.channel}`;
+      const streamUrl = `https://www.twitch.tv/${this.channel}`;
       const streamlink = spawn(this.options.streamlinkBinary ?? 'streamlink', [
         '--quiet',
         '--twitch-low-latency',
@@ -92,7 +103,7 @@ export class MediaPipeline {
       const ffmpeg = spawn(this.options.ffmpegBinary ?? 'ffmpeg', [
         '-hide_banner', '-loglevel', 'warning', '-i', 'pipe:0',
         '-map', '0:a:0?', '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', '-f', 's16le', 'pipe:3',
-        '-map', '0:v:0?', '-an', '-vf', `fps=${this.options.visionFps},scale=${this.options.frameWidth}:-2:force_original_aspect_ratio=decrease`,
+        '-map', '0:v:0?', '-an', '-vf', `fps=${this.visionFps},scale=${this.options.frameWidth}:-2:force_original_aspect_ratio=decrease`,
         '-q:v', '5', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:4',
       ], { stdio: ['pipe', 'ignore', 'pipe', 'pipe', 'pipe'] });
 
@@ -133,7 +144,7 @@ export class MediaPipeline {
           streamed = true;
           this.backoff.reset();
           this.setState('STREAMING');
-          this.logger.info('Stream media connected', { channel: this.options.channel });
+          this.logger.info('Stream media connected', { channel: this.channel });
         }
         audioBuffer = Buffer.concat([audioBuffer, chunk]);
         while (audioBuffer.length >= AUDIO_CHUNK_BYTES) {
@@ -162,7 +173,7 @@ export class MediaPipeline {
           }
           const frame = jpegBuffer.subarray(start, end + 2);
           jpegBuffer = jpegBuffer.subarray(end + 2);
-          void Promise.resolve(this.options.handlers.onVideo(frame, this.visionFrameDurationMs)).catch((cause: unknown) => {
+          void Promise.resolve(this.options.handlers.onVideo(frame, 1_000 / this.visionFps)).catch((cause: unknown) => {
             this.logger.warn('Video consumer rejected a frame', { cause });
           });
         }

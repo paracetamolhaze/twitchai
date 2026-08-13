@@ -23,7 +23,9 @@ function server(): ApiServer {
     events: async () => [event],
     chat: () => [],
     usage: () => ({ startedAt: 0, uptimeSeconds: 1, streamMinutes: 0, audioMinutes: 0, videoMinutes: 0,
-      geminiReconnects: 0, geminiInputTokens: 0, geminiOutputTokens: 0, generatedResponses: 0, skippedResponses: 0 }),
+      geminiReconnects: 0, geminiInputTokens: 0, geminiOutputTokens: 0, geminiToolCalls: 0,
+      preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0, guardRejections: 0,
+      eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0 }),
     settings: async () => ({}), updateSettings: async () => ({ restartRequired: [] }),
     personas: () => DEFAULT_PERSONAS, updatePersona: async () => undefined,
   });
@@ -42,6 +44,18 @@ describe('dashboard API', () => {
 
   it('protects dashboard endpoints', async () => {
     await request(server().app).get('/api/bots').expect(401);
+  });
+
+  it('exchanges the dashboard token for a persistent HttpOnly session cookie', async () => {
+    const api = server();
+    const login = await request(api.app).post('/api/auth/login').send({ token }).expect(200);
+    const setCookie = login.headers['set-cookie']?.[0];
+    expect(setCookie).toContain('HttpOnly');
+    expect(setCookie).not.toContain(token);
+    const cookie = setCookie?.split(';')[0];
+    expect(cookie).toBeTruthy();
+    await request(api.app).get('/api/bots').set('Cookie', cookie!).expect(200);
+    await request(api.app).post('/api/auth/logout').set('Cookie', cookie!).expect(200);
   });
 
   it('returns bot status and normalized stream events when authorized', async () => {

@@ -7,7 +7,14 @@ export interface UsageSnapshot {
   geminiReconnects: number;
   geminiInputTokens: number;
   geminiOutputTokens: number;
+  geminiToolCalls: number;
+  preparedReactionContexts: number;
+  reactionBatches: number;
+  emptyReactionBatches: number;
+  guardRejections: number;
+  eventsDetected: number;
   generatedResponses: number;
+  sentResponses: number;
   skippedResponses: number;
 }
 
@@ -20,7 +27,14 @@ export class UsageTracker {
   private geminiReconnects = 0;
   private geminiInputTokens = 0;
   private geminiOutputTokens = 0;
+  private geminiToolCalls = 0;
+  private preparedReactionContexts = 0;
+  private reactionBatches = 0;
+  private emptyReactionBatches = 0;
+  private guardRejections = 0;
+  private eventsDetected = 0;
   private generatedResponses = 0;
+  private sentResponses = 0;
   private skippedResponses = 0;
 
   startStream(now = Date.now()): void { this.streamStartedAt ??= now; }
@@ -35,7 +49,14 @@ export class UsageTracker {
     this.geminiInputTokens += Math.max(0, input);
     this.geminiOutputTokens += Math.max(0, output);
   }
-  recordGenerated(): void { this.generatedResponses += 1; }
+  recordGeminiToolCall(): void { this.geminiToolCalls += 1; }
+  recordReactionContextPrepared(): void { this.preparedReactionContexts += 1; }
+  recordReactionBatch(): void { this.reactionBatches += 1; }
+  recordEmptyReactionBatch(): void { this.emptyReactionBatches += 1; this.skippedResponses += 1; }
+  recordGuardRejection(): void { this.guardRejections += 1; }
+  recordEventDetected(): void { this.eventsDetected += 1; }
+  recordGenerated(count = 1): void { this.generatedResponses += Math.max(0, count); }
+  recordSentResponse(): void { this.sentResponses += 1; }
   recordSkipped(): void { this.skippedResponses += 1; }
 
   snapshot(now = Date.now()): UsageSnapshot {
@@ -49,7 +70,14 @@ export class UsageTracker {
       geminiReconnects: this.geminiReconnects,
       geminiInputTokens: this.geminiInputTokens,
       geminiOutputTokens: this.geminiOutputTokens,
+      geminiToolCalls: this.geminiToolCalls,
+      preparedReactionContexts: this.preparedReactionContexts,
+      reactionBatches: this.reactionBatches,
+      emptyReactionBatches: this.emptyReactionBatches,
+      guardRejections: this.guardRejections,
+      eventsDetected: this.eventsDetected,
       generatedResponses: this.generatedResponses,
+      sentResponses: this.sentResponses,
       skippedResponses: this.skippedResponses,
     };
   }

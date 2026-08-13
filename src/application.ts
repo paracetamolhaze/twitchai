@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { ApiServer, createApiServer } from './api/server';
 import { AppConfig, normalizeChannel } from './config';
 import { ReactionMemory } from './learning/reaction-memory';
@@ -9,15 +8,14 @@ import { AppRepository } from './persistence/repository';
 import { MemoryRepository } from './persistence/memory-repository';
 import { PostgresRepository } from './persistence/postgres-repository';
 import { ReactionCoordinator } from './reaction/reaction-coordinator';
-import { ReactionDecisionEngine } from './reaction/reaction-decision-engine';
-import { GeminiResponseProvider } from './response/gemini-response-provider';
-import { ResponseProvider, UnavailableResponseProvider } from './response/response-provider';
+import { ReactionPolicyGuard } from './reaction/reaction-policy-guard';
+import { ReactionDecisionRecord } from './reaction/types';
 import { ContextStore } from './stream-brain/context-store';
 import { EventDetector } from './stream-brain/event-detector';
 import { GeminiLiveClient } from './stream-brain/gemini-live.client';
 import { MediaPipeline } from './stream-brain/media-pipeline';
 import { StreamBrainService } from './stream-brain/stream-brain.service';
-import { ChatMessage, StreamEvent } from './stream-brain/types';
+import { ChatMessage, StreamEvent, StreamEventCandidate } from './stream-brain/types';
 import { GroqWhisperFallback } from './transcription/groq-whisper-fallback';
 import { TwitchBotManager } from './twitch/bot-manager';
 import { TwitchHelixClient } from './twitch/helix-client';
@@ -29,13 +27,15 @@ export class Application {
   private readonly repository: AppRepository;
   private readonly contextStore: ContextStore;
   private readonly personas: PersonaStore;
-  private readonly decision: ReactionDecisionEngine;
+  private readonly policy: ReactionPolicyGuard;
   private readonly memory: ReactionMemory;
   private readonly history: BotHistory;
+  private readonly decisions: ReactionDecisionRecord[] = [];
   private botManager!: TwitchBotManager;
   private brain!: StreamBrainService;
   private coordinator!: ReactionCoordinator;
   private api!: ApiServer;
+  private gemini?: GeminiLiveClient;
   private transcriber?: GroqWhisperFallback;
   private categoryTimer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
@@ -51,11 +51,11 @@ export class Application {
       : new MemoryRepository();
     this.contextStore = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 200, maxEvents: 100 });
     this.personas = new PersonaStore(this.repository);
-    this.decision = new ReactionDecisionEngine({
-      eventThreshold: config.stream.eventThreshold,
-      minimumDelayMs: config.response.minimumDelayMs,
-      maximumDelayMs: config.response.maximumDelayMs,
-      globalMessagesPer30Seconds: config.response.globalMessagesPer30Seconds,
+    this.policy = new ReactionPolicyGuard({
+      minimumDelayMs: config.reaction.minimumDelayMs,
+      maximumDelayMs: config.reaction.maximumDelayMs,
+      globalMessagesPer30Seconds: config.reaction.globalMessagesPer30Seconds,
+      maxReactionsPerEvent: config.reaction.maxReactionsPerEvent,
     });
     this.memory = new ReactionMemory({
       enabled: config.learning.enabled,
@@ -69,16 +69,12 @@ export class Application {
   async start(): Promise<void> {
     await this.repository.initialize();
     this.databaseReady = true;
-    if (!this.config.database.url) {
-      this.logger.warn('DATABASE_URL is not configured; using non-persistent in-memory storage');
-    }
+    if (!this.config.database.url) this.logger.warn('DATABASE_URL is not configured; using non-persistent in-memory storage');
     await this.personas.initialize();
     this.runtimeSettings = await this.repository.getSettings();
     this.config.twitch.channel = normalizeChannel(stringSetting(this.runtimeSettings.channel, this.config.twitch.channel));
     this.config.stream.visionFps = boundedNumberSetting(this.runtimeSettings.visionFps, this.config.stream.visionFps, 0.05, 1);
     const streamContext = stringSetting(this.runtimeSettings.streamContext, this.config.stream.context);
-    const eventThreshold = boundedNumberSetting(this.runtimeSettings.eventThreshold, this.config.stream.eventThreshold, 0, 1);
-    this.decision.setEventThreshold(eventThreshold);
     this.contextStore.configure({
       channel: this.config.twitch.channel,
       streamContext,
@@ -94,17 +90,36 @@ export class Application {
     });
     await this.botManager.initialize();
 
-    let gemini: GeminiLiveClient | undefined;
+    this.coordinator = new ReactionCoordinator({
+      policy: this.policy,
+      sender: this.botManager,
+      history: this.history,
+      memory: this.memory,
+      contextStore: this.contextStore,
+      usage: this.usage,
+      logger: this.logger,
+      retrievalLimit: this.config.learning.retrievalLimit,
+      candidates: () => this.botManager.candidates(),
+    });
+
     if (this.config.gemini.apiKey) {
-      gemini = new GeminiLiveClient({
+      this.gemini = new GeminiLiveClient({
         apiKey: this.config.gemini.apiKey,
         model: this.config.gemini.liveModel,
         logger: this.logger,
         usage: this.usage,
         handlers: {
-          onEvent: (candidate) => this.brain.acceptCandidate(candidate),
+          onPrepareReactionContext: async (candidate) => {
+            const event = await this.brain.acceptCandidate(candidate);
+            if (!event) throw new Error('invalid_event');
+            return this.coordinator.prepare(event);
+          },
+          onEmitReactionBatch: (batch) => this.coordinator.submitBatch(batch),
           onTranscript: (text) => this.logger.debug('Gemini input transcription received', { characters: text.length }),
-          onStatus: (connected, error) => this.brain.onGeminiStatus(connected, error),
+          onStatus: (connected, error) => {
+            if (!connected) this.coordinator.clearPendingContexts();
+            this.brain.onGeminiStatus(connected, error);
+          },
         },
       });
     }
@@ -114,18 +129,18 @@ export class Application {
         apiKey: this.config.transcription.groqApiKey,
         language: this.config.transcription.language,
         logger: this.logger,
-        onTranscript: (text) => this.brain.acceptCandidate({
-          type: 'speech',
-          summary: `Streamer said: ${text}`,
-          speech: text,
-          importance: 0.5,
-          confidence: 0.8,
-        }, 'fallback-transcription'),
+        onTranscript: (text) => {
+          const candidate: StreamEventCandidate = {
+            type: 'speech', summary: `Streamer said: ${text}`, speech: text, importance: 0.5, confidence: 0.8,
+          };
+          if (this.gemini?.isConnected()) this.gemini.requestReaction(candidate);
+          else void this.brain.acceptCandidate(candidate, 'fallback-transcription');
+        },
       });
     }
 
-    const hasStreamAnalyzer = Boolean(gemini || this.transcriber);
-    const media = this.config.twitch.channel && hasStreamAnalyzer
+    const hasStreamAnalyzer = Boolean(this.gemini || this.transcriber);
+    const media = hasStreamAnalyzer
       ? new MediaPipeline({
           channel: this.config.twitch.channel,
           visionFps: this.config.stream.visionFps,
@@ -135,7 +150,7 @@ export class Application {
             onAudio: (pcm, durationMs) => {
               this.brain.sendAudio(pcm, durationMs);
               const useWhisper = this.config.transcription.provider === 'groq-whisper'
-                || (this.config.transcription.fallback === 'groq-whisper' && !gemini?.isConnected());
+                || (this.config.transcription.fallback === 'groq-whisper' && !this.gemini?.isConnected());
               if (useWhisper) this.transcriber?.acceptPcm(pcm);
             },
             onVideo: (jpeg, durationMs) => this.brain.sendVideo(jpeg, durationMs),
@@ -148,35 +163,22 @@ export class Application {
       channel: this.config.twitch.channel,
       contextStore: this.contextStore,
       eventDetector: new EventDetector({ minimumConfidence: this.config.stream.confidenceThreshold }),
-      gemini,
+      gemini: this.gemini,
       media,
       eventSink: this.repository,
       usage: this.usage,
       logger: this.logger,
       contextRefreshMs: this.config.stream.contextRefreshMs,
-      enabled: Boolean(this.config.twitch.channel && hasStreamAnalyzer),
-    });
-
-    const provider: ResponseProvider = this.config.gemini.apiKey
-      ? new GeminiResponseProvider(this.config.gemini.apiKey, this.config.gemini.responseModel, this.logger, this.usage)
-      : new UnavailableResponseProvider();
-    this.coordinator = new ReactionCoordinator({
-      decision: this.decision,
-      provider,
-      sender: this.botManager,
-      history: this.history,
-      memory: this.memory,
-      contextStore: this.contextStore,
-      usage: this.usage,
-      logger: this.logger,
-      retrievalLimit: this.config.learning.retrievalLimit,
-      candidates: () => this.botManager.candidates(),
+      enabled: hasStreamAnalyzer,
+      model: this.config.gemini.liveModel,
     });
 
     this.api = createApiServer({
       port: this.config.app.port,
       frontendUrls: this.config.app.frontendUrls,
       dashboardToken: this.config.app.dashboardToken,
+      dashboardSessionDays: this.config.app.dashboardSessionDays,
+      secureCookies: this.config.app.nodeEnv === 'production',
       logger: this.logger,
       health: () => ({
         status: this.config.database.url && this.databaseReady ? 'ok' : 'degraded',
@@ -204,6 +206,7 @@ export class Application {
       events: (limit) => this.repository.listStreamEvents(limit),
       chat: () => this.contextStore.snapshot().recentChat,
       usage: () => this.usage.snapshot(),
+      decisions: () => [...this.decisions].reverse(),
       settings: () => this.getSettings(),
       updateSettings: (settings) => this.updateSettings(settings),
       personas: () => this.personas.list(),
@@ -212,9 +215,7 @@ export class Application {
 
     this.wireEvents();
     await this.api.start();
-    if (!this.config.app.dashboardToken) {
-      this.logger.warn('DASHBOARD_TOKEN is missing; protected dashboard API and realtime connections are unavailable');
-    }
+    if (!this.config.app.dashboardToken) this.logger.warn('DASHBOARD_TOKEN is missing; protected dashboard API and realtime connections are unavailable');
     await Promise.allSettled([this.brain.start(), this.botManager.start()]);
     this.startCategoryMonitor();
     this.usageTimer = setInterval(() => { void this.persistUsage(); }, 60_000);
@@ -225,10 +226,10 @@ export class Application {
     if (this.stopping) return;
     this.stopping = true;
     if (this.categoryTimer) clearInterval(this.categoryTimer);
-    this.categoryTimer = undefined;
     if (this.usageTimer) clearInterval(this.usageTimer);
-    this.usageTimer = undefined;
     if (this.healthTimer) clearInterval(this.healthTimer);
+    this.categoryTimer = undefined;
+    this.usageTimer = undefined;
     this.healthTimer = undefined;
     await this.api?.stop();
     await this.coordinator?.stop();
@@ -244,7 +245,6 @@ export class Application {
 
   private wireEvents(): void {
     this.brain.on('event', (event: StreamEvent) => {
-      this.coordinator.handle(event);
       this.api.emitEvent(event);
       this.api.emitOverview();
     });
@@ -252,13 +252,17 @@ export class Application {
       this.api.emitBrain(status);
       this.api.emitOverview();
     });
+    this.coordinator.on('decision', (decision: ReactionDecisionRecord) => {
+      this.decisions.push(decision);
+      if (this.decisions.length > 100) this.decisions.shift();
+      this.api.emitDecision(decision);
+    });
     this.botManager.on('status', (bots) => {
       this.api.emitBots(bots);
       this.api.emitOverview();
     });
     this.botManager.on('chat', (message: ChatMessage) => {
-      void this.handleChat(message)
-        .catch((cause: unknown) => this.logger.warn('Chat context handling failed', { cause }));
+      void this.handleChat(message).catch((cause: unknown) => this.logger.warn('Chat context handling failed', { cause }));
     });
   }
 
@@ -271,29 +275,22 @@ export class Application {
       .map((account) => account.username)
       .filter((username) => new RegExp(`@${escapeRegex(username)}\\b`, 'i').test(message.message));
     if (mentions.length === 0) return;
-    const snapshot = this.contextStore.snapshot();
-    const event: StreamEvent = {
-      id: randomUUID(),
+    this.brain.requestReaction({
       timestamp: message.timestamp,
       type: 'conversation',
       summary: `${message.username} directly addressed ${mentions.map((name) => `@${name}`).join(', ')}: ${message.message}`,
       speech: message.message,
-      category: snapshot.category,
       importance: 0.85,
       confidence: 1,
-      source: 'chat',
       directMentions: mentions,
-    };
-    this.contextStore.addEvent(event);
-    this.coordinator.handle(event);
-    this.api.emitEvent(event);
-    try { await this.repository.saveStreamEvent(event); }
-    catch (cause) { this.logger.warn('Direct-mention event persistence failed', { eventId: event.id, cause }); }
+    });
   }
 
   private startCategoryMonitor(): void {
+    if (this.categoryTimer) clearInterval(this.categoryTimer);
+    this.categoryTimer = undefined;
     if (!this.config.twitch.channel || !this.config.twitch.clientId || !this.config.twitch.clientSecret) {
-      this.logger.warn('Twitch category auto-refresh disabled; TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET are required');
+      this.logger.warn('Twitch category auto-refresh disabled; channel and Twitch client credentials are required');
       return;
     }
     const helix = new TwitchHelixClient(this.config.twitch.clientId, this.config.twitch.clientSecret, this.logger);
@@ -302,9 +299,7 @@ export class Application {
         const info = await helix.getStream(this.config.twitch.channel);
         const previous = this.contextStore.snapshot();
         this.contextStore.configure({ category: info.category, isLive: info.isLive });
-        if (previous.category !== info.category) {
-          this.logger.info('Twitch category updated', { category: info.category || 'offline' });
-        }
+        if (previous.category !== info.category) this.logger.info('Twitch category updated', { category: info.category || 'offline' });
         this.api.emitOverview();
       } catch (cause) {
         this.logger.warn('Twitch category refresh failed', { cause });
@@ -319,20 +314,35 @@ export class Application {
       channel: this.config.twitch.channel,
       streamContext: this.contextStore.snapshot().streamContext,
       visionFps: this.config.stream.visionFps,
-      eventThreshold: boundedNumberSetting(this.runtimeSettings.eventThreshold, this.config.stream.eventThreshold, 0, 1),
       learnEnabled: this.config.learning.enabled,
     };
   }
 
   private async updateSettings(settings: Record<string, unknown>): Promise<{ restartRequired: string[] }> {
-    const restartRequired: string[] = [];
-    if (typeof settings.streamContext === 'string') this.contextStore.configure({ streamContext: settings.streamContext });
-    if (typeof settings.eventThreshold === 'number') this.decision.setEventThreshold(settings.eventThreshold);
-    if (settings.channel !== undefined && settings.channel !== this.config.twitch.channel) restartRequired.push('channel');
-    if (settings.visionFps !== undefined && settings.visionFps !== this.config.stream.visionFps) restartRequired.push('visionFps');
-    this.runtimeSettings = { ...this.runtimeSettings, ...settings };
-    await this.repository.setSettings(settings);
-    return { restartRequired };
+    const persisted: Record<string, unknown> = {};
+    if (typeof settings.streamContext === 'string') {
+      this.contextStore.configure({ streamContext: settings.streamContext });
+      persisted.streamContext = settings.streamContext;
+    }
+    const nextChannel = typeof settings.channel === 'string' ? normalizeChannel(settings.channel) : this.config.twitch.channel;
+    const nextVisionFps = typeof settings.visionFps === 'number' ? settings.visionFps : this.config.stream.visionFps;
+    const mediaChanged = nextChannel !== this.config.twitch.channel || nextVisionFps !== this.config.stream.visionFps;
+    if (mediaChanged) {
+      const channelChanged = nextChannel !== this.config.twitch.channel;
+      this.config.twitch.channel = nextChannel;
+      this.config.stream.visionFps = nextVisionFps;
+      this.contextStore.configure({ channel: nextChannel });
+      await this.brain.reconfigureMedia(nextChannel, nextVisionFps);
+      if (channelChanged) {
+        await this.botManager.reconfigureChannel(nextChannel);
+        this.startCategoryMonitor();
+      }
+      persisted.channel = nextChannel;
+      persisted.visionFps = nextVisionFps;
+    }
+    this.runtimeSettings = { ...this.runtimeSettings, ...persisted };
+    await this.repository.setSettings(persisted);
+    return { restartRequired: [] };
   }
 
   private async persistUsage(): Promise<void> {

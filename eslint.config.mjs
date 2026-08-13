@@ -11,7 +11,7 @@ export default [
   ...tseslint.configs.recommended,
   ...vue.configs['flat/essential'],
   {
-    files: ['src/**/*.ts', 'tests/**/*.ts'],
+    files: ['src/**/*.ts', 'tests/**/*.ts', 'scripts/**/*.mjs'],
     languageOptions: { globals: globals.node },
     rules: {
       'no-console': 'off',

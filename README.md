@@ -1,154 +1,169 @@
 # Twitch AI Viewers
 
-Event-driven AI viewers for Twitch. One multimodal Gemini Live session understands the stream; independent personas decide whether they have a natural reason to react. This project connects accounts to official Twitch chat and does **not** manipulate viewer counts or simulate views.
+Система событийных AI-зрителей Twitch. Одна мультимодальная сессия Gemini Live видит стрим, слышит речь, учитывает чат и память, сама выбирает подходящие персоны и пишет все финальные реакции. Проект подключает аккаунты только к официальному Twitch IRC и не накручивает просмотры.
 
-## Architecture
+## Архитектура
 
 ```text
-                                  ┌── Twitch IRC chat (official OAuth)
-Twitch stream                     │         │
-      │                           │         ├── recent real chat
-  Streamlink                      │         └── direct @mentions
-      │                           │
-    FFmpeg ── PCM 16 kHz ─────┐   │
-      └───── sampled JPEG ────┼───┴──> one Gemini Live Stream Brain
-                              │              │
-                              │       normalized StreamEvent
-                              │              │
-                              │      ReactionDecisionEngine
-                              │              │
-                              │      0..3 selected personas
-                              │              │
-                              │   Gemini text ResponseProvider
-                              │     │        │          │
-                              │  <skip>  duplicate  natural delay
-                              │                       │
-                              └────────────────> Twitch chat
+Twitch stream
+    │
+Streamlink → FFmpeg ── PCM 16 kHz ─┐
+                    └─ JPEG ≤1 FPS ├──────────────┐
+Twitch IRC ─ recent chat / @mentions ─────────────┤
+PostgreSQL ─ events / history / ReactionMemory ───┤
+                                                  ▼
+                           ONE Gemini 3.1 Flash Live session
+                                      │
+                          prepare_reaction_context
+                                      │
+                 all eligible personas + each history + chat
+                         + retrieved examples + constraints
+                                      │
+                            emit_reaction_batch (0..N)
+                                      │
+                         backend PolicyGuard + Scheduler
+                                      │
+                       natural delays → official Twitch chat
 
-PostgreSQL <── events, personas, reaction examples, bot history, settings
-Railway backend <── HTTPS + authenticated Socket.IO ──> Vercel dashboard
+Railway backend ← authenticated HTTPS + Socket.IO → Vercel dashboard
+                         │
+                     PostgreSQL
 ```
 
-The Stream Brain emits events rather than forcing a response for every sentence. `ReactionMemory` associates a normalized event with nearby messages from real viewers and retrieves similar examples as style evidence. Real messages are never automatically copied. Markov generation is not part of the system.
+В production нет отдельных вызовов AI для каждого бота, `generateContent`, Flash Lite, Markov-генератора или правила «всегда ответить». Пустой `reactions: []` — нормальное решение промолчать. Backend не принимает творческих решений: он только проверяет аккаунт, соединение, cooldown, дубликаты, длину и лимиты, затем разносит готовые сообщения по естественным задержкам.
 
-## Local development
+## Локальная разработка
 
-Requirements:
+Требования: Node.js 20+, FFmpeg, Streamlink и PostgreSQL для постоянных данных.
 
-- Node.js 20+
-- FFmpeg on `PATH`
-- Streamlink on `PATH`
-- PostgreSQL for persistent development data (optional only for a short local demo)
-
-```bash
+```powershell
 npm ci
 npm --prefix frontend ci
-copy .env.example .env        # PowerShell / cmd
-npm run db:migrate            # requires DATABASE_URL
-npm run dev                   # backend, http://localhost:3000
-npm --prefix frontend run dev # dashboard, http://localhost:5173
+Copy-Item .env.example .env
+npm run db:migrate
+npm run dev
+# в другом терминале
+npm --prefix frontend run dev
 ```
 
-Without `DATABASE_URL`, the backend deliberately uses an in-memory repository and logs a warning. Nothing is written to an unreliable Railway filesystem.
+Backend: `http://localhost:3000`, dashboard: `http://localhost:5173`. Без `DATABASE_URL` backend запустит временное in-memory хранилище и явно предупредит об этом.
 
-## Environment variables
+## Переменные окружения
 
-The complete, commented template is [.env.example](.env.example). Important groups:
+Полный шаблон находится в [.env.example](.env.example). Основные группы:
 
-- App: `PORT`, `LOG_LEVEL`, `DASHBOARD_TOKEN`, `FRONTEND_URL`
-- Twitch: `TWITCH_CHANNEL`, client credentials, and numbered `BOTn_*` account variables
-- Gemini: `GEMINI_API_KEY`, centralized `GEMINI_LIVE_MODEL`
-- Stream: `STREAM_CONTEXT`, `VISION_FPS`, event/confidence thresholds
-- Response: `RESPONSE_PROVIDER`, `RESPONSE_MODEL`, delay and rate settings
-- Learning: reaction collection window and retrieval count
-- Optional debug fallback: `TRANSCRIPTION_FALLBACK=groq-whisper`, `GROQ_API_KEY`
-- Database: `DATABASE_URL`, `DATABASE_SSL`
+- приложение: `PORT`, `LOG_LEVEL`, `DASHBOARD_TOKEN`, `DASHBOARD_SESSION_DAYS`, `FRONTEND_URL`;
+- Twitch: необязательный стартовый `TWITCH_CHANNEL`, Client ID/Secret и `BOTn_*`;
+- Gemini: `GEMINI_API_KEY`, централизованный `GEMINI_LIVE_MODEL`;
+- медиа: `STREAM_CONTEXT`, `VISION_FPS`, `VISION_FRAME_WIDTH`;
+- hard policy: задержки, общий rate limit и `MAX_REACTIONS_PER_EVENT`;
+- обучение: окно сбора и количество retrieval-примеров;
+- необязательный debug/fallback Whisper через Groq;
+- PostgreSQL: `DATABASE_URL`, `DATABASE_SSL`.
 
-Never prefix frontend variables with API keys or OAuth tokens. `DASHBOARD_TOKEN` is entered by the operator in the dashboard and stored only for the browser tab session.
+Канал обычно вводится в русскоязычном dashboard и хранится в PostgreSQL, поэтому `TWITCH_CHANNEL` в Railway можно оставить пустым. Смена канала и `VISION_FPS` применяются без ручного рестарта.
 
-## Twitch OAuth setup
+## Авторизация dashboard
 
-1. Create an application in the [Twitch Developer Console](https://dev.twitch.tv/console).
-2. Set `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET`; the backend uses them for the official Helix category refresh.
-3. Obtain a **user access token for each bot account** with `chat:read` and `chat:edit`.
-4. Put the matching username and token in `BOT1_USERNAME` / `BOT1_OAUTH_TOKEN`, then repeat with `BOT2_*`, etc.
-5. Do not reuse one account token under another username. Tokens are validated against Twitch before IRC connection and are never stored in PostgreSQL or logs.
+`DASHBOARD_TOKEN` вводится только при первом входе. Backend проверяет его и выдаёт подписанную HttpOnly Secure cookie на срок `DASHBOARD_SESSION_DAYS` (по умолчанию 30 дней). Исходный токен не сохраняется в `localStorage`, `sessionStorage` или JavaScript и не передаётся в Socket.IO payload. Повторный ввод нужен только после истечения cookie, очистки данных браузера или смены `DASHBOARD_TOKEN`.
 
-The manager isolates account failures, tracks `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `ERROR`, and `DISABLED`, and applies conservative local chat rate limits.
+Production CORS принимает только точные адреса из `FRONTEND_URL`; cookie и realtime-соединение используют тот же авторизованный контур. API-ключи Gemini и OAuth Twitch во frontend не попадают.
 
-## Gemini setup
+## Настройка Twitch OAuth
 
-1. Create a key in [Google AI Studio](https://aistudio.google.com/apikey).
-2. Set `GEMINI_API_KEY` on the backend only.
-3. Set `GEMINI_LIVE_MODEL` to the currently available Flash Live model. The model name is read in one config module and is not hardcoded across business logic.
-4. Optionally change `RESPONSE_MODEL` independently; final response generation uses the `ResponseProvider` abstraction.
+1. Создайте приложение в [Twitch Developer Console](https://dev.twitch.tv/console).
+2. Задайте `TWITCH_CLIENT_ID` и `TWITCH_CLIENT_SECRET` для автоматического обновления категории.
+3. Получите отдельный user access token каждого bot-аккаунта со scope `chat:read` и `chat:edit`.
+4. Добавьте `BOT1_USERNAME` и `BOT1_OAUTH_TOKEN`, затем следующие аккаунты. Для миграции поддерживается старое имя `BOTn_OAUTH`.
+5. Token каждого аккаунта проверяется официальным endpoint Twitch; один сломанный аккаунт не останавливает остальные.
 
-Audio is raw mono 16-bit PCM at 16 kHz in 40 ms chunks. Video is resized JPEG sampled at configurable `VISION_FPS` (0.05–1). Live sessions use context-window compression, session resumption handles, `goAway` handling, and exponential reconnect backoff.
+Состояния: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `ERROR`, `DISABLED`. Backend применяет дополнительный локальный Twitch rate limiter.
 
-## Database migrations
+## Настройка Gemini Live
 
-The initial schema lives in `migrations/001_initial.sql` and includes personas, bot metadata, reaction examples, message history, stream events, settings, and usage snapshots.
+1. Создайте ключ в [Google AI Studio](https://aistudio.google.com/apikey).
+2. Добавьте `GEMINI_API_KEY` только в Railway.
+3. По умолчанию используется `GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview`; имя модели меняется в одном env без правок бизнес-логики.
 
-```bash
-DATABASE_URL=postgresql://... npm run db:migrate
+Аудио отправляется как mono 16-bit PCM 16 kHz по 40 мс. Видео — JPEG с настраиваемой частотой `0.05–1 FPS`. Live-сессия использует low media resolution, input transcription, low thinking, context-window compression, resumption handle, обработку `goAway` и bounded exponential backoff. Ответная аудиодорожка Gemini не воспроизводится: модель обязана принимать решения через два синхронных tool call.
+
+## PostgreSQL и миграции
+
+`migrations/001_initial.sql` создаёт таблицы персон, метаданных ботов, ReactionMemory, истории сообщений, событий стрима, runtime settings и usage snapshots.
+
+```powershell
+$env:DATABASE_URL='postgresql://...'
+npm run db:migrate
 ```
 
-The PostgreSQL repository also applies pending idempotent migrations during initialization under an advisory lock.
+Миграции идемпотентны, выполняются под advisory lock и также автоматически проверяются при старте backend.
 
-## Railway deployment (backend)
+### Перенос со старого Railway
 
-1. Create a Railway service from this repository and attach PostgreSQL.
-2. Add the backend variables from `.env.example`, including the Railway `DATABASE_URL`.
-3. Set `FRONTEND_URL` to the exact Vercel origin; comma-separate additional trusted origins if needed.
-4. Deploy. `nixpacks.toml` installs Node 20, FFmpeg, Streamlink, runs `npm ci`, and builds only the backend.
-5. Railway starts `node dist/main.js` as a long-running process and checks `GET /health`.
+Старая production-среда использовала service variables и могла хранить `config-<channel>.json` на volume/эфемерном диске. Без доступа к старому workspace секретные значения получить нельзя. Создайте API token именно в workspace старого проекта и выполните локально:
 
-`/health` is intentionally public and contains only booleans. It returns HTTP 200 when persistent storage is configured and healthy, while the Twitch, Stream Brain, and Gemini fields report their own live state; without healthy PostgreSQL it returns HTTP 503 with `status: "degraded"`. Every `/api/*` route and Socket.IO handshake requires `DASHBOARD_TOKEN`.
+```powershell
+$env:RAILWAY_SOURCE_TOKEN='токен старого workspace'
+$env:RAILWAY_TARGET_TOKEN='токен нового workspace'
+npm run railway:migrate:variables
+```
 
-## Vercel deployment (dashboard)
+Скрипт переносит совместимые Twitch/Gemini/Groq и `BOTn_*` переменные напрямую Railway→Railway, не печатая значения. Он намеренно сохраняет новые `DATABASE_URL`, `FRONTEND_URL`, `DASHBOARD_TOKEN` и не переносит `TWITCH_CHANNEL`, потому что канал теперь задаётся в dashboard. Sealed variables Railway нельзя прочитать через API — их надо создать заново.
 
-Use `frontend/` as the Vercel Root Directory:
+Если у старого сервиса есть volume, сначала скачайте `config-<channel>.json`, затем импортируйте совместимые пользовательские персоны и историю отправленных ботами сообщений:
 
-1. Framework preset: Vite.
-2. Build command: `npm run build`.
-3. Output: `dist`.
-4. Set `VITE_API_URL=https://your-backend.up.railway.app`.
-5. Add the resulting Vercel origin to backend `FRONTEND_URL` and redeploy the backend.
+```powershell
+$env:DATABASE_URL='postgresql://...'
+$env:LEGACY_CHANNEL='имя_канала' # необязательно
+npm run db:import:legacy -- C:\path\to\config-channel.json
+```
 
-The dashboard provides Overview, bot states, normalized Stream Brain events, typed chat feed, usage counters, runtime settings, and persona editing. Channel and vision-FPS changes are persisted but require a backend restart; stream context and event threshold apply immediately.
+Старый `markov-data.json` остаётся архивом и не импортируется в production: цепочки Markov не содержат надёжной связи `событие → реальные реакции` и возвращать их в генерацию нельзя. Новая `ReactionMemory` начинает собирать корректные пары автоматически. Если старый файл находился только на эфемерном Railway filesystem и уже исчез после redeploy, восстановить его технически невозможно; проверьте вкладки Volumes/Backups старого проекта до удаления.
 
-## Verification
+## Railway: backend
 
-```bash
-npm run lint
-npm run typecheck
-npm test
-npm run build
-# or all checks once:
+1. Создайте service из этого репозитория и подключите PostgreSQL.
+2. Добавьте backend-переменные из `.env.example`; `DATABASE_URL` лучше задавать ссылкой `${{Postgres.DATABASE_URL}}`.
+3. Укажите точный Vercel origin в `FRONTEND_URL`.
+4. `nixpacks.toml` ставит Node 20, FFmpeg и Streamlink; Railway запускает `node dist/main.js` как long-running process.
+5. Healthcheck: `GET /health`. Ответ не содержит секретов.
+
+## Vercel: dashboard
+
+Root Directory: `frontend/`, Framework: Vite, Output: `dist`. Единственная production-переменная frontend:
+
+```env
+VITE_API_URL=https://your-backend.up.railway.app
+```
+
+Dashboard показывает состояние backend/Twitch/Gemini, аккаунты, события, чат, решения AI, usage, настройки канала и персон. Постоянные Twitch/Gemini/FFmpeg соединения на Vercel не создаются.
+
+## Проверка
+
+```powershell
 npm run verify
 ```
 
-Live Gemini/Twitch integration cannot be exercised without real credentials and an active channel. Unit and API tests use fakes and never contact external services.
+Команда один раз выполняет lint, backend/frontend/test typecheck, unit/API tests и обе production-сборки. Реальный Twitch/Gemini поток требует валидных credentials и активного канала; тесты внешние сервисы не вызывают.
 
-## Troubleshooting
+## Диагностика
 
-- **Stream Brain remains DISABLED:** set both `TWITCH_CHANNEL` and `GEMINI_API_KEY`.
-- **Media ERROR/OFFLINE:** verify `streamlink --version`, `ffmpeg -version`, and whether the channel is live.
-- **Bot ERROR:** confirm token ownership and `chat:read` / `chat:edit` scopes. One bad bot does not stop the others.
-- **Category is empty:** configure Twitch client ID/secret and check Helix access.
-- **Dashboard says unauthorized:** `DASHBOARD_TOKEN` must match Railway and contain at least 16 characters.
-- **Dashboard has CORS errors:** `FRONTEND_URL` must exactly match the browser origin, including scheme.
-- **Gemini reconnects:** transient reconnects use bounded exponential backoff and session resumption; inspect redacted `[BRAIN]` logs.
-- **Data disappears after restart:** configure PostgreSQL; in-memory mode is for local evaluation only.
+- **Мозг стрима выключен:** проверьте `GEMINI_API_KEY` и модель; канал можно задать в dashboard.
+- **Медиапоток offline/error:** проверьте Streamlink, FFmpeg и активность канала.
+- **Bot ERROR:** проверьте владельца токена и scopes `chat:read`/`chat:edit`.
+- **Категория не обновляется:** нужны Twitch Client ID/Secret.
+- **Dashboard снова просит токен:** cookie истекла/очищена, `DASHBOARD_TOKEN` сменился или браузер блокирует cross-site cookies.
+- **CORS:** `FRONTEND_URL` должен точно совпадать с origin браузера.
+- **Данные пропадают:** убедитесь, что backend использует PostgreSQL, а не in-memory fallback.
 
 ## Production checklist
 
-- [ ] Revoke and replace any credential ever exposed in a Git remote, terminal capture, or log.
-- [ ] Store all secrets in Railway variables; keep `.env` untracked.
-- [ ] Use a strong `DASHBOARD_TOKEN` and exact production `FRONTEND_URL`.
-- [ ] Configure PostgreSQL and confirm migrations.
-- [ ] Validate every bot's OAuth identity/scopes and enable accounts gradually.
-- [ ] Confirm FFmpeg/Streamlink and `/health` after deploy.
-- [ ] Confirm Gemini model availability and monitor reconnect/usage counters.
-- [ ] Test dashboard HTTP and realtime authorization from the Vercel origin.
-- [ ] Review Twitch rate limits and platform policy before production use.
+- [ ] Все секреты находятся только в Railway; `.env` не отслеживается Git.
+- [ ] Старые/показанные где-либо credentials отозваны и заменены.
+- [ ] PostgreSQL подключён, migration применена, `/health` показывает `database: true`.
+- [ ] У каждого Twitch token правильный username и scopes.
+- [ ] `GEMINI_LIVE_MODEL` доступна, reconnect/usage отслеживаются.
+- [ ] `FRONTEND_URL` и `VITE_API_URL` указывают друг на друга корректно.
+- [ ] Вход по HttpOnly-сессии и Socket.IO проверены с production-origin.
+- [ ] Старые Railway volumes/backups проверены до удаления проекта.
+- [ ] Учитываются актуальные ограничения и правила Twitch.

@@ -15,6 +15,7 @@ export interface AppConfig {
     port: number;
     logLevel: 'debug' | 'info' | 'warn' | 'error';
     dashboardToken?: string;
+    dashboardSessionDays: number;
     frontendUrls: string[];
   };
   twitch: {
@@ -27,21 +28,19 @@ export interface AppConfig {
   gemini: {
     apiKey?: string;
     liveModel: string;
-    responseModel: string;
   };
   stream: {
     context: string;
     visionFps: number;
     frameWidth: number;
-    eventThreshold: number;
     confidenceThreshold: number;
     contextRefreshMs: number;
   };
-  response: {
-    provider: 'gemini';
+  reaction: {
     minimumDelayMs: number;
     maximumDelayMs: number;
     globalMessagesPer30Seconds: number;
+    maxReactionsPerEvent: number;
   };
   learning: {
     enabled: boolean;
@@ -65,6 +64,7 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
   DASHBOARD_TOKEN: z.string().trim().min(16).optional(),
+  DASHBOARD_SESSION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   FRONTEND_URL: z.string().default('http://localhost:5173'),
   TWITCH_CHANNEL: z.string().default(''),
   TWITCH_CLIENT_ID: z.string().trim().optional(),
@@ -72,17 +72,15 @@ const envSchema = z.object({
   TWITCH_CATEGORY_REFRESH_SECONDS: z.coerce.number().min(30).max(3600).default(120),
   GEMINI_API_KEY: z.string().trim().optional(),
   GEMINI_LIVE_MODEL: z.string().trim().default('gemini-3.1-flash-live-preview'),
-  RESPONSE_PROVIDER: z.literal('gemini').default('gemini'),
-  RESPONSE_MODEL: z.string().trim().default('gemini-3.1-flash-lite'),
   STREAM_CONTEXT: z.string().default(''),
   VISION_FPS: z.coerce.number().min(0.05).max(1).default(1),
   VISION_FRAME_WIDTH: z.coerce.number().int().min(320).max(1280).default(640),
-  EVENT_THRESHOLD: z.coerce.number().min(0).max(1).default(0.45),
   EVENT_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.4),
   STREAM_CONTEXT_REFRESH_SECONDS: z.coerce.number().min(10).max(300).default(30),
   REACTION_MIN_DELAY_MS: z.coerce.number().int().min(0).max(60_000).default(1200),
   REACTION_MAX_DELAY_MS: z.coerce.number().int().min(100).max(120_000).default(9000),
   CHAT_MESSAGES_PER_30_SECONDS: z.coerce.number().int().min(1).max(20).default(18),
+  MAX_REACTIONS_PER_EVENT: z.coerce.number().int().min(1).max(10).default(3),
   LEARN_ENABLED: z.string().default('true'),
   LEARN_REACTION_WINDOW_SECONDS: z.coerce.number().int().min(5).max(120).default(25),
   LEARN_RETRIEVAL_LIMIT: z.coerce.number().int().min(1).max(10).default(4),
@@ -137,6 +135,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       port: parsed.PORT,
       logLevel: parsed.LOG_LEVEL,
       dashboardToken: parsed.DASHBOARD_TOKEN,
+      dashboardSessionDays: parsed.DASHBOARD_SESSION_DAYS,
       frontendUrls: parsed.FRONTEND_URL.split(',').map((url) => url.trim()).filter(Boolean),
     },
     twitch: {
@@ -149,21 +148,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     gemini: {
       apiKey: parsed.GEMINI_API_KEY,
       liveModel: parsed.GEMINI_LIVE_MODEL,
-      responseModel: parsed.RESPONSE_MODEL,
     },
     stream: {
       context: parsed.STREAM_CONTEXT.trim(),
       visionFps: parsed.VISION_FPS,
       frameWidth: parsed.VISION_FRAME_WIDTH,
-      eventThreshold: parsed.EVENT_THRESHOLD,
       confidenceThreshold: parsed.EVENT_CONFIDENCE_THRESHOLD,
       contextRefreshMs: parsed.STREAM_CONTEXT_REFRESH_SECONDS * 1000,
     },
-    response: {
-      provider: parsed.RESPONSE_PROVIDER,
+    reaction: {
       minimumDelayMs,
       maximumDelayMs,
       globalMessagesPer30Seconds: parsed.CHAT_MESSAGES_PER_30_SECONDS,
+      maxReactionsPerEvent: parsed.MAX_REACTIONS_PER_EVENT,
     },
     learning: {
       enabled: bool(parsed.LEARN_ENABLED, true),

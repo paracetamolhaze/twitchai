@@ -1,10 +1,10 @@
-# Twitch AI Viewers Dashboard
+# Dashboard Twitch AI Viewers
 
-The dashboard is a standalone Vue/Vite application intended for Vercel. It never opens Twitch, FFmpeg, or Gemini connections.
+Отдельное приложение Vue/Vite для Vercel. Оно не подключается к Twitch, FFmpeg или Gemini — все постоянные соединения живут в Railway backend.
 
 ```bash
 npm ci
 VITE_API_URL=http://localhost:3000 npm run dev
 ```
 
-Configure `VITE_API_URL` in Vercel with the public Railway backend origin. The operator enters `DASHBOARD_TOKEN` at runtime; it is kept in `sessionStorage`, not bundled into the frontend.
+В Vercel задайте `VITE_API_URL` с публичным адресом Railway backend. Оператор вводит `DASHBOARD_TOKEN` один раз; backend обменивает его на подписанную HttpOnly-сессию. Токен не хранится в JavaScript, `localStorage` или `sessionStorage`.

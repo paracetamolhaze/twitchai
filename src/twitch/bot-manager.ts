@@ -33,11 +33,13 @@ export class TwitchBotManager extends EventEmitter {
   private readonly logger: Logger;
   private readonly validator: TwitchTokenValidator;
   private readerUsername?: string;
+  private channel: string;
 
   constructor(private readonly options: TwitchBotManagerOptions) {
     super();
     this.logger = options.logger.child('TWITCH');
     this.validator = options.validator ?? new OfficialTwitchTokenValidator();
+    this.channel = options.channel;
     for (const account of options.accounts) {
       this.bots.set(account.username, {
         config: account,
@@ -60,8 +62,10 @@ export class TwitchBotManager extends EventEmitter {
       const previous = stored.get(bot.config.username);
       if (!previous) continue;
       bot.config.enabled = previous.enabled;
+      bot.config.personaId = previous.personaId || bot.config.personaId;
       bot.status = {
         ...bot.status,
+        personaId: bot.config.personaId,
         enabled: previous.enabled,
         connectionState: previous.enabled ? 'DISCONNECTED' : 'DISABLED',
         messagesSent: previous.messagesSent,
@@ -73,6 +77,7 @@ export class TwitchBotManager extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    if (!this.channel) return;
     await Promise.allSettled([...this.bots.values()].map((bot) => this.connectBot(bot)));
   }
 
@@ -85,6 +90,14 @@ export class TwitchBotManager extends EventEmitter {
         chatConnected: false,
       });
     }));
+    this.readerUsername = undefined;
+  }
+
+  async reconfigureChannel(channel: string): Promise<void> {
+    if (channel === this.channel) return;
+    await this.stop();
+    this.channel = channel;
+    if (channel) await this.start();
   }
 
   listStatuses(): BotAccountRecord[] { return [...this.bots.values()].map((bot) => structuredClone(bot.status)); }
@@ -125,7 +138,7 @@ export class TwitchBotManager extends EventEmitter {
       return false;
     }
     try {
-      await bot.client.say(`#${this.options.channel}`, message);
+      await bot.client.say(`#${this.channel}`, message);
       bot.sentAt.push(Date.now());
       await this.patch(bot, {
         messagesSent: bot.status.messagesSent + 1,
@@ -153,7 +166,7 @@ export class TwitchBotManager extends EventEmitter {
           username: bot.config.username,
           password: bot.config.oauthToken.startsWith('oauth:') ? bot.config.oauthToken : `oauth:${bot.config.oauthToken}`,
         },
-        channels: [this.options.channel],
+        channels: [this.channel],
         connection: {
           secure: true,
           reconnect: true,
@@ -167,16 +180,16 @@ export class TwitchBotManager extends EventEmitter {
       bot.client = client;
       client.on('connected', () => {
         void this.patch(bot, { connectionState: 'CONNECTED', chatConnected: false, lastError: undefined });
-        this.logger.info('Bot IRC connected; waiting for channel join', { bot: bot.config.username, channel: this.options.channel });
+        this.logger.info('Bot IRC connected; waiting for channel join', { bot: bot.config.username, channel: this.channel });
       });
       client.on('join', (channel, username, self) => {
-        if (!self || username.toLowerCase() !== bot.config.username || channel.replace(/^#/, '').toLowerCase() !== this.options.channel) return;
+        if (!self || username.toLowerCase() !== bot.config.username || channel.replace(/^#/, '').toLowerCase() !== this.channel) return;
         if (!this.readerUsername) this.readerUsername = bot.config.username;
         void this.patch(bot, { connectionState: 'CONNECTED', chatConnected: true, lastError: undefined });
-        this.logger.info('Bot chat joined', { bot: bot.config.username, channel: this.options.channel });
+        this.logger.info('Bot chat joined', { bot: bot.config.username, channel: this.channel });
       });
       client.on('part', (channel, username, self) => {
-        if (!self || username.toLowerCase() !== bot.config.username || channel.replace(/^#/, '').toLowerCase() !== this.options.channel) return;
+        if (!self || username.toLowerCase() !== bot.config.username || channel.replace(/^#/, '').toLowerCase() !== this.channel) return;
         if (this.readerUsername === bot.config.username) this.chooseReader(bot.config.username);
         void this.patch(bot, { chatConnected: false, lastError: 'Bot left the Twitch channel' });
       });
