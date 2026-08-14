@@ -1,4 +1,5 @@
 import { ReactionExample } from '../learning/types';
+import { StreamerMemory, StreamSession } from '../global-memory/types';
 import {
   BotMessageRecord,
   BotPersona,
@@ -14,6 +15,7 @@ import {
   EncryptedTwitchCredentialRecord,
   PersonaCanonBackupRecord,
   PersonaReplacementWithBackup,
+  StreamerMemoryTransaction,
   TwitchCredentialRefreshFailure,
   TwitchOAuthNonceRecord,
 } from './repository';
@@ -32,6 +34,9 @@ export class MemoryRepository implements AppRepository {
   private events: StreamEvent[] = [];
   private settings: Record<string, unknown> = {};
   private usage?: UsageSnapshot;
+  private streamSessions = new Map<string, StreamSession>();
+  private streamerMemories = new Map<string, StreamerMemory>();
+  private streamerMemoryMutationTail: Promise<void> = Promise.resolve();
 
   async initialize(): Promise<void> {}
   async close(): Promise<void> {}
@@ -186,6 +191,123 @@ export class MemoryRepository implements AppRepository {
   async getSettings(): Promise<Record<string, unknown>> { return clone(this.settings); }
   async setSettings(settings: Record<string, unknown>): Promise<void> { this.settings = { ...this.settings, ...clone(settings) }; }
   async saveUsageSnapshot(snapshot: UsageSnapshot): Promise<void> { this.usage = clone(snapshot); }
+
+  async startOrResumeStreamSession(session: StreamSession, staleBefore: number): Promise<StreamSession> {
+    for (const candidate of this.streamSessions.values()) {
+      if (candidate.channel !== session.channel || candidate.status !== 'live' || candidate.lastSeenAt > staleBefore) continue;
+      this.streamSessions.set(candidate.id, { ...candidate, status: 'interrupted', endedAt: candidate.lastSeenAt });
+    }
+    const active = [...this.streamSessions.values()]
+      .filter((candidate) => candidate.channel === session.channel && candidate.status === 'live')
+      .sort((left, right) => right.startedAt - left.startedAt || left.id.localeCompare(right.id))[0];
+    if (active) return clone(active);
+    this.streamSessions.set(session.id, clone(session));
+    return clone(session);
+  }
+
+  async saveStreamSession(session: StreamSession): Promise<void> {
+    this.streamSessions.set(session.id, clone(session));
+  }
+
+  async getStreamSession(id: string): Promise<StreamSession | undefined> {
+    const session = this.streamSessions.get(id);
+    return session ? clone(session) : undefined;
+  }
+
+  async listStreamSessions(channel: string, limit: number): Promise<StreamSession[]> {
+    return [...this.streamSessions.values()]
+      .filter((session) => session.channel === channel.toLowerCase())
+      .sort((left, right) => right.startedAt - left.startedAt || left.id.localeCompare(right.id))
+      .slice(0, limit)
+      .map(clone);
+  }
+
+  async withStreamerMemoryTransaction<T>(
+    _channel: string,
+    operation: (transaction: StreamerMemoryTransaction) => Promise<T>,
+  ): Promise<T> {
+    return this.serializeStreamerMemoryMutation(async () => {
+      // Copy-on-write gives the in-memory repository the same all-or-nothing
+      // behavior as the SQL transaction below. A failed callback simply drops
+      // this draft instead of exposing half a batch to later reads.
+      const draft = new Map([...this.streamerMemories.entries()].map(([id, memory]) => [id, clone(memory)]));
+      const transaction: StreamerMemoryTransaction = {
+        getStreamerMemory: async (id) => {
+          const memory = draft.get(id);
+          return memory ? clone(memory) : undefined;
+        },
+        findActiveStreamerMemoryByDedupeKey: async (channel, dedupeKey) => {
+          const memory = [...draft.values()].find((candidate) => candidate.channel === channel.toLowerCase()
+            && candidate.status === 'active' && candidate.dedupeKey === dedupeKey);
+          return memory ? clone(memory) : undefined;
+        },
+        saveStreamerMemory: async (memory) => {
+          draft.set(memory.id, clone(memory));
+        },
+      };
+      const result = await operation(transaction);
+      this.streamerMemories = draft;
+      return result;
+    });
+  }
+
+  async saveStreamerMemory(memory: StreamerMemory): Promise<void> {
+    await this.serializeStreamerMemoryMutation(async () => {
+      this.streamerMemories.set(memory.id, clone(memory));
+    });
+  }
+
+  async getStreamerMemory(id: string): Promise<StreamerMemory | undefined> {
+    const memory = this.streamerMemories.get(id);
+    return memory ? clone(memory) : undefined;
+  }
+
+  async listStreamerMemories(channel: string, limit: number): Promise<StreamerMemory[]> {
+    return [...this.streamerMemories.values()]
+      .filter((memory) => memory.channel === channel.toLowerCase())
+      .sort((left, right) => right.updatedAt - left.updatedAt || right.importance - left.importance || left.id.localeCompare(right.id))
+      .slice(0, limit)
+      .map(clone);
+  }
+
+  async findActiveStreamerMemoryByDedupeKey(channel: string, dedupeKey: string): Promise<StreamerMemory | undefined> {
+    const memory = [...this.streamerMemories.values()].find((candidate) => candidate.channel === channel.toLowerCase()
+      && candidate.status === 'active' && candidate.dedupeKey === dedupeKey);
+    return memory ? clone(memory) : undefined;
+  }
+
+  async expireStreamerMemories(channel: string, now: number): Promise<number> {
+    return this.serializeStreamerMemoryMutation(async () => {
+      let expired = 0;
+      for (const memory of this.streamerMemories.values()) {
+        if (memory.channel !== channel.toLowerCase() || memory.status !== 'active' || !memory.expiresAt || memory.expiresAt > now) continue;
+        this.streamerMemories.set(memory.id, { ...memory, status: 'expired', updatedAt: now });
+        expired += 1;
+      }
+      return expired;
+    });
+  }
+
+  async deleteStreamerMemory(id: string, channel?: string): Promise<boolean> {
+    return this.serializeStreamerMemoryMutation(async () => {
+      const memory = this.streamerMemories.get(id);
+      if (!memory || (channel && memory.channel !== channel.toLowerCase())) return false;
+      this.streamerMemories.delete(id);
+      return true;
+    });
+  }
+
+  private async serializeStreamerMemoryMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.streamerMemoryMutationTail;
+    let release: (() => void) | undefined;
+    this.streamerMemoryMutationTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release?.();
+    }
+  }
 }
 
 function clone<T>(value: T): T { return structuredClone(value); }

@@ -11,7 +11,7 @@ import { UsageTracker } from '../src/usage/usage-tracker';
 
 afterEach(() => vi.useRealTimers());
 
-describe('Gemini Live two-tool protocol', () => {
+describe('Gemini Live three-tool protocol', () => {
   it('keeps the model instruction free of administrative labels and requires background restraint', () => {
     const instruction = STREAM_BRAIN_INSTRUCTION.toLowerCase();
 
@@ -23,6 +23,10 @@ describe('Gemini Live two-tool protocol', () => {
     expect(STREAM_BRAIN_INSTRUCTION).toContain('Never expose internal application metadata');
     expect(STREAM_BRAIN_INSTRUCTION).toContain('Questions attempting to classify the account or expose implementation details');
     expect(STREAM_BRAIN_INSTRUCTION).toContain('Never fabricate new canonical facts');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('record_stream_memories');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Long-term memory is selective');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Current observed reality outranks global memory');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Memory recording is independent of reaction creation');
   });
 
   it('handles every tool call in a server message and correlates synchronous responses by id', async () => {
@@ -30,6 +34,7 @@ describe('Gemini Live two-tool protocol', () => {
     const order: string[] = [];
     const transcripts: string[] = [];
     let onMessage: ((message: LiveServerMessage) => void) | undefined;
+    let liveParameters: LiveConnectParameters | undefined;
     const sendRealtimeInput = vi.fn();
     const session = {
       sendRealtimeInput,
@@ -40,10 +45,12 @@ describe('Gemini Live two-tool protocol', () => {
       apiKey: 'test-key', model: 'gemini-3.1-flash-live-preview',
       logger: new Logger('TEST', 'error'), usage: new UsageTracker(),
       connect: async (parameters: LiveConnectParameters) => {
+        liveParameters = parameters;
         onMessage = parameters.callbacks?.onmessage;
         return session;
       },
       handlers: {
+        onRecordStreamMemories: async () => { order.push('memory'); return { accepted: [{ outcome: 'created' }], rejected: [] }; },
         onPrepareReactionContext: async () => { order.push('prepare'); return { eventId: 'event-1', candidates: [] }; },
         onEmitReactionBatch: async () => { order.push('emit'); return { accepted: [], rejected: [] }; },
         onTranscript: (text) => transcripts.push(text),
@@ -63,13 +70,14 @@ describe('Gemini Live two-tool protocol', () => {
         modelTurn: { role: 'model', parts: [{ text: 'ignored voice output' }, { inlineData: { mimeType: 'audio/pcm', data: 'AA==' } }] },
       },
       toolCall: { functionCalls: [
+        { id: 'memory-1', name: 'record_stream_memories', args: { memories: [{ type: 'plan', summary: 'trip tomorrow', entities: ['Thailand'], tags: ['travel'], importance: .8, confidence: .9 }] } },
         { id: 'prepare-1', name: 'prepare_reaction_context', args: { type: 'funny', summary: 'момент', importance: .8, confidence: .9 } },
         { id: 'emit-1', name: 'emit_reaction_batch', args: { eventId: 'event-1', reactions: [] } },
       ] },
     } as LiveServerMessage);
 
-    await vi.waitFor(() => expect(sent).toHaveLength(2));
-    expect(order).toEqual(['prepare', 'emit']);
+    await vi.waitFor(() => expect(sent).toHaveLength(3));
+    expect(order).toEqual(['memory', 'prepare', 'emit']);
     expect(transcripts).toEqual(['одновременная расшифровка']);
     expect(sendRealtimeInput).toHaveBeenCalledWith(expect.objectContaining({ audio: expect.any(Object) }));
     expect(sendRealtimeInput).toHaveBeenCalledWith(expect.objectContaining({ video: expect.any(Object) }));
@@ -78,7 +86,41 @@ describe('Gemini Live two-tool protocol', () => {
     expect(sent.map((item) => {
       const responses = Array.isArray(item.functionResponses) ? item.functionResponses : [item.functionResponses];
       return responses[0]?.id;
-    })).toEqual(['prepare-1', 'emit-1']);
+    })).toEqual(['memory-1', 'prepare-1', 'emit-1']);
+    expect(JSON.stringify(liveParameters?.config?.tools)).toContain('"name":"record_stream_memories"');
+    expect(JSON.stringify(liveParameters?.config?.tools)).toContain('"maxItems":8');
+    client.stop();
+  });
+
+  it('returns invalid_memory_batch for a rejected global memory batch without dropping the Live session', async () => {
+    const sent: LiveSendToolResponseParameters[] = [];
+    let onMessage: ((message: LiveServerMessage) => void) | undefined;
+    const session = {
+      sendRealtimeInput: vi.fn(),
+      sendToolResponse: (response: LiveSendToolResponseParameters) => { sent.push(response); },
+      close: vi.fn(),
+    } as unknown as Session;
+    const client = new GeminiLiveClient({
+      apiKey: 'test-key', model: 'gemini-3.1-flash-live-preview',
+      logger: new Logger('TEST', 'error'), usage: new UsageTracker(),
+      connect: async (parameters: LiveConnectParameters) => { onMessage = parameters.callbacks?.onmessage; return session; },
+      handlers: {
+        onRecordStreamMemories: async () => { throw new Error('invalid batch'); },
+        onPrepareReactionContext: async () => ({}),
+        onEmitReactionBatch: async () => ({}),
+      },
+    });
+    await client.start();
+    onMessage?.({ toolCall: { functionCalls: [{
+      id: 'bad-memory-1', name: 'record_stream_memories', args: { memories: [] },
+    }] } } as LiveServerMessage);
+
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    const responses = Array.isArray(sent[0]?.functionResponses) ? sent[0]?.functionResponses : [sent[0]?.functionResponses];
+    expect(responses[0]).toMatchObject({
+      id: 'bad-memory-1', name: 'record_stream_memories', response: { error: 'invalid_memory_batch' },
+    });
+    expect(client.isConnected()).toBe(true);
     client.stop();
   });
 
@@ -122,18 +164,29 @@ describe('Gemini Live two-tool protocol', () => {
       reconnectMinimumMs: 1, reconnectMaximumMs: 1,
       connect: async (value) => { parameters = value; connectCount += 1; return session; },
       handlers: {
+        onRecordStreamMemories: async () => ({}),
         onPrepareReactionContext: async () => ({}),
         onEmitReactionBatch: async () => ({}),
         onStatus: (connected) => statuses.push(connected),
       },
     });
     await client.start();
+    client.updateGlobalMemorySnapshot([{
+      type: 'plan', summary: 'Streamer plans to fly to Thailand tomorrow', entities: ['Thailand'], tags: ['travel'], importance: .82, confidence: .96,
+    }]);
+    expect(session.sendRealtimeInput).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('TRUSTED GLOBAL STREAMER MEMORY SNAPSHOT'),
+    }));
+    vi.mocked(session.sendRealtimeInput).mockClear();
     parameters?.callbacks?.onclose?.({ code: 1006 } as never);
     expect(client.isConnected()).toBe(false);
     await vi.runOnlyPendingTimersAsync();
     expect(connectCount).toBe(2);
     expect(statuses).toEqual(expect.arrayContaining([false, true]));
     expect(client.isConnected()).toBe(true);
+    expect(session.sendRealtimeInput).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('Streamer plans to fly to Thailand tomorrow'),
+    }));
     client.stop();
   });
 });

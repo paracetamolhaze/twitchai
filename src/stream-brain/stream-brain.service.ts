@@ -81,6 +81,7 @@ export class StreamBrainService extends EventEmitter {
       state: this.deriveState(mediaConnected, this.status.geminiConnected, state === 'ERROR' ? error : undefined),
       ...(error ? { lastError: error } : {}),
     });
+    this.emit('media', { state, error, mediaConnected });
   }
 
   onGeminiStatus(connected: boolean, error?: string): void {

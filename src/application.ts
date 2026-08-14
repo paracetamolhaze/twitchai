@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { ApiServer, createApiServer } from './api/server';
 import { AppConfig, normalizeChannel } from './config';
+import { GlobalStreamerMemory } from './global-memory/global-streamer-memory';
+import { StreamerMemory } from './global-memory/types';
 import { ReactionMemory } from './learning/reaction-memory';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
@@ -40,6 +42,7 @@ export class Application {
   private readonly personas: PersonaStore;
   private readonly policy: ReactionPolicyGuard;
   private readonly memory: ReactionMemory;
+  private readonly globalMemory: GlobalStreamerMemory;
   private readonly history: BotHistory;
   private readonly personaMemory: PersonaMemory;
   private readonly personaRuntime: PersonaRuntimeStore;
@@ -56,9 +59,12 @@ export class Application {
   private usageTimer?: NodeJS.Timeout;
   private healthTimer?: NodeJS.Timeout;
   private oauthRefreshTimer?: NodeJS.Timeout;
+  private sessionHeartbeatTimer?: NodeJS.Timeout;
   private databaseReady = false;
   private stopping = false;
   private runtimeSettings: Record<string, unknown> = {};
+  /** Serializes STREAMING/OFFLINE/reconfigure/heartbeat transitions. */
+  private globalMemoryLifecycle: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: AppConfig) {
     this.logger = new Logger('APP', config.app.logLevel);
@@ -78,6 +84,14 @@ export class Application {
       reactionWindowMs: config.learning.reactionWindowSeconds * 1000,
       repository: this.repository,
       logger: this.logger,
+    });
+    this.globalMemory = new GlobalStreamerMemory({
+      repository: this.repository,
+      usage: this.usage,
+      logger: this.logger,
+      retrievalLimit: config.globalMemory.retrievalLimit,
+      startupLimit: config.globalMemory.snapshotLimit,
+      staleSessionMs: config.globalMemory.sessionStaleMinutes * 60_000,
     });
     this.history = new BotHistory(this.repository, 50);
     this.personaMemory = new PersonaMemory(this.repository);
@@ -117,6 +131,7 @@ export class Application {
       sender: this.botManager,
       history: this.history,
       memory: this.memory,
+      globalMemory: this.globalMemory,
       personaContext: this.personaContext,
       personaMemory: this.personaMemory,
       personaRuntime: this.personaRuntime,
@@ -134,6 +149,7 @@ export class Application {
         logger: this.logger,
         usage: this.usage,
         handlers: {
+          onRecordStreamMemories: (batch) => this.globalMemory.recordFromGemini(batch),
           onPrepareReactionContext: async (candidate) => {
             const event = await this.brain.acceptCandidate(candidate);
             if (!event) throw new Error('invalid_event');
@@ -144,6 +160,7 @@ export class Application {
           onStatus: (connected, error) => {
             if (!connected) this.coordinator.clearPendingContexts();
             this.brain.onGeminiStatus(connected, error);
+            if (connected) void this.refreshGlobalMemorySnapshot();
           },
         },
       });
@@ -264,6 +281,18 @@ export class Application {
       personaMemories: (personaId, limit) => this.personaMemory.list(personaId, limit),
       deletePersonaMemory: (personaId, memoryId) => this.personaMemory.delete(personaId, memoryId),
       previewPersonaContext: (personaId, query, username) => this.previewPersonaContext(personaId, query, username),
+      streamerMemories: (input) => this.globalMemory.list({ channel: this.config.twitch.channel, ...input }),
+      streamerMemoryStats: () => this.globalMemory.stats(this.config.twitch.channel),
+      updateStreamerMemory: (input) => this.globalMemory.updateMemory({ channel: this.config.twitch.channel, ...input }),
+      deleteStreamerMemory: async (id) => {
+        const deleted = await this.globalMemory.deleteMemory(id, this.config.twitch.channel);
+        if (deleted) {
+          await this.emitGlobalMemorySnapshot();
+          await this.refreshGlobalMemorySnapshot();
+        }
+        return deleted;
+      },
+      previewStreamerMemoryContext: (input) => this.globalMemory.retrieve({ channel: this.config.twitch.channel, ...input }),
       ...(this.twitchOAuth ? {
         twitchOAuth: {
           status: () => this.twitchOAuth!.status(),
@@ -284,6 +313,13 @@ export class Application {
     this.startCategoryMonitor();
     this.usageTimer = setInterval(() => { void this.persistUsage(); }, 60_000);
     this.healthTimer = setInterval(() => { void this.refreshDatabaseHealth(); }, 30_000);
+    this.sessionHeartbeatTimer = setInterval(() => {
+      if (!this.brain.getStatus().mediaConnected) return;
+      void this.enqueueGlobalMemoryLifecycle(async () => {
+        try { await this.globalMemory.touchCurrentSession(); }
+        catch (cause) { this.logger.warn('Stream session heartbeat failed', { cause }); }
+      });
+    }, 60_000);
     if (this.twitchOAuth) {
       void this.refreshExpiringTwitchCredentials();
       this.oauthRefreshTimer = setInterval(() => {
@@ -299,14 +335,17 @@ export class Application {
     if (this.usageTimer) clearInterval(this.usageTimer);
     if (this.healthTimer) clearInterval(this.healthTimer);
     if (this.oauthRefreshTimer) clearInterval(this.oauthRefreshTimer);
+    if (this.sessionHeartbeatTimer) clearInterval(this.sessionHeartbeatTimer);
     this.categoryTimer = undefined;
     this.usageTimer = undefined;
     this.healthTimer = undefined;
     this.oauthRefreshTimer = undefined;
+    this.sessionHeartbeatTimer = undefined;
     await this.api?.stop();
     await this.coordinator?.stop();
     await this.memory.stop();
     await this.transcriber?.flush();
+    await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
     await this.brain?.stop();
     await this.botManager?.stop();
     await this.persistUsage();
@@ -323,6 +362,18 @@ export class Application {
     this.brain.on('status', (status) => {
       this.api.emitBrain(status);
       this.api.emitOverview();
+    });
+    this.brain.on('media', ({ state, mediaConnected }: { state: string; mediaConnected: boolean }) => {
+      if (mediaConnected) {
+        void this.enqueueGlobalMemoryLifecycle(() => this.startGlobalMemorySession());
+      } else if (state === 'OFFLINE') {
+        void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
+      }
+    });
+    this.globalMemory.on('memory', ({ memory }: { memory: StreamerMemory }) => {
+      this.api.emitStreamerMemory(memory);
+      void this.emitGlobalMemorySnapshot();
+      void this.refreshGlobalMemorySnapshot();
     });
     this.coordinator.on('decision', (decision: ReactionDecisionRecord) => {
       this.decisions.push(decision);
@@ -475,6 +526,7 @@ export class Application {
     const mediaChanged = nextChannel !== this.config.twitch.channel || nextVisionFps !== this.config.stream.visionFps;
     if (mediaChanged) {
       const channelChanged = nextChannel !== this.config.twitch.channel;
+      if (channelChanged) await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
       this.config.twitch.channel = nextChannel;
       this.config.stream.visionFps = nextVisionFps;
       this.contextStore.configure({ channel: nextChannel });
@@ -489,6 +541,58 @@ export class Application {
     this.runtimeSettings = { ...this.runtimeSettings, ...persisted };
     await this.repository.setSettings(persisted);
     return { restartRequired: [] };
+  }
+
+  private async startGlobalMemorySession(): Promise<void> {
+    const snapshot = this.contextStore.snapshot();
+    if (!snapshot.channel) return;
+    try {
+      await this.globalMemory.startOrResumeSession({
+        channel: snapshot.channel,
+        ...(snapshot.category ? { initialCategory: snapshot.category } : {}),
+        ...(snapshot.streamContext ? { initialStreamContext: snapshot.streamContext } : {}),
+      });
+      await this.refreshGlobalMemorySnapshot();
+    } catch (cause) {
+      this.logger.warn('Stream session start failed', { cause });
+    }
+  }
+
+  private async closeGlobalMemorySession(status: 'ended' | 'interrupted'): Promise<void> {
+    try { await this.globalMemory.endCurrentSession(status); }
+    catch (cause) { this.logger.warn('Stream session close failed', { cause, status }); }
+  }
+
+  private enqueueGlobalMemoryLifecycle(operation: () => Promise<void>): Promise<void> {
+    const queued = this.globalMemoryLifecycle.then(operation, operation);
+    this.globalMemoryLifecycle = queued.catch(() => undefined);
+    return queued;
+  }
+
+  private async refreshGlobalMemorySnapshot(): Promise<void> {
+    if (!this.gemini || !this.config.twitch.channel) return;
+    try {
+      const memories = await this.globalMemory.startupSnapshot(
+        this.config.twitch.channel,
+        this.config.globalMemory.snapshotLimit,
+      );
+      this.gemini.updateGlobalMemorySnapshot(memories);
+    } catch (cause) {
+      this.logger.warn('Global memory snapshot refresh failed', { cause });
+    }
+  }
+
+  private async emitGlobalMemorySnapshot(): Promise<void> {
+    try {
+      const [memories, stats] = await Promise.all([
+        this.globalMemory.list({ channel: this.config.twitch.channel, limit: 100 }),
+        this.globalMemory.stats(this.config.twitch.channel),
+      ]);
+      this.api.emitStreamerMemories(memories);
+      this.api.emitStreamerMemoryStats(stats);
+    } catch (cause) {
+      this.logger.warn('Global memory dashboard update failed', { cause });
+    }
   }
 
   private async persistUsage(): Promise<void> {

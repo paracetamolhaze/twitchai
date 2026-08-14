@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { z } from 'zod';
 import { Logger } from '../logger';
 import { ReactionMemory } from '../learning/reaction-memory';
+import { GlobalStreamerMemory } from '../global-memory/global-streamer-memory';
 import { BotHistory } from '../personas/bot-history';
 import { PersonaContextBuilder } from '../personas/persona-context-builder';
 import { PersonaMemory } from '../personas/persona-memory';
@@ -32,6 +33,7 @@ export interface ReactionCoordinatorOptions {
   sender: ReactionSender;
   history: BotHistory;
   memory: ReactionMemory;
+  globalMemory: GlobalStreamerMemory;
   personaContext: PersonaContextBuilder;
   personaMemory: PersonaMemory;
   personaRuntime: PersonaRuntimeStore;
@@ -87,9 +89,15 @@ export class ReactionCoordinator extends EventEmitter {
     const candidates = directTargets.size > 0
       ? eligibleCandidates.filter((candidate) => directTargets.has(candidate.username.toLowerCase()))
       : eligibleCandidates;
-    const [histories, reactionExamples] = await Promise.all([
+    const [histories, reactionExamples, globalStreamerMemories] = await Promise.all([
       Promise.all(candidates.map((candidate) => this.options.history.recent(candidate.username))),
       this.options.memory.retrieve(event, snapshot, this.options.retrievalLimit),
+      this.options.globalMemory.retrieve({
+        channel: snapshot.channel,
+        query: globalMemoryQuery(event, snapshot.streamContext, snapshot.recentChat),
+        entities: event.directMentions,
+        tags: [event.type, event.category ?? snapshot.category].filter((value): value is string => Boolean(value?.trim())),
+      }),
     ]);
     const viewerByUsername = new Map<string, string>();
     const personaContexts = await Promise.all(candidates.map((candidate, index) => {
@@ -125,6 +133,7 @@ export class ReactionCoordinator extends EventEmitter {
       eventId: event.id,
       event,
       recentChat: snapshot.recentChat.slice(-40),
+      globalStreamerMemories,
       candidates: candidates.map((candidate, index) => ({
         ...personaContexts[index]!,
         rateLimit: this.options.policy.candidateRateLimit(candidate),
@@ -304,6 +313,24 @@ export class ReactionCoordinator extends EventEmitter {
   }
 
   private emitDecision(decision: ReactionDecisionRecord): void { this.emit('decision', decision); }
+}
+
+function globalMemoryQuery(
+  event: StreamEvent,
+  streamContext: string,
+  recentChat: Array<{ message: string }>,
+): string {
+  return [
+    event.summary,
+    event.speech,
+    event.visualContext,
+    event.gameContext,
+    event.category,
+    streamContext,
+    ...recentChat.slice(-12).map((message) => message.message),
+  ]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join('\n');
 }
 
 function rawUsername(value: unknown, index: number): string {

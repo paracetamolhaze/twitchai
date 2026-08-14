@@ -49,6 +49,11 @@ export interface AppConfig {
     reactionWindowSeconds: number;
     retrievalLimit: number;
   };
+  globalMemory: {
+    retrievalLimit: number;
+    snapshotLimit: number;
+    sessionStaleMinutes: number;
+  };
   transcription: {
     provider: TranscriptionProvider;
     fallback?: 'groq-whisper';
@@ -88,6 +93,9 @@ const envSchema = z.object({
   LEARN_ENABLED: z.string().default('true'),
   LEARN_REACTION_WINDOW_SECONDS: z.coerce.number().int().min(5).max(120).default(25),
   LEARN_RETRIEVAL_LIMIT: z.coerce.number().int().min(1).max(10).default(4),
+  GLOBAL_MEMORY_RETRIEVAL_LIMIT: z.coerce.number().int().min(1).max(15).default(6),
+  GLOBAL_MEMORY_SNAPSHOT_LIMIT: z.coerce.number().int().min(1).max(15).default(10),
+  GLOBAL_MEMORY_SESSION_STALE_MINUTES: z.coerce.number().int().min(5).max(240).default(30),
   TRANSCRIPTION_PROVIDER: z.enum(['gemini', 'groq-whisper']).default('gemini'),
   TRANSCRIPTION_FALLBACK: z.enum(['groq-whisper']).optional(),
   GROQ_API_KEY: z.string().trim().optional(),
@@ -172,6 +180,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       enabled: bool(parsed.LEARN_ENABLED, true),
       reactionWindowSeconds: parsed.LEARN_REACTION_WINDOW_SECONDS,
       retrievalLimit: parsed.LEARN_RETRIEVAL_LIMIT,
+    },
+    globalMemory: {
+      retrievalLimit: parsed.GLOBAL_MEMORY_RETRIEVAL_LIMIT,
+      snapshotLimit: parsed.GLOBAL_MEMORY_SNAPSHOT_LIMIT,
+      sessionStaleMinutes: parsed.GLOBAL_MEMORY_SESSION_STALE_MINUTES,
     },
     transcription: {
       provider: parsed.TRANSCRIPTION_PROVIDER,

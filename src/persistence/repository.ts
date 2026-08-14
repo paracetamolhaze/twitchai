@@ -1,4 +1,5 @@
 import { ReactionExample } from '../learning/types';
+import { StreamerMemory, StreamSession } from '../global-memory/types';
 import {
   BotMessageRecord,
   BotPersona,
@@ -70,6 +71,17 @@ export interface PersonaReplacementWithBackup {
   persona: BotPersona;
 }
 
+/**
+ * The intentionally small transactional surface used by global streamer
+ * memory. Keeping it domain-specific prevents callers from accidentally
+ * mixing unrelated persistence with a memory batch.
+ */
+export interface StreamerMemoryTransaction {
+  getStreamerMemory(id: string): Promise<StreamerMemory | undefined>;
+  findActiveStreamerMemoryByDedupeKey(channel: string, dedupeKey: string): Promise<StreamerMemory | undefined>;
+  saveStreamerMemory(memory: StreamerMemory): Promise<void>;
+}
+
 export interface AppRepository {
   initialize(): Promise<void>;
   close(): Promise<void>;
@@ -105,4 +117,24 @@ export interface AppRepository {
   getSettings(): Promise<Record<string, unknown>>;
   setSettings(settings: Record<string, unknown>): Promise<void>;
   saveUsageSnapshot(snapshot: UsageSnapshot): Promise<void>;
+  /** Atomically reuse a channel's live session instead of creating a duplicate after a restart. */
+  startOrResumeStreamSession(session: StreamSession, staleBefore: number): Promise<StreamSession>;
+  saveStreamSession(session: StreamSession): Promise<void>;
+  getStreamSession(id: string): Promise<StreamSession | undefined>;
+  listStreamSessions(channel: string, limit: number): Promise<StreamSession[]>;
+  /**
+   * Serialize and atomically commit a channel-scoped memory mutation batch.
+   * Postgres implementations hold a transaction and advisory lock; in-memory
+   * implementations use copy-on-write so a failed callback leaves no writes.
+   */
+  withStreamerMemoryTransaction<T>(
+    channel: string,
+    operation: (transaction: StreamerMemoryTransaction) => Promise<T>,
+  ): Promise<T>;
+  saveStreamerMemory(memory: StreamerMemory): Promise<void>;
+  getStreamerMemory(id: string): Promise<StreamerMemory | undefined>;
+  listStreamerMemories(channel: string, limit: number): Promise<StreamerMemory[]>;
+  findActiveStreamerMemoryByDedupeKey(channel: string, dedupeKey: string): Promise<StreamerMemory | undefined>;
+  expireStreamerMemories(channel: string, now: number): Promise<number>;
+  deleteStreamerMemory(id: string, channel?: string): Promise<boolean>;
 }

@@ -6,11 +6,17 @@ import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { auditPersonas } from '../src/personas/persona-quality';
 import { personaSummary } from '../src/personas/schema';
 import { StreamEvent } from '../src/stream-brain/types';
+import { StreamerMemory } from '../src/global-memory/types';
 
 const token = 'a-secure-test-token';
 const event: StreamEvent = {
   id: '4cd428b2-65d8-4359-891f-f020ec39ad2b', timestamp: 1000, type: 'funny', summary: 'unexpected moment',
   importance: 0.8, confidence: 0.9, source: 'gemini-live', directMentions: [],
+};
+const streamerMemory: StreamerMemory = {
+  id: 'memory-thailand', channel: 'channel', type: 'plan', summary: 'Стример завтра летит в Таиланд',
+  entities: ['Таиланд'], tags: ['поездка', 'план'], importance: 0.82, confidence: 0.96,
+  createdAt: 1000, updatedAt: 1000, lastSeenAt: 1000, confirmationCount: 1, status: 'active', dedupeKey: 'plan|thailand',
 };
 let servers: ApiServer[] = [];
 const testPersona = generatePersonaV3('karlbekner', { id: 'account-karlbekner' });
@@ -25,6 +31,7 @@ function server(twitchOAuth?: {
   abandonAuthorization: (state: string, browserState: string) => Promise<void>;
   completeAuthorization: (code: string, state: string, browserState: string) => Promise<{ username: string }>;
 }): ApiServer {
+  let streamerMemories = [structuredClone(streamerMemory)];
   const api = createApiServer({
     port: 0, frontendUrls: ['http://localhost:5173'], dashboardToken: token, logger: new Logger('TEST', 'error'),
     health: () => ({ status: 'ok', twitch: true, streamBrain: true, gemini: true, database: true }),
@@ -38,7 +45,8 @@ function server(twitchOAuth?: {
     usage: () => ({ startedAt: 0, uptimeSeconds: 1, streamMinutes: 0, audioMinutes: 0, videoMinutes: 0,
       geminiReconnects: 0, geminiInputTokens: 0, geminiOutputTokens: 0, geminiToolCalls: 0,
       preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0, guardRejections: 0,
-      eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0 }),
+      eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0,
+      memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0 }),
     settings: async () => ({}), updateSettings: async () => ({ restartRequired: [] }),
     personas: () => testPersonas,
     personaSummaries: () => testPersonas.map((persona) => personaSummary(persona)),
@@ -63,6 +71,31 @@ function server(twitchOAuth?: {
     personaMemories: async () => [],
     deletePersonaMemory: async () => false,
     previewPersonaContext: async () => { throw new Error('not used'); },
+    streamerMemories: async (input) => streamerMemories.filter((memory) =>
+      (!input.type || memory.type === input.type)
+      && (!input.status || memory.status === input.status)
+      && (!input.search || memory.summary.toLowerCase().includes(input.search.toLowerCase()))),
+    streamerMemoryStats: async () => ({
+      channel: 'channel', total: streamerMemories.length,
+      active: streamerMemories.filter((memory) => memory.status === 'active').length,
+      resolved: streamerMemories.filter((memory) => memory.status === 'resolved').length,
+      superseded: streamerMemories.filter((memory) => memory.status === 'superseded').length,
+      expired: streamerMemories.filter((memory) => memory.status === 'expired').length,
+      duplicateMerges: 0, averageImportance: 0.82, averageConfidence: 0.96,
+    }),
+    updateStreamerMemory: async (input) => {
+      const index = streamerMemories.findIndex((memory) => memory.id === input.id);
+      if (index < 0) return undefined;
+      const updated = { ...streamerMemories[index]!, ...input, updatedAt: 2_000 } as StreamerMemory;
+      streamerMemories[index] = updated;
+      return updated;
+    },
+    deleteStreamerMemory: async (id) => {
+      const before = streamerMemories.length;
+      streamerMemories = streamerMemories.filter((memory) => memory.id !== id);
+      return streamerMemories.length < before;
+    },
+    previewStreamerMemoryContext: async () => streamerMemories,
     twitchOAuth,
   });
   servers.push(api);
@@ -100,6 +133,29 @@ describe('dashboard API', () => {
     const events = await request(api.app).get('/api/events').set('Authorization', `Bearer ${token}`).expect(200);
     expect(bots.body[0]).toMatchObject({ username: 'bot', connectionState: 'CONNECTED', chatConnected: true });
     expect(events.body[0]).toMatchObject({ id: event.id, summary: event.summary });
+  });
+
+  it('protects, edits and previews global streamer memories', async () => {
+    const api = server();
+    await request(api.app).get('/api/streamer-memories').expect(401);
+    const memories = await request(api.app).get('/api/streamer-memories?type=plan').set('Authorization', `Bearer ${token}`).expect(200);
+    expect(memories.body).toEqual([expect.objectContaining({ id: streamerMemory.id, type: 'plan' })]);
+    const preview = await request(api.app)
+      .post('/api/streamer-memories/context-preview')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ query: 'Таиланд' })
+      .expect(200);
+    expect(preview.body[0]).toMatchObject({ id: streamerMemory.id });
+    const updated = await request(api.app)
+      .patch(`/api/streamer-memories/${streamerMemory.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ status: 'resolved' })
+      .expect(200);
+    expect(updated.body).toMatchObject({ id: streamerMemory.id, status: 'resolved' });
+    await request(api.app)
+      .delete(`/api/streamer-memories/${streamerMemory.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(204);
   });
 
   it('exposes deep persona CRUD and blocks deletion while assigned', async () => {

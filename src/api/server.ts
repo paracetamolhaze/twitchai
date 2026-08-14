@@ -5,6 +5,14 @@ import helmet from 'helmet';
 import { Server as SocketServer } from 'socket.io';
 import { z } from 'zod';
 import { Logger } from '../logger';
+import {
+  GlobalMemoryRetrievalInput,
+  GlobalStreamerMemoryStats,
+  StreamerMemory,
+  StreamerMemoryStatus,
+  StreamerMemoryType,
+  UpdateStreamerMemoryInput,
+} from '../global-memory/types';
 import { PersonaReactionContext } from '../personas/persona-context-builder';
 import { auditPersonas } from '../personas/persona-quality';
 import { PersonaRegenerationPreview } from '../personas/persona-store';
@@ -72,6 +80,16 @@ export interface ApiServerDependencies {
   personaMemories: (personaId: string, limit: number) => Promise<PersonaMemoryItem[]>;
   deletePersonaMemory: (personaId: string, memoryId: string) => Promise<boolean>;
   previewPersonaContext: (personaId: string, query: string, username?: string) => Promise<PersonaReactionContext>;
+  streamerMemories: (input: {
+    type?: StreamerMemoryType;
+    status?: StreamerMemoryStatus;
+    search?: string;
+    limit?: number;
+  }) => Promise<StreamerMemory[]>;
+  streamerMemoryStats: () => Promise<GlobalStreamerMemoryStats>;
+  updateStreamerMemory: (input: Omit<UpdateStreamerMemoryInput, 'channel'>) => Promise<StreamerMemory | undefined>;
+  deleteStreamerMemory: (id: string) => Promise<boolean>;
+  previewStreamerMemoryContext: (input: Omit<GlobalMemoryRetrievalInput, 'channel'>) => Promise<StreamerMemory[]>;
   twitchOAuth?: {
     status: () => Promise<TwitchOAuthStatus>;
     startAuthorization: () => Promise<string>;
@@ -92,6 +110,9 @@ export interface ApiServer {
   emitBots(bots: BotAccountRecord[]): void;
   emitBrain(status: StreamBrainStatus): void;
   emitDecision(decision: ReactionDecisionRecord): void;
+  emitStreamerMemories(memories: StreamerMemory[]): void;
+  emitStreamerMemory(memory: StreamerMemory): void;
+  emitStreamerMemoryStats(stats: GlobalStreamerMemoryStats): void;
   emitOverview(): void;
 }
 
@@ -99,6 +120,32 @@ const settingsSchema = z.object({
   channel: z.string().trim().min(1).max(50).optional(),
   streamContext: z.string().max(2_000).optional(),
   visionFps: z.number().min(0.05).max(1).optional(),
+}).strict();
+
+const streamerMemoryListSchema = z.object({
+  type: z.enum(['fact', 'preference', 'person', 'relationship', 'plan', 'promise', 'result', 'place', 'trip', 'running_joke', 'important_event', 'recurring_context', 'other']).optional(),
+  status: z.enum(['active', 'resolved', 'superseded', 'expired']).optional(),
+  search: z.string().trim().min(1).max(300).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(100),
+}).strict();
+
+const streamerMemoryUpdateSchema = z.object({
+  summary: z.string().trim().min(1).max(600).optional(),
+  details: z.record(z.unknown()).optional(),
+  entities: z.array(z.string().trim().min(1).max(120)).max(16).optional(),
+  tags: z.array(z.string().trim().min(1).max(80)).max(16).optional(),
+  importance: z.number().min(0).max(1).optional(),
+  confidence: z.number().min(0).max(1).optional(),
+  occurredAt: z.number().int().positive().nullable().optional(),
+  expiresAt: z.number().int().positive().nullable().optional(),
+  status: z.enum(['active', 'resolved', 'expired']).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, 'Нужно передать хотя бы одно поле памяти');
+
+const streamerMemoryPreviewSchema = z.object({
+  query: z.string().trim().min(1).max(1_000),
+  entities: z.array(z.string().trim().min(1).max(120)).max(16).optional(),
+  tags: z.array(z.string().trim().min(1).max(80)).max(16).optional(),
+  limit: z.number().int().min(1).max(15).optional(),
 }).strict();
 
 export function createApiServer(dependencies: ApiServerDependencies): ApiServer {
@@ -267,6 +314,33 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
   app.get('/api/chat', (_request, response) => response.json(dependencies.chat()));
   app.get('/api/usage', (_request, response) => response.json(dependencies.usage()));
   app.get('/api/decisions', (_request, response) => response.json(dependencies.decisions?.() ?? []));
+  app.get('/api/streamer-memories', async (request, response, next) => {
+    try { return response.json(await dependencies.streamerMemories(streamerMemoryListSchema.parse(request.query))); }
+    catch (error) { return next(error); }
+  });
+  app.get('/api/streamer-memories/stats', async (_request, response, next) => {
+    try { return response.json(await dependencies.streamerMemoryStats()); }
+    catch (error) { return next(error); }
+  });
+  app.post('/api/streamer-memories/context-preview', async (request, response, next) => {
+    try {
+      const body = streamerMemoryPreviewSchema.parse(request.body);
+      return response.json(await dependencies.previewStreamerMemoryContext(body));
+    } catch (error) { return next(error); }
+  });
+  app.patch('/api/streamer-memories/:id', async (request, response, next) => {
+    try {
+      const update = streamerMemoryUpdateSchema.parse(request.body);
+      const memory = await dependencies.updateStreamerMemory({ id: request.params.id, ...update });
+      return memory ? response.json(memory) : response.status(404).json({ error: 'Запись памяти не найдена' });
+    } catch (error) { return next(error); }
+  });
+  app.delete('/api/streamer-memories/:id', async (request, response, next) => {
+    try {
+      const deleted = await dependencies.deleteStreamerMemory(request.params.id);
+      return deleted ? response.status(204).send() : response.status(404).json({ error: 'Запись памяти не найдена' });
+    } catch (error) { return next(error); }
+  });
   app.get('/api/settings', async (_request, response, next) => {
     try { response.json(await dependencies.settings()); } catch (error) { next(error); }
   });
@@ -417,6 +491,12 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     void dependencies.events(50)
       .then((events) => socket.emit('events:init', events))
       .catch((error: unknown) => logger.warn('Initial realtime event load failed', { error }));
+    void Promise.all([dependencies.streamerMemories({ limit: 100 }), dependencies.streamerMemoryStats()])
+      .then(([memories, stats]) => {
+        socket.emit('streamer-memories:init', memories);
+        socket.emit('streamer-memory-stats', stats);
+      })
+      .catch((error: unknown) => logger.warn('Initial realtime memory load failed', { error }));
   });
 
   return {
@@ -441,6 +521,9 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     emitBots: (bots) => io.emit('bots', bots),
     emitBrain: (status) => io.emit('brain', status),
     emitDecision: (decision) => io.emit('decision', decision),
+    emitStreamerMemories: (memories) => io.emit('streamer-memories:init', memories),
+    emitStreamerMemory: (memory) => io.emit('streamer-memory', memory),
+    emitStreamerMemoryStats: (stats) => io.emit('streamer-memory-stats', stats),
     emitOverview: () => io.emit('overview', dependencies.overview()),
   };
 }

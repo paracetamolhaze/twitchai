@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ReactionMemory } from '../src/learning/reaction-memory';
+import { GlobalStreamerMemory } from '../src/global-memory/global-streamer-memory';
 import { Logger } from '../src/logger';
 import { BotHistory } from '../src/personas/bot-history';
 import { PersonaContextBuilder } from '../src/personas/persona-context-builder';
@@ -50,6 +51,8 @@ async function setup() {
   let candidates = [bot('bot-one', 0), bot('bot-two', 1), bot('bot-three', 2)];
   const sent: Array<{ username: string; message: string }> = [];
   const usage = new UsageTracker();
+  const globalMemory = new GlobalStreamerMemory({ repository, usage, now: () => event.timestamp });
+  await globalMemory.startOrResumeSession({ channel: 'streamer', initialCategory: 'Dota 2' });
   const policy = new ReactionPolicyGuard({
     minimumDelayMs: 100,
     maximumDelayMs: 300,
@@ -63,6 +66,7 @@ async function setup() {
     sender: { send: async (username, message) => { sent.push({ username, message }); return true; } },
     history,
     memory: new ReactionMemory({ enabled: true, reactionWindowMs: 1_000, repository }),
+    globalMemory,
     personaContext: new PersonaContextBuilder(personaMemory, personaRuntime),
     personaMemory,
     personaRuntime,
@@ -74,12 +78,31 @@ async function setup() {
     contextTtlMs: 60_000,
     now: () => event.timestamp,
   });
-  return { coordinator, history, policy, sent, usage, setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; } };
+  return { coordinator, globalMemory, history, policy, sent, usage, setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; } };
 }
 
 afterEach(() => vi.useRealTimers());
 
 describe('single-session reaction protocol', () => {
+  it('supplies relevant channel memory once at the reaction root instead of cloning it into every persona', async () => {
+    const { coordinator, globalMemory } = await setup();
+    await globalMemory.recordFromGemini({
+      memories: [{
+        type: 'important_event', summary: 'Стример промахнулся решающим ультимейтом.',
+        entities: ['ультимейт'], tags: ['Dota 2'], importance: .9, confidence: .95,
+      }],
+    });
+
+    const prepared = await coordinator.prepare(event);
+
+    expect(prepared.globalStreamerMemories).toEqual([
+      expect.objectContaining({ type: 'important_event', summary: expect.stringContaining('ультимейтом') }),
+    ]);
+    expect(prepared.candidates).not.toEqual([]);
+    expect(prepared.candidates.every((candidate) => !('globalStreamerMemories' in candidate))).toBe(true);
+    await coordinator.stop();
+  });
+
   it('deterministically skips all generated replies to a direct account-classification question', async () => {
     vi.useFakeTimers();
     const { coordinator, sent } = await setup();

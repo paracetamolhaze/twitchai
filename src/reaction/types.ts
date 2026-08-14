@@ -2,6 +2,7 @@ import { BotPersona } from '../personas/types';
 import { PersonaReactionContext } from '../personas/persona-context-builder';
 import { BotConnectionState } from '../persistence/repository';
 import { ReactionExample } from '../learning/types';
+import { StreamerMemory } from '../global-memory/types';
 import { ChatMessage } from '../stream-brain/types';
 import { StreamEvent } from '../stream-brain/types';
 
@@ -35,6 +36,8 @@ export interface PreparedReactionContext {
   eventId: string;
   event: StreamEvent;
   recentChat: ChatMessage[];
+  /** Supplied once per event, never repeated inside each persona candidate. */
+  globalStreamerMemories: StreamerMemory[];
   candidates: ReactionContextCandidate[];
   reactionExamples: ReactionExample[];
   constraints: {

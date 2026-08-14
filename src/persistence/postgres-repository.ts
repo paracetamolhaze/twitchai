@@ -1,4 +1,5 @@
 import { Pool, PoolClient } from 'pg';
+import { StreamerMemory, StreamSession } from '../global-memory/types';
 import { ReactionExample } from '../learning/types';
 import {
   BotMessageRecord,
@@ -15,6 +16,7 @@ import {
   EncryptedTwitchCredentialRecord,
   PersonaCanonBackupRecord,
   PersonaReplacementWithBackup,
+  StreamerMemoryTransaction,
   TwitchCredentialRefreshFailure,
   TwitchOAuthNonceRecord,
 } from './repository';
@@ -417,6 +419,169 @@ export class PostgresRepository implements AppRepository {
     await this.pool.query('INSERT INTO usage_snapshots (metrics) VALUES ($1)', [snapshot]);
   }
 
+  async startOrResumeStreamSession(session: StreamSession, staleBefore: number): Promise<StreamSession> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // A transactional advisory lock makes restart races deterministic even
+      // before the partial unique index can reject a second live session.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [session.channel]);
+      await client.query(
+        `UPDATE stream_sessions SET status='interrupted', ended_at=last_seen_at
+         WHERE channel=$1 AND status='live' AND last_seen_at <= $2`,
+        [session.channel, new Date(staleBefore)],
+      );
+      const active = await client.query<StreamSessionRow>(
+        `SELECT id, channel, started_at, last_seen_at, ended_at, initial_category, initial_stream_context, status, summary
+         FROM stream_sessions WHERE channel=$1 AND status='live'
+         ORDER BY started_at DESC, id ASC LIMIT 1 FOR UPDATE`,
+        [session.channel],
+      );
+      if (active.rows[0]) {
+        await client.query('COMMIT');
+        return mapStreamSession(active.rows[0]);
+      }
+      await client.query(
+        `INSERT INTO stream_sessions
+         (id, channel, started_at, last_seen_at, ended_at, initial_category, initial_stream_context, status, summary)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [session.id, session.channel, new Date(session.startedAt), new Date(session.lastSeenAt), session.endedAt ? new Date(session.endedAt) : null,
+          session.initialCategory ?? null, session.initialStreamContext ?? null, session.status, session.summary ?? null],
+      );
+      await client.query('COMMIT');
+      return structuredClone(session);
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async saveStreamSession(session: StreamSession): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO stream_sessions
+       (id, channel, started_at, last_seen_at, ended_at, initial_category, initial_stream_context, status, summary)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (id) DO UPDATE SET last_seen_at=EXCLUDED.last_seen_at, ended_at=EXCLUDED.ended_at,
+       initial_category=EXCLUDED.initial_category, initial_stream_context=EXCLUDED.initial_stream_context,
+       status=EXCLUDED.status, summary=EXCLUDED.summary`,
+      [session.id, session.channel, new Date(session.startedAt), new Date(session.lastSeenAt), session.endedAt ? new Date(session.endedAt) : null,
+        session.initialCategory ?? null, session.initialStreamContext ?? null, session.status, session.summary ?? null],
+    );
+  }
+
+  async getStreamSession(id: string): Promise<StreamSession | undefined> {
+    const result = await this.pool.query<StreamSessionRow>(
+      `SELECT id, channel, started_at, last_seen_at, ended_at, initial_category, initial_stream_context, status, summary
+       FROM stream_sessions WHERE id=$1`,
+      [id],
+    );
+    return result.rows[0] ? mapStreamSession(result.rows[0]) : undefined;
+  }
+
+  async listStreamSessions(channel: string, limit: number): Promise<StreamSession[]> {
+    const result = await this.pool.query<StreamSessionRow>(
+      `SELECT id, channel, started_at, last_seen_at, ended_at, initial_category, initial_stream_context, status, summary
+       FROM stream_sessions WHERE channel=$1 ORDER BY started_at DESC, id ASC LIMIT $2`,
+      [channel.toLowerCase(), limit],
+    );
+    return result.rows.map(mapStreamSession);
+  }
+
+  async withStreamerMemoryTransaction<T>(
+    channel: string,
+    operation: (transaction: StreamerMemoryTransaction) => Promise<T>,
+  ): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // A Live reconnect can overlap a previous tool call. Serializing by
+      // channel keeps merge/reconciliation read-modify-write operations safe.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [channel.toLowerCase()]);
+      const transaction: StreamerMemoryTransaction = {
+        getStreamerMemory: async (id) => {
+          const result = await client.query<StreamerMemoryRow>(`${STREAMER_MEMORY_SELECT} WHERE id=$1`, [id]);
+          return result.rows[0] ? mapStreamerMemory(result.rows[0]) : undefined;
+        },
+        findActiveStreamerMemoryByDedupeKey: async (memoryChannel, dedupeKey) => {
+          const result = await client.query<StreamerMemoryRow>(
+            `${STREAMER_MEMORY_SELECT} WHERE channel=$1 AND dedupe_key=$2 AND status='active' LIMIT 1`,
+            [memoryChannel.toLowerCase(), dedupeKey],
+          );
+          return result.rows[0] ? mapStreamerMemory(result.rows[0]) : undefined;
+        },
+        saveStreamerMemory: async (memory) => this.saveStreamerMemoryWithClient(client, memory),
+      };
+      const result = await operation(transaction);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async saveStreamerMemory(memory: StreamerMemory): Promise<void> {
+    await this.saveStreamerMemoryWithClient(this.pool, memory);
+  }
+
+  private async saveStreamerMemoryWithClient(client: Pool | PoolClient, memory: StreamerMemory): Promise<void> {
+    await client.query(
+      `INSERT INTO streamer_memories
+       (id, channel, type, summary, details, entities, tags, importance, confidence, occurred_at,
+        created_at, updated_at, last_seen_at, confirmation_count, source_session_id, source_event_id,
+        status, expires_at, resolved_at, superseded_by, dedupe_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+       ON CONFLICT (id) DO UPDATE SET type=EXCLUDED.type, summary=EXCLUDED.summary, details=EXCLUDED.details,
+       entities=EXCLUDED.entities, tags=EXCLUDED.tags, importance=EXCLUDED.importance, confidence=EXCLUDED.confidence,
+       occurred_at=EXCLUDED.occurred_at, updated_at=EXCLUDED.updated_at, last_seen_at=EXCLUDED.last_seen_at,
+       confirmation_count=EXCLUDED.confirmation_count, source_session_id=EXCLUDED.source_session_id,
+       source_event_id=EXCLUDED.source_event_id, status=EXCLUDED.status, expires_at=EXCLUDED.expires_at,
+       resolved_at=EXCLUDED.resolved_at, superseded_by=EXCLUDED.superseded_by, dedupe_key=EXCLUDED.dedupe_key`,
+      streamerMemoryParams(memory),
+    );
+  }
+
+  async getStreamerMemory(id: string): Promise<StreamerMemory | undefined> {
+    const result = await this.pool.query<StreamerMemoryRow>(`${STREAMER_MEMORY_SELECT} WHERE id=$1`, [id]);
+    return result.rows[0] ? mapStreamerMemory(result.rows[0]) : undefined;
+  }
+
+  async listStreamerMemories(channel: string, limit: number): Promise<StreamerMemory[]> {
+    const result = await this.pool.query<StreamerMemoryRow>(
+      `${STREAMER_MEMORY_SELECT} WHERE channel=$1 ORDER BY updated_at DESC, importance DESC, id ASC LIMIT $2`,
+      [channel.toLowerCase(), limit],
+    );
+    return result.rows.map(mapStreamerMemory);
+  }
+
+  async findActiveStreamerMemoryByDedupeKey(channel: string, dedupeKey: string): Promise<StreamerMemory | undefined> {
+    const result = await this.pool.query<StreamerMemoryRow>(
+      `${STREAMER_MEMORY_SELECT} WHERE channel=$1 AND dedupe_key=$2 AND status='active' LIMIT 1`,
+      [channel.toLowerCase(), dedupeKey],
+    );
+    return result.rows[0] ? mapStreamerMemory(result.rows[0]) : undefined;
+  }
+
+  async expireStreamerMemories(channel: string, now: number): Promise<number> {
+    const result = await this.pool.query(
+      `UPDATE streamer_memories SET status='expired', updated_at=$2
+       WHERE channel=$1 AND status='active' AND expires_at IS NOT NULL AND expires_at <= $2`,
+      [channel.toLowerCase(), new Date(now)],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async deleteStreamerMemory(id: string, channel?: string): Promise<boolean> {
+    const result = channel
+      ? await this.pool.query('DELETE FROM streamer_memories WHERE id=$1 AND channel=$2', [id, channel.toLowerCase()])
+      : await this.pool.query('DELETE FROM streamer_memories WHERE id=$1', [id]);
+    return Boolean(result.rowCount);
+  }
+
   private async upsertPersonaWithClient(client: PoolClient, persona: BotPersona): Promise<void> {
     await client.query(
       `INSERT INTO personas (id, config, updated_at) VALUES ($1, $2, NOW())
@@ -462,4 +627,95 @@ function mapTwitchCredential(row: {
     updatedAt: row.updated_at.getTime(),
     version: Number(row.credential_version),
   };
+}
+
+interface StreamSessionRow {
+  id: string;
+  channel: string;
+  started_at: Date;
+  last_seen_at: Date;
+  ended_at: Date | null;
+  initial_category: string | null;
+  initial_stream_context: string | null;
+  status: StreamSession['status'];
+  summary: string | null;
+}
+
+interface StreamerMemoryRow {
+  id: string;
+  channel: string;
+  type: StreamerMemory['type'];
+  summary: string;
+  details: Record<string, unknown> | null;
+  entities: string[];
+  tags: string[];
+  importance: number;
+  confidence: number;
+  occurred_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
+  last_seen_at: Date;
+  confirmation_count: number;
+  source_session_id: string | null;
+  source_event_id: string | null;
+  status: StreamerMemory['status'];
+  expires_at: Date | null;
+  resolved_at: Date | null;
+  superseded_by: string | null;
+  dedupe_key: string;
+}
+
+const STREAMER_MEMORY_SELECT = `SELECT id, channel, type, summary, details, entities, tags, importance, confidence,
+  occurred_at, created_at, updated_at, last_seen_at, confirmation_count, source_session_id, source_event_id,
+  status, expires_at, resolved_at, superseded_by, dedupe_key FROM streamer_memories`;
+
+function mapStreamSession(row: StreamSessionRow): StreamSession {
+  return {
+    id: row.id,
+    channel: row.channel,
+    startedAt: row.started_at.getTime(),
+    lastSeenAt: row.last_seen_at.getTime(),
+    ...(row.ended_at ? { endedAt: row.ended_at.getTime() } : {}),
+    ...(row.initial_category ? { initialCategory: row.initial_category } : {}),
+    ...(row.initial_stream_context ? { initialStreamContext: row.initial_stream_context } : {}),
+    status: row.status,
+    ...(row.summary ? { summary: row.summary } : {}),
+  };
+}
+
+function mapStreamerMemory(row: StreamerMemoryRow): StreamerMemory {
+  return {
+    id: row.id,
+    channel: row.channel,
+    type: row.type,
+    summary: row.summary,
+    ...(row.details ? { details: row.details } : {}),
+    entities: row.entities,
+    tags: row.tags,
+    importance: Number(row.importance),
+    confidence: Number(row.confidence),
+    ...(row.occurred_at ? { occurredAt: row.occurred_at.getTime() } : {}),
+    createdAt: row.created_at.getTime(),
+    updatedAt: row.updated_at.getTime(),
+    lastSeenAt: row.last_seen_at.getTime(),
+    confirmationCount: Number(row.confirmation_count),
+    ...(row.source_session_id ? { sourceSessionId: row.source_session_id } : {}),
+    ...(row.source_event_id ? { sourceEventId: row.source_event_id } : {}),
+    status: row.status,
+    ...(row.expires_at ? { expiresAt: row.expires_at.getTime() } : {}),
+    ...(row.resolved_at ? { resolvedAt: row.resolved_at.getTime() } : {}),
+    ...(row.superseded_by ? { supersededBy: row.superseded_by } : {}),
+    dedupeKey: row.dedupe_key,
+  };
+}
+
+function streamerMemoryParams(memory: StreamerMemory): unknown[] {
+  return [
+    memory.id, memory.channel, memory.type, memory.summary, memory.details ?? null, memory.entities, memory.tags,
+    memory.importance, memory.confidence, memory.occurredAt ? new Date(memory.occurredAt) : null,
+    new Date(memory.createdAt), new Date(memory.updatedAt), new Date(memory.lastSeenAt), memory.confirmationCount,
+    memory.sourceSessionId ?? null, memory.sourceEventId ?? null, memory.status,
+    memory.expiresAt ? new Date(memory.expiresAt) : null, memory.resolvedAt ? new Date(memory.resolvedAt) : null,
+    memory.supersededBy ?? null, memory.dedupeKey,
+  ];
 }

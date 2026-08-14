@@ -12,8 +12,11 @@ Streamlink → FFmpeg ── PCM 16 kHz ─┐
 Twitch IRC ─ recent chat / @mentions ─────────────┤
 PostgreSQL ─ events / ReactionMemory ─────────────┤
            └ persona canon / memory / threads ────┤
+           └ Global Streamer Memory / sessions ───┤
                                                   ▼
                            ONE Gemini 3.1 Flash Live session
+                                      │
+                     record_stream_memories (optional)
                                       │
                           prepare_reaction_context
                                       │
@@ -35,6 +38,14 @@ Railway backend ← authenticated HTTPS + Socket.IO → Vercel dashboard
 ```
 
 В production нет отдельных вызовов AI для каждого бота, `generateContent`, Flash Lite, Markov-генератора или правила «всегда ответить». Пустой `reactions: []` — нормальное решение промолчать. Backend не принимает творческих решений: он только проверяет аккаунт, соединение, cooldown, дубликаты, длину и лимиты, затем разносит готовые сообщения по естественным задержкам.
+
+## Global Streamer Memory
+
+`GlobalStreamerMemory` — отдельный долгоживущий слой знания канала, не связанный с конкретной persona и не заменяющий `ReactionMemory`. Он хранит лишь важные подтверждённые факты, планы, обещания, людей, поездки, результаты и повторяющиеся шутки. Raw transcript, каждое сообщение чата и обычные игровые моменты туда не попадают.
+
+Для каждого фактического эфира создаётся `StreamSession` при состоянии медиапайплайна `STREAMING`, а при Twitch `OFFLINE` сессия закрывается. Heartbeat и advisory-lock PostgreSQL не дают Railway restart создать duplicate live session; устаревшая незакрытая сессия завершается как `interrupted`. При закрытии backend строит короткое детерминированное summary из связанных записей, без второй модели.
+
+Та же единственная Gemini Live-сессия получает третий tool `record_stream_memories({ memories: [...] })`. Он необязателен и независим от реакции ботов: важный факт может сохраниться при `reactions: []`. Backend валидирует batch, отбрасывает секреты/контакты/точные адреса, объединяет повторные факты по type+summary+entities+tags, повышает confidence и обновляет `lastSeenAt`. Старый факт можно `resolved`, `expired` или `superseded` новым. На старте и reconnect Gemini получает компактный snapshot из 5–15 активных записей; на конкретное событие retrieval добавляет только релевантные записи один раз в корневой payload `globalStreamerMemories`, а не в каждый persona candidate. Нынешнее наблюдение стрима всегда приоритетнее старой памяти.
 
 ## Глубокие постоянные личности
 
@@ -80,6 +91,7 @@ Backend: `http://localhost:3000`, dashboard: `http://localhost:5173`. Без `DA
 - медиа: `STREAM_CONTEXT`, `VISION_FPS`, `VISION_FRAME_WIDTH`;
 - hard policy: задержки, общий rate limit и `MAX_REACTIONS_PER_EVENT`;
 - обучение: окно сбора и количество retrieval-примеров;
+- Global Streamer Memory: лимиты snapshot/retrieval и stale-session heartbeat;
 - необязательный debug/fallback Whisper через Groq;
 - PostgreSQL: `DATABASE_URL`, `DATABASE_SSL`.
 
@@ -117,7 +129,7 @@ Access token не бывает бессрочным. Backend обновляет 
 2. Добавьте `GEMINI_API_KEY` только в Railway.
 3. По умолчанию используется `GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview`; имя модели меняется в одном env без правок бизнес-логики.
 
-Аудио отправляется как mono 16-bit PCM 16 kHz по 40 мс. Видео — JPEG с настраиваемой частотой `0.05–1 FPS`. Live-сессия использует low media resolution, input transcription, low thinking, context-window compression, resumption handle, обработку `goAway` и bounded exponential backoff. Ответная аудиодорожка Gemini не воспроизводится: модель обязана принимать решения через два синхронных tool call.
+Аудио отправляется как mono 16-bit PCM 16 kHz по 40 мс. Видео — JPEG с настраиваемой частотой `0.05–1 FPS`. Live-сессия использует low media resolution, input transcription, low thinking, context-window compression, resumption handle, обработку `goAway` и bounded exponential backoff. Ответная аудиодорожка Gemini не воспроизводится: модель принимает решения через три синхронных tool call (`record_stream_memories`, `prepare_reaction_context`, `emit_reaction_batch`).
 
 ## PostgreSQL и миграции
 
@@ -131,6 +143,8 @@ Access token не бывает бессрочным. Backend обновляет 
 - добавляет `bot_accounts.persona_id → personas.id` с `ON DELETE RESTRICT`.
 
 `migrations/005_deep_persona_generation_v3.sql` добавляет append-only резервные копии канона перед automatic/operator regeneration. `schemaVersion` при этом остаётся 2, а версия deterministic generator хранится внутри канона отдельно.
+
+`migrations/006_global_streamer_memory.sql` добавляет `stream_sessions` и `streamer_memories`: статус, traceability source session/event, tags/entities, expiry, confirmation count и indexes по channel/type/status/importance/date/source. Существующие `stream_events` остаются raw/normalized историей и не заменяются этой памятью.
 
 Старый JSON persona автоматически проходит безопасный runtime upgrade в schema v2. Не назначенные аккаунтам и явно ручные профили не получают придуманную биографию. Назначенные старые autogenerated archetypes распознаются по legacy-маркерам: backend сохраняет полный канон в backup и ставит флаг обязательного ручного сравнения, но сам профиль не переписывает. Оператор сравнивает «Сейчас → Новая личность» и явно применяет индивидуальную или массовую regeneration. После подтверждения v3 любые последующие операторские изменения записываются как `manualOverrides` и накладываются поверх следующих версий генератора.
 
@@ -188,7 +202,7 @@ Root Directory: `frontend/`, Framework: Vite, Output: `dist`. Единствен
 VITE_API_URL=https://your-backend.up.railway.app
 ```
 
-Dashboard показывает состояние backend/Twitch/Gemini, аккаунты и их обновляемый OAuth-статус, события, чат, решения AI и usage. Канал вводится в панели. Для каждой учётной записи можно без рестарта назначить только свободную личность и увидеть имя, preferred name, вычисляемый возраст, город и работу.
+Dashboard показывает состояние backend/Twitch/Gemini, аккаунты и их обновляемый OAuth-статус, события, чат, решения AI и usage. Канал вводится в панели. Раздел «Память стримера» показывает поиск, filters, status, source session, confirmation/expiry, ручное edit/delete/resolve/obsolete и безопасный debug preview того, что может попасть в Gemini context. Для каждой учётной записи можно без рестарта назначить только свободную личность и увидеть имя, preferred name, вычисляемый возраст, город и работу.
 
 Русский редактор личностей содержит разделы «Основное», «Характер», «Семья», «Биография», «Интересы», «Мнения», «Речь», «Twitch», «Память» и «Качество». Отдельно показаны детерминированные эвристики заполненности, уникальности и связности, ближайшая похожая persona и общий cohort audit. Доступны ручное создание, проверенная генерация из ника, дублирование, CRUD, индивидуальный preview/confirmation и массовая проверка/пересоздание только autogenerated profiles. Кнопка OAuth только начинает защищённый переход; Client Secret и полученные токены никогда не проходят через Vercel frontend. Постоянные Twitch/Gemini/FFmpeg соединения на Vercel не создаются.
 
@@ -211,12 +225,14 @@ npm run verify
 - **Dashboard снова просит токен:** cookie истекла/очищена, `DASHBOARD_TOKEN` сменился или браузер блокирует cross-site cookies.
 - **CORS:** `FRONTEND_URL` должен точно совпадать с origin браузера.
 - **Данные пропадают:** убедитесь, что backend использует PostgreSQL, а не in-memory fallback.
+- **Память не записывается:** нужен активный медиапоток и `StreamSession`; Gemini сохранит только важные безопасные факты с достаточной уверенностью.
 
 ## Production checklist
 
 - [ ] Все секреты находятся только в Railway; `.env` не отслеживается Git.
 - [ ] Старые/показанные где-либо credentials отозваны и заменены.
 - [ ] PostgreSQL подключён, migration применена, `/health` показывает `database: true`.
+- [ ] Применена `006_global_streamer_memory.sql`; в разделе «Память стримера» видна статистика для выбранного канала.
 - [ ] У каждого Twitch-аккаунта отдельный `personaId`; в dashboard нет незаполненных shallow-личностей.
 - [ ] `npm run personas:audit` показывает 30 уникальных persona/speech fingerprints и 0 coherence errors.
 - [ ] У каждого Twitch token правильный username и scopes.

@@ -16,6 +16,11 @@ export interface UsageSnapshot {
   generatedResponses: number;
   sentResponses: number;
   skippedResponses: number;
+  memoryToolCalls: number;
+  memoriesCreated: number;
+  memoriesMerged: number;
+  memoriesSuperseded: number;
+  memoryRetrievals: number;
 }
 
 export class UsageTracker {
@@ -36,6 +41,11 @@ export class UsageTracker {
   private generatedResponses = 0;
   private sentResponses = 0;
   private skippedResponses = 0;
+  private memoryToolCalls = 0;
+  private memoriesCreated = 0;
+  private memoriesMerged = 0;
+  private memoriesSuperseded = 0;
+  private memoryRetrievals = 0;
 
   startStream(now = Date.now()): void { this.streamStartedAt ??= now; }
   stopStream(now = Date.now()): void {
@@ -58,6 +68,11 @@ export class UsageTracker {
   recordGenerated(count = 1): void { this.generatedResponses += Math.max(0, count); }
   recordSentResponse(): void { this.sentResponses += 1; }
   recordSkipped(): void { this.skippedResponses += 1; }
+  recordMemoryToolCall(): void { this.memoryToolCalls += 1; }
+  recordMemoryCreated(count = 1): void { this.memoriesCreated += Math.max(0, count); }
+  recordMemoryMerged(count = 1): void { this.memoriesMerged += Math.max(0, count); }
+  recordMemorySuperseded(count = 1): void { this.memoriesSuperseded += Math.max(0, count); }
+  recordMemoryRetrieval(): void { this.memoryRetrievals += 1; }
 
   snapshot(now = Date.now()): UsageSnapshot {
     const activeMs = this.streamStartedAt === undefined ? 0 : Math.max(0, now - this.streamStartedAt);
@@ -79,6 +94,11 @@ export class UsageTracker {
       generatedResponses: this.generatedResponses,
       sentResponses: this.sentResponses,
       skippedResponses: this.skippedResponses,
+      memoryToolCalls: this.memoryToolCalls,
+      memoriesCreated: this.memoriesCreated,
+      memoriesMerged: this.memoriesMerged,
+      memoriesSuperseded: this.memoriesSuperseded,
+      memoryRetrievals: this.memoryRetrievals,
     };
   }
 }

@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { io, Socket } from 'socket.io-client'
 
-type Page = 'overview' | 'bots' | 'brain' | 'chat' | 'settings'
+type Page = 'overview' | 'bots' | 'brain' | 'memories' | 'chat' | 'settings'
 type PersonaTab = 'main' | 'character' | 'family' | 'biography' | 'interests' | 'opinions' | 'speech' | 'twitch' | 'memory' | 'quality'
 type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'DISABLED'
 
@@ -89,6 +89,46 @@ interface Usage {
   generatedResponses: number
   sentResponses: number
   skippedResponses: number
+  memoryToolCalls: number
+  memoriesCreated: number
+  memoriesMerged: number
+  memoriesSuperseded: number
+  memoryRetrievals: number
+}
+type StreamerMemoryType = 'fact' | 'preference' | 'person' | 'relationship' | 'plan' | 'promise' | 'result' | 'place' | 'trip' | 'running_joke' | 'important_event' | 'recurring_context' | 'other'
+type StreamerMemoryStatus = 'active' | 'resolved' | 'superseded' | 'expired'
+interface StreamerMemory {
+  id: string
+  channel: string
+  type: StreamerMemoryType
+  summary: string
+  details?: Record<string, unknown>
+  entities: string[]
+  tags: string[]
+  importance: number
+  confidence: number
+  occurredAt?: number
+  createdAt: number
+  updatedAt: number
+  lastSeenAt: number
+  confirmationCount: number
+  sourceSessionId?: string
+  sourceEventId?: string
+  status: StreamerMemoryStatus
+  expiresAt?: number
+  resolvedAt?: number
+  supersededBy?: string
+}
+interface StreamerMemoryStats {
+  channel: string
+  total: number
+  active: number
+  resolved: number
+  superseded: number
+  expired: number
+  duplicateMerges: number
+  averageImportance: number
+  averageConfidence: number
 }
 interface Persona {
   schemaVersion: 2
@@ -207,6 +247,7 @@ const usage = reactive<Usage>({
   geminiReconnects: 0, geminiInputTokens: 0, geminiOutputTokens: 0, geminiToolCalls: 0,
   preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0,
   guardRejections: 0, eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0,
+  memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0,
 })
 const bots = ref<Bot[]>([])
 const events = ref<StreamEvent[]>([])
@@ -223,6 +264,28 @@ const personaBusy = ref(false)
 const regenerationPreview = ref<PersonaRegenerationPreview | null>(null)
 const bulkRegenerationPreview = ref<BulkRegenerationPreview | null>(null)
 const decisions = ref<ReactionDecision[]>([])
+const streamerMemories = ref<StreamerMemory[]>([])
+const streamerMemoryStats = reactive<StreamerMemoryStats>({
+  channel: '', total: 0, active: 0, resolved: 0, superseded: 0, expired: 0,
+  duplicateMerges: 0, averageImportance: 0, averageConfidence: 0,
+})
+const memoryTypeFilter = ref<'all' | StreamerMemoryType>('all')
+const memoryStatusFilter = ref<'all' | StreamerMemoryStatus>('all')
+const memorySearch = ref('')
+const memoryPreviewQuery = ref('')
+const memoryContextPreview = ref<StreamerMemory[] | null>(null)
+const memoryBusy = ref(false)
+const editingStreamerMemoryId = ref<string | null>(null)
+const streamerMemoryEditDraft = reactive({
+  summary: '',
+  entities: '',
+  tags: '',
+  importance: 0.5,
+  confidence: 0.5,
+  occurredAt: '',
+  expiresAt: '',
+  status: 'active' as Exclude<StreamerMemoryStatus, 'superseded'>,
+})
 const twitchOAuth = reactive<TwitchOAuthStatus>({ configured: false, accounts: [] })
 const settings = reactive({ channel: '', streamContext: '', visionFps: 1 })
 let socket: Socket | undefined
@@ -232,6 +295,7 @@ const pages: Array<{ id: Page; label: string; glyph: string }> = [
   { id: 'overview', label: 'Обзор', glyph: '◫' },
   { id: 'bots', label: 'Боты', glyph: '◎' },
   { id: 'brain', label: 'Мозг стрима', glyph: '◇' },
+  { id: 'memories', label: 'Память стримера', glyph: '◌' },
   { id: 'chat', label: 'Чат', glyph: '≡' },
   { id: 'settings', label: 'Настройки', glyph: '⚙' },
 ]
@@ -254,6 +318,15 @@ const bulkIndividualConfirmationItems = computed(() => bulkChangedItems.value
 const bulkApplicableItems = computed(() => bulkChangedItems.value
   .filter((item) => item.requiresIndividualConfirmation !== true))
 const bulkUnchangedItems = computed(() => (bulkRegenerationPreview.value?.items ?? []).filter((item) => item.changed === false))
+const visibleStreamerMemories = computed(() => {
+  const query = memorySearch.value.trim().toLowerCase()
+  return streamerMemories.value.filter((memory) => {
+    if (memoryTypeFilter.value !== 'all' && memory.type !== memoryTypeFilter.value) return false
+    if (memoryStatusFilter.value !== 'all' && memory.status !== memoryStatusFilter.value) return false
+    if (!query) return true
+    return [memory.summary, ...memory.entities, ...memory.tags].join(' ').toLowerCase().includes(query)
+  })
+})
 
 const timeline = computed(() => [
   ...events.value.map((event) => ({
@@ -320,11 +393,12 @@ async function loadDashboard(): Promise<void> {
   if (!authenticated.value) return
   loading.value = true
   try {
-    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData, personaSummaryData, personaAuditData, decisionData, oauthData] = await Promise.all([
+    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData, personaSummaryData, personaAuditData, decisionData, oauthData, memoryData, memoryStatsData] = await Promise.all([
       api<Overview>('/api/overview'), api<Bot[]>('/api/bots'), api<StreamEvent[]>('/api/events?limit=100'),
       api<ChatMessage[]>('/api/chat'), api<Usage>('/api/usage'), api<Record<string, unknown>>('/api/settings'),
       api<Persona[]>('/api/personas'), api<PersonaSummary[]>('/api/persona-summaries'), api<PersonaAuditReport>('/api/persona-audit'),
       api<ReactionDecision[]>('/api/decisions'), api<TwitchOAuthStatus>('/api/twitch/oauth/status'),
+      api<StreamerMemory[]>('/api/streamer-memories?limit=100'), api<StreamerMemoryStats>('/api/streamer-memories/stats'),
     ])
     Object.assign(overview, overviewData)
     Object.assign(usage, usageData)
@@ -339,6 +413,8 @@ async function loadDashboard(): Promise<void> {
     }
     if (selectedPersona.value) preparePersonaForEditing(selectedPersona.value)
     decisions.value = decisionData
+    streamerMemories.value = memoryData
+    Object.assign(streamerMemoryStats, memoryStatsData)
     Object.assign(twitchOAuth, oauthData)
     settings.channel = String(settingsData.channel || '')
     settings.streamContext = String(settingsData.streamContext || '')
@@ -368,6 +444,11 @@ function connectRealtime(): void {
   socket.on('chat:init', (value: ChatMessage[]) => { chat.value = value })
   socket.on('chat', (value: ChatMessage) => { chat.value = [...chat.value.filter((item) => item.id !== value.id), value].slice(-300) })
   socket.on('decision', (value: ReactionDecision) => { decisions.value = [value, ...decisions.value].slice(0, 100) })
+  socket.on('streamer-memories:init', (value: StreamerMemory[]) => { streamerMemories.value = value })
+  socket.on('streamer-memory', (value: StreamerMemory) => {
+    streamerMemories.value = [value, ...streamerMemories.value.filter((memory) => memory.id !== value.id)]
+  })
+  socket.on('streamer-memory-stats', (value: StreamerMemoryStats) => Object.assign(streamerMemoryStats, value))
 }
 
 async function login(): Promise<void> {
@@ -531,6 +612,108 @@ async function loadPersonaMemories(): Promise<void> {
   if (!selectedPersonaId.value) return
   try { personaMemories.value = await api<PersonaMemoryItem[]>(`/api/personas/${encodeURIComponent(selectedPersonaId.value)}/memories?limit=50`) }
   catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+}
+
+async function refreshStreamerMemories(): Promise<void> {
+  try {
+    const [memories, stats] = await Promise.all([
+      api<StreamerMemory[]>('/api/streamer-memories?limit=100'),
+      api<StreamerMemoryStats>('/api/streamer-memories/stats'),
+    ])
+    streamerMemories.value = memories
+    Object.assign(streamerMemoryStats, stats)
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+}
+
+function startStreamerMemoryEdit(memory: StreamerMemory): void {
+  editingStreamerMemoryId.value = memory.id
+  streamerMemoryEditDraft.summary = memory.summary
+  streamerMemoryEditDraft.entities = memory.entities.join(', ')
+  streamerMemoryEditDraft.tags = memory.tags.join(', ')
+  streamerMemoryEditDraft.importance = memory.importance
+  streamerMemoryEditDraft.confidence = memory.confidence
+  streamerMemoryEditDraft.occurredAt = toLocalDateTimeInput(memory.occurredAt)
+  streamerMemoryEditDraft.expiresAt = toLocalDateTimeInput(memory.expiresAt)
+  streamerMemoryEditDraft.status = memory.status === 'superseded' ? 'active' : memory.status
+}
+
+function cancelStreamerMemoryEdit(): void {
+  editingStreamerMemoryId.value = null
+}
+
+async function saveStreamerMemoryEdit(): Promise<void> {
+  const id = editingStreamerMemoryId.value
+  if (!id || !streamerMemoryEditDraft.summary.trim()) return
+  try {
+    memoryBusy.value = true
+    const saved = await api<StreamerMemory>(`/api/streamer-memories/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        summary: streamerMemoryEditDraft.summary.trim(),
+        entities: splitMemoryValues(streamerMemoryEditDraft.entities),
+        tags: splitMemoryValues(streamerMemoryEditDraft.tags),
+        importance: clampUnitInterval(streamerMemoryEditDraft.importance),
+        confidence: clampUnitInterval(streamerMemoryEditDraft.confidence),
+        occurredAt: parseLocalDateTimeInput(streamerMemoryEditDraft.occurredAt),
+        expiresAt: parseLocalDateTimeInput(streamerMemoryEditDraft.expiresAt),
+        status: streamerMemoryEditDraft.status,
+      }),
+    })
+    upsertStreamerMemory(saved)
+    editingStreamerMemoryId.value = null
+    await refreshStreamerMemoryStats()
+    saveMessage.value = 'Запись памяти обновлена'
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { memoryBusy.value = false }
+}
+
+async function setStreamerMemoryStatus(memory: StreamerMemory, status: Exclude<StreamerMemoryStatus, 'superseded'>): Promise<void> {
+  if (memory.status === status) return
+  try {
+    memoryBusy.value = true
+    const saved = await api<StreamerMemory>(`/api/streamer-memories/${encodeURIComponent(memory.id)}`, {
+      method: 'PATCH', body: JSON.stringify({ status }),
+    })
+    upsertStreamerMemory(saved)
+    await refreshStreamerMemoryStats()
+    saveMessage.value = status === 'resolved' ? 'Запись помечена как завершённая' : status === 'expired'
+      ? 'Запись помечена как устаревшая' : 'Запись снова активна'
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { memoryBusy.value = false }
+}
+
+async function deleteStreamerMemory(memory: StreamerMemory): Promise<void> {
+  if (!window.confirm(`Удалить запись «${memory.summary}»? Это действие нельзя отменить.`)) return
+  try {
+    memoryBusy.value = true
+    await api(`/api/streamer-memories/${encodeURIComponent(memory.id)}`, { method: 'DELETE' })
+    streamerMemories.value = streamerMemories.value.filter((candidate) => candidate.id !== memory.id)
+    if (editingStreamerMemoryId.value === memory.id) editingStreamerMemoryId.value = null
+    await refreshStreamerMemoryStats()
+    saveMessage.value = 'Запись памяти удалена'
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { memoryBusy.value = false }
+}
+
+async function previewStreamerMemoryContext(): Promise<void> {
+  const query = memoryPreviewQuery.value.trim()
+  if (!query) return
+  try {
+    memoryBusy.value = true
+    memoryContextPreview.value = await api<StreamerMemory[]>('/api/streamer-memories/context-preview', {
+      method: 'POST', body: JSON.stringify({ query, limit: 8 }),
+    })
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { memoryBusy.value = false }
+}
+
+async function refreshStreamerMemoryStats(): Promise<void> {
+  const stats = await api<StreamerMemoryStats>('/api/streamer-memories/stats')
+  Object.assign(streamerMemoryStats, stats)
+}
+
+function upsertStreamerMemory(memory: StreamerMemory): void {
+  streamerMemories.value = [memory, ...streamerMemories.value.filter((candidate) => candidate.id !== memory.id)]
 }
 
 async function refreshPersonaSummaries(): Promise<void> {
@@ -752,6 +935,37 @@ function eventTypeLabel(type: string): string {
 function sourceLabel(source: StreamEvent['source']): string {
   return ({ 'gemini-live': 'Gemini Live', chat: 'чат', 'fallback-transcription': 'резервная транскрипция' })[source]
 }
+function streamerMemoryTypeLabel(type: StreamerMemoryType): string {
+  return ({
+    fact: 'факт', preference: 'предпочтение', person: 'человек', relationship: 'отношение',
+    plan: 'план', promise: 'обещание', result: 'результат', place: 'место', trip: 'поездка',
+    running_joke: 'внутренняя шутка', important_event: 'важное событие',
+    recurring_context: 'повторяющийся контекст', other: 'другое',
+  } as Record<StreamerMemoryType, string>)[type]
+}
+function streamerMemoryStatusLabel(status: StreamerMemoryStatus): string {
+  return ({ active: 'актуальна', resolved: 'завершена', superseded: 'заменена', expired: 'устарела' } as Record<StreamerMemoryStatus, string>)[status]
+}
+function splitMemoryValues(value: string): string[] {
+  return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))].slice(0, 16)
+}
+function clampUnitInterval(value: number): number {
+  return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0))
+}
+function toLocalDateTimeInput(timestamp?: number): string {
+  if (!timestamp) return ''
+  const date = new Date(timestamp)
+  const offset = date.getTimezoneOffset() * 60_000
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16)
+}
+function parseLocalDateTimeInput(value: string): number | null {
+  if (!value) return null
+  const parsed = new Date(value).getTime()
+  return Number.isFinite(parsed) ? parsed : null
+}
+function shortMemoryId(id?: string): string {
+  return id ? `${id.slice(0, 8)}…` : '—'
+}
 function memoryTypeLabel(type: string): string {
   return ({ stream_event: 'событие стрима', conversation: 'разговор', viewer: 'зритель', streamer: 'стример', self: 'собственная реплика', relationship: 'отношения' } as Record<string, string>)[type] || type
 }
@@ -955,6 +1169,60 @@ onBeforeUnmount(() => {
           <section class="event-grid">
             <article v-for="event in events" :key="event.id" class="event-card"><div class="event-top"><time>{{ formatTime(event.timestamp) }}</time><span>{{ event.category || overview.category || 'Категория неизвестна' }}</span><b>{{ eventTypeLabel(event.type) }}</b></div><h3>{{ event.summary }}</h3><p v-if="event.speech">«{{ event.speech }}»</p><div class="event-bars"><label>важность <meter min="0" max="1" :value="event.importance"></meter><b>{{ event.importance.toFixed(2) }}</b></label><label>уверенность <meter min="0" max="1" :value="event.confidence"></meter><b>{{ event.confidence.toFixed(2) }}</b></label></div><small>{{ sourceLabel(event.source) }}<template v-if="event.directMentions.length"> · @{{ event.directMentions.join(', @') }}</template></small></article>
             <div v-if="!events.length" class="empty-state panel">Нормализованных событий пока нет.</div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage === 'memories'">
+          <div class="page-heading"><div><p class="eyebrow">ДОЛГОСРОЧНЫЙ КОНТЕКСТ КАНАЛА</p><h1>Память стримера</h1></div><p class="muted">Общая память канала переживает эфиры и доступна Gemini один раз в корневом контексте — она не является памятью отдельных личностей.</p></div>
+
+          <section class="memory-stat-grid" aria-label="Статистика памяти стримера">
+            <article><span>Всего записей</span><strong>{{ streamerMemoryStats.total }}</strong><small>канал: {{ streamerMemoryStats.channel || overview.channel || 'не выбран' }}</small></article>
+            <article><span>Актуальны</span><strong>{{ streamerMemoryStats.active }}</strong><small>доступны для подбора контекста</small></article>
+            <article><span>Подтверждения</span><strong>{{ streamerMemoryStats.duplicateMerges }}</strong><small>повторных наблюдений объединено</small></article>
+            <article><span>Средняя уверенность</span><strong>{{ streamerMemoryStats.averageConfidence.toFixed(2) }}</strong><small>важность {{ streamerMemoryStats.averageImportance.toFixed(2) }}</small></article>
+            <article><span>Завершены</span><strong>{{ streamerMemoryStats.resolved }}</strong><small>факты и планы закрыты</small></article>
+            <article><span>Заменены</span><strong>{{ streamerMemoryStats.superseded }}</strong><small>уступили более свежему факту</small></article>
+            <article><span>Устарели</span><strong>{{ streamerMemoryStats.expired }}</strong><small>вышел срок действия</small></article>
+          </section>
+
+          <section class="panel streamer-memory-controls">
+            <label>Поиск по памяти<input v-model="memorySearch" autocomplete="off" placeholder="Например: поездка, Таиланд, турнир" /></label>
+            <label>Тип<select v-model="memoryTypeFilter"><option value="all">Все типы</option><option value="fact">Факт</option><option value="preference">Предпочтение</option><option value="person">Человек</option><option value="relationship">Отношение</option><option value="plan">План</option><option value="promise">Обещание</option><option value="result">Результат</option><option value="place">Место</option><option value="trip">Поездка</option><option value="running_joke">Внутренняя шутка</option><option value="important_event">Важное событие</option><option value="recurring_context">Повторяющийся контекст</option><option value="other">Другое</option></select></label>
+            <label>Состояние<select v-model="memoryStatusFilter"><option value="all">Все состояния</option><option value="active">Актуальные</option><option value="resolved">Завершённые</option><option value="superseded">Заменённые</option><option value="expired">Устаревшие</option></select></label>
+            <div class="streamer-memory-control-actions"><span>{{ visibleStreamerMemories.length }} из {{ streamerMemories.length }}</span><button class="secondary" type="button" :disabled="memoryBusy" @click="refreshStreamerMemories">Обновить</button></div>
+          </section>
+
+          <section class="streamer-memory-layout">
+            <div class="streamer-memory-list">
+              <article v-for="memory in visibleStreamerMemories" :key="memory.id" :class="['streamer-memory-card', `is-${memory.status}`]">
+                <form v-if="editingStreamerMemoryId === memory.id" class="streamer-memory-edit" @submit.prevent="saveStreamerMemoryEdit">
+                  <div class="panel-heading"><div><p class="eyebrow">РУЧНОЕ РЕДАКТИРОВАНИЕ</p><h3>{{ streamerMemoryTypeLabel(memory.type) }}</h3></div><span :class="['streamer-memory-status', `is-${memory.status}`]">{{ streamerMemoryStatusLabel(memory.status) }}</span></div>
+                  <label>Краткая формулировка<textarea v-model="streamerMemoryEditDraft.summary" rows="3" maxlength="600"></textarea></label>
+                  <div class="two-fields"><label>Сущности через запятую<input v-model="streamerMemoryEditDraft.entities" placeholder="Таиланд, Миша" /></label><label>Теги через запятую<input v-model="streamerMemoryEditDraft.tags" placeholder="план, поездка" /></label></div>
+                  <div class="four-columns"><label>Важность <b>{{ streamerMemoryEditDraft.importance.toFixed(2) }}</b><input v-model.number="streamerMemoryEditDraft.importance" type="range" min="0" max="1" step="0.05" /></label><label>Уверенность <b>{{ streamerMemoryEditDraft.confidence.toFixed(2) }}</b><input v-model.number="streamerMemoryEditDraft.confidence" type="range" min="0" max="1" step="0.05" /></label><label>Когда произошло<input v-model="streamerMemoryEditDraft.occurredAt" type="datetime-local" /></label><label>Срок действия<input v-model="streamerMemoryEditDraft.expiresAt" type="datetime-local" /></label></div>
+                  <label>Состояние<select v-model="streamerMemoryEditDraft.status"><option value="active">Актуальна</option><option value="resolved">Завершена</option><option value="expired">Устарела</option></select></label>
+                  <div class="streamer-memory-actions"><button class="secondary" type="button" :disabled="memoryBusy" @click="cancelStreamerMemoryEdit">Отмена</button><button class="primary" type="submit" :disabled="memoryBusy">{{ memoryBusy ? 'Сохраняем…' : 'Сохранить' }}</button></div>
+                  <small class="muted">Пустой срок действия снимает ограничение. Запись не изменяет канон личностей и не показывает технические секреты.</small>
+                </form>
+
+                <template v-else>
+                  <div class="streamer-memory-card-top"><div><p class="eyebrow">{{ streamerMemoryTypeLabel(memory.type) }}</p><h3>{{ memory.summary }}</h3></div><span :class="['streamer-memory-status', `is-${memory.status}`]">{{ streamerMemoryStatusLabel(memory.status) }}</span></div>
+                  <div class="streamer-memory-chip-row"><span v-for="entity in memory.entities" :key="`entity-${entity}`" class="memory-chip entity">{{ entity }}</span><span v-for="tag in memory.tags" :key="`tag-${tag}`" class="memory-chip">#{{ tag }}</span><span v-if="!memory.entities.length && !memory.tags.length" class="memory-chip muted-chip">без сущностей и тегов</span></div>
+                  <div class="streamer-memory-scores"><label>важность <meter min="0" max="1" :value="memory.importance"></meter><b>{{ memory.importance.toFixed(2) }}</b></label><label>уверенность <meter min="0" max="1" :value="memory.confidence"></meter><b>{{ memory.confidence.toFixed(2) }}</b></label></div>
+                  <dl class="streamer-memory-meta"><div><dt>Создана</dt><dd>{{ formatDate(memory.createdAt) }}</dd></div><div><dt>Произошла</dt><dd>{{ memory.occurredAt ? formatDate(memory.occurredAt) : 'время не указано' }}</dd></div><div><dt>Подтверждена</dt><dd>{{ formatDate(memory.lastSeenAt) }} · ×{{ memory.confirmationCount }}</dd></div><div><dt>Источник эфира</dt><dd>{{ memory.sourceSessionId ? `эфир ${shortMemoryId(memory.sourceSessionId)}` : 'без привязки к эфиру' }}</dd></div><div><dt>Источник события</dt><dd>{{ memory.sourceEventId ? shortMemoryId(memory.sourceEventId) : 'не указан' }}</dd></div><div><dt>Срок действия</dt><dd>{{ memory.expiresAt ? formatDate(memory.expiresAt) : 'без срока' }}</dd></div><div v-if="memory.supersededBy"><dt>Заменена</dt><dd>{{ shortMemoryId(memory.supersededBy) }}</dd></div></dl>
+                  <div class="streamer-memory-actions"><button class="text-button" type="button" :disabled="memoryBusy" @click="startStreamerMemoryEdit(memory)">Изменить</button><button v-if="memory.status === 'active'" class="text-button" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'resolved')">Завершить</button><button v-if="memory.status === 'active'" class="text-button warning" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'expired')">Устарела</button><button v-if="memory.status === 'resolved' || memory.status === 'expired'" class="text-button" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'active')">Вернуть в актуальные</button><button class="danger-button compact" type="button" :disabled="memoryBusy" @click="deleteStreamerMemory(memory)">Удалить</button></div>
+                </template>
+              </article>
+              <div v-if="!visibleStreamerMemories.length" class="empty-state panel">Записей с такими фильтрами пока нет. Во время эфира Gemini сохраняет только важные и безопасные факты, планы, людей и повторяющиеся контексты.</div>
+            </div>
+
+            <aside class="panel streamer-memory-preview">
+              <div class="panel-heading"><div><p class="eyebrow">ОТЛАДКА ПОДБОРА</p><h3>Контекст для Gemini</h3></div></div>
+              <p class="muted">Проверяет только серверный детерминированный поиск. Этот запрос не создаёт память, не запускает новую модель и показывает лишь безопасные поля записей.</p>
+              <form class="streamer-memory-preview-form" @submit.prevent="previewStreamerMemoryContext"><label>Событие или вопрос<input v-model="memoryPreviewQuery" autocomplete="off" placeholder="Стример опять говорит о поездке" /></label><button class="primary" type="submit" :disabled="memoryBusy || !memoryPreviewQuery.trim()">{{ memoryBusy ? 'Ищем…' : 'Проверить контекст' }}</button></form>
+              <div v-if="memoryContextPreview" class="streamer-memory-preview-results"><p class="preview-result-count">Найдено: {{ memoryContextPreview.length }}</p><article v-for="memory in memoryContextPreview" :key="memory.id"><div><span>{{ streamerMemoryTypeLabel(memory.type) }}</span><strong>{{ memory.summary }}</strong></div><small>{{ memory.entities.join(', ') || 'без сущностей' }} · важность {{ memory.importance.toFixed(2) }} · уверенность {{ memory.confidence.toFixed(2) }}</small></article><p v-if="!memoryContextPreview.length" class="empty-state">Релевантных активных записей нет — старый контекст не будет добавлен просто из-за давности или важности.</p></div>
+              <p v-else class="empty-state">Введите текущую тему, чтобы увидеть, какие записи реально могут попасть в общий контекст.</p>
+            </aside>
           </section>
         </template>
 
