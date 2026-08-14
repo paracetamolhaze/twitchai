@@ -94,7 +94,7 @@ export class MediaPipeline {
     return new Promise((resolve) => {
       const streamUrl = `https://www.twitch.tv/${this.channel}`;
       const streamlink = spawn(this.options.streamlinkBinary ?? 'streamlink', [
-        '--quiet',
+        '--loglevel', 'error',
         '--twitch-low-latency',
         streamUrl,
         'best,720p60,720p,worst',
