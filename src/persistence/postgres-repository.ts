@@ -1,6 +1,12 @@
 import { Pool } from 'pg';
 import { ReactionExample } from '../learning/types';
-import { BotMessageRecord, BotPersona } from '../personas/types';
+import {
+  BotMessageRecord,
+  BotPersona,
+  PersonaConversationMessage,
+  PersonaMemoryItem,
+  PersonaRelationship,
+} from '../personas/types';
 import { StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import {
@@ -36,16 +42,135 @@ export class PostgresRepository implements AppRepository {
   }
 
   async listPersonas(): Promise<BotPersona[]> {
-    const result = await this.pool.query<{ config: BotPersona }>('SELECT config FROM personas ORDER BY id');
-    return result.rows.map((row) => row.config);
+    const result = await this.pool.query<{ id: string; config: Record<string, unknown> }>('SELECT id, config FROM personas ORDER BY id');
+    // The relational primary key is authoritative for old JSON rows whose
+    // embedded id was missing or malformed.
+    return result.rows.map((row) => ({ ...row.config, id: row.id }) as unknown as BotPersona);
   }
 
   async upsertPersona(persona: BotPersona): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO personas (id, config, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()`,
+        [persona.id, persona],
+      );
+      await client.query('DELETE FROM persona_relationships WHERE persona_id=$1', [persona.id]);
+      for (const relationship of persona.relationships) {
+        await client.query(
+          `INSERT INTO persona_relationships (persona_id, target_persona_id, familiarity, sentiment, notes, updated_at)
+           VALUES ($1,$2,$3,$4,$5,NOW())`,
+          [persona.id, relationship.targetPersonaId, relationship.familiarity, relationship.sentiment, relationship.notes],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async deletePersona(id: string): Promise<void> {
+    await this.pool.query('DELETE FROM personas WHERE id=$1', [id]);
+  }
+
+  async savePersonaMemory(memory: PersonaMemoryItem): Promise<void> {
+    await this.pool.query('DELETE FROM persona_memories WHERE expires_at IS NOT NULL AND expires_at<=NOW()');
     await this.pool.query(
-      `INSERT INTO personas (id, config, updated_at) VALUES ($1, $2, NOW())
-       ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()`,
-      [persona.id, persona],
+      `INSERT INTO persona_memories
+       (id, persona_id, created_at, type, summary, importance, tags, viewer_username, event_id, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (id) DO UPDATE SET summary=EXCLUDED.summary, importance=EXCLUDED.importance,
+       tags=EXCLUDED.tags, expires_at=EXCLUDED.expires_at`,
+      [memory.id, memory.personaId, new Date(memory.createdAt), memory.type, memory.summary, memory.importance,
+        memory.tags, memory.viewerUsername ?? null, memory.eventId ?? null,
+        memory.expiresAt ? new Date(memory.expiresAt) : null],
     );
+  }
+
+  async listPersonaMemories(personaId: string, limit: number): Promise<PersonaMemoryItem[]> {
+    const result = await this.pool.query<{
+      id: string; persona_id: string; created_at: Date; type: PersonaMemoryItem['type']; summary: string;
+      importance: number; tags: string[]; viewer_username: string | null; event_id: string | null; expires_at: Date | null;
+    }>(
+      `SELECT id, persona_id, created_at, type, summary, importance, tags, viewer_username, event_id, expires_at
+       FROM persona_memories WHERE persona_id=$1 AND (expires_at IS NULL OR expires_at>NOW())
+       ORDER BY created_at DESC, importance DESC, id ASC LIMIT $2`,
+      [personaId, limit],
+    );
+    return result.rows.map((row) => ({
+      id: row.id, personaId: row.persona_id, createdAt: row.created_at.getTime(), type: row.type,
+      summary: row.summary, importance: Number(row.importance), tags: row.tags,
+      ...(row.viewer_username ? { viewerUsername: row.viewer_username } : {}),
+      ...(row.event_id ? { eventId: row.event_id } : {}),
+      ...(row.expires_at ? { expiresAt: row.expires_at.getTime() } : {}),
+    }));
+  }
+
+  async deletePersonaMemory(id: string, personaId: string): Promise<boolean> {
+    const result = await this.pool.query('DELETE FROM persona_memories WHERE id=$1 AND persona_id=$2', [id, personaId]);
+    return Boolean(result.rowCount);
+  }
+
+  async savePersonaConversationMessage(message: PersonaConversationMessage): Promise<void> {
+    await this.pool.query('DELETE FROM persona_conversation_messages WHERE expires_at<=NOW()');
+    await this.pool.query(
+      `INSERT INTO persona_conversation_messages
+       (id, persona_id, viewer_username, role, message, created_at, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [message.id, message.personaId, message.viewerUsername, message.role, message.message,
+        new Date(message.createdAt), new Date(message.expiresAt)],
+    );
+  }
+
+  async listPersonaConversationMessages(personaId: string, viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]> {
+    const result = await this.pool.query<{
+      id: string; persona_id: string; viewer_username: string; role: PersonaConversationMessage['role'];
+      message: string; created_at: Date; expires_at: Date;
+    }>(
+      `SELECT id, persona_id, viewer_username, role, message, created_at, expires_at
+       FROM persona_conversation_messages
+       WHERE persona_id=$1 AND viewer_username=$2 AND created_at>=$3 AND expires_at>NOW()
+       ORDER BY created_at DESC, id ASC LIMIT $4`,
+      [personaId, viewerUsername.toLowerCase(), new Date(since), limit],
+    );
+    return result.rows.reverse().map((row) => ({
+      id: row.id, personaId: row.persona_id, viewerUsername: row.viewer_username, role: row.role,
+      message: row.message, createdAt: row.created_at.getTime(), expiresAt: row.expires_at.getTime(),
+    }));
+  }
+
+  async listRecentPersonaConversationMessages(viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]> {
+    const result = await this.pool.query<{
+      id: string; persona_id: string; viewer_username: string; role: PersonaConversationMessage['role'];
+      message: string; created_at: Date; expires_at: Date;
+    }>(
+      `SELECT id, persona_id, viewer_username, role, message, created_at, expires_at
+       FROM persona_conversation_messages
+       WHERE viewer_username=$1 AND created_at>=$2 AND expires_at>NOW()
+       ORDER BY created_at DESC, id ASC LIMIT $3`,
+      [viewerUsername.toLowerCase(), new Date(since), limit],
+    );
+    return result.rows.map((row) => ({
+      id: row.id, personaId: row.persona_id, viewerUsername: row.viewer_username, role: row.role,
+      message: row.message, createdAt: row.created_at.getTime(), expiresAt: row.expires_at.getTime(),
+    }));
+  }
+
+  async listPersonaRelationships(personaId: string): Promise<PersonaRelationship[]> {
+    const result = await this.pool.query<{
+      target_persona_id: string; familiarity: number; sentiment: number; notes: string[];
+    }>('SELECT target_persona_id, familiarity, sentiment, notes FROM persona_relationships WHERE persona_id=$1 ORDER BY target_persona_id', [personaId]);
+    return result.rows.map((row) => ({
+      targetPersonaId: row.target_persona_id,
+      familiarity: Number(row.familiarity),
+      sentiment: Number(row.sentiment),
+      notes: row.notes,
+    }));
   }
 
   async listBots(): Promise<BotAccountRecord[]> {

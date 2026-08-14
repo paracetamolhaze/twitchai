@@ -5,7 +5,9 @@ import helmet from 'helmet';
 import { Server as SocketServer } from 'socket.io';
 import { z } from 'zod';
 import { Logger } from '../logger';
-import { BotPersona } from '../personas/types';
+import { PersonaReactionContext } from '../personas/persona-context-builder';
+import { personaSchema } from '../personas/schema';
+import { BotPersona, PersonaMemoryItem, PersonaSummary } from '../personas/types';
 import { BotAccountRecord } from '../persistence/repository';
 import { ReactionDecisionRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
@@ -43,6 +45,7 @@ export interface ApiServerDependencies {
   overview: () => OverviewPayload;
   bots: () => BotAccountRecord[];
   setBotEnabled: (username: string, enabled: boolean) => Promise<boolean>;
+  assignBotPersona: (username: string, personaId: string) => Promise<'updated' | 'bot_not_found' | 'persona_not_found' | 'persona_in_use'>;
   events: (limit: number) => Promise<StreamEvent[]>;
   chat: () => ChatMessage[];
   usage: () => UsageSnapshot;
@@ -50,7 +53,17 @@ export interface ApiServerDependencies {
   settings: () => Promise<Record<string, unknown>>;
   updateSettings: (settings: Record<string, unknown>) => Promise<{ restartRequired: string[] }>;
   personas: () => BotPersona[];
-  updatePersona: (persona: BotPersona) => Promise<void>;
+  personaSummaries: () => PersonaSummary[];
+  persona: (id: string) => BotPersona | undefined;
+  createPersona: (persona: BotPersona) => Promise<BotPersona>;
+  createBlankPersona: (id: string, name: string) => Promise<BotPersona>;
+  createPersonaTemplate: (username: string, id?: string) => Promise<BotPersona>;
+  duplicatePersona: (sourceId: string, id: string, name: string) => Promise<BotPersona>;
+  updatePersona: (persona: BotPersona) => Promise<BotPersona>;
+  deletePersona: (id: string) => Promise<boolean>;
+  personaMemories: (personaId: string, limit: number) => Promise<PersonaMemoryItem[]>;
+  deletePersonaMemory: (personaId: string, memoryId: string) => Promise<boolean>;
+  previewPersonaContext: (personaId: string, query: string, username?: string) => Promise<PersonaReactionContext>;
   twitchOAuth?: {
     status: () => Promise<TwitchOAuthStatus>;
     startAuthorization: () => Promise<string>;
@@ -80,24 +93,6 @@ const settingsSchema = z.object({
   visionFps: z.number().min(0.05).max(1).optional(),
 }).strict();
 
-const personaSchema: z.ZodType<BotPersona> = z.object({
-  id: z.string().trim().min(1).max(80),
-  name: z.string().trim().min(1).max(100),
-  description: z.string().trim().min(1).max(1_000),
-  styleInstructions: z.string().trim().min(1).max(2_000),
-  verbosity: z.object({ minWords: z.number().int().min(1).max(50), maxWords: z.number().int().min(1).max(100) }),
-  reactionProbability: z.number().min(0).max(1),
-  uppercaseProbability: z.number().min(0).max(1),
-  questionProbability: z.number().min(0).max(1),
-  emojiProbability: z.number().min(0).max(1),
-  slangLevel: z.number().min(0).max(1),
-  sarcasmLevel: z.number().min(0).max(1),
-  toxicityLimit: z.number().min(0).max(1),
-  interests: z.array(z.string().trim().min(1).max(80)).max(30),
-  temperature: z.number().min(0).max(2),
-  minimumIntervalMs: z.number().int().min(1_000).max(3_600_000),
-});
-
 export function createApiServer(dependencies: ApiServerDependencies): ApiServer {
   const logger = dependencies.logger.child('API');
   const app = express();
@@ -109,7 +104,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
       if (originAllowed(origin)) callback(null, true);
       else callback(new Error('Origin is not allowed'));
     },
-    methods: ['GET', 'POST', 'PATCH', 'PUT', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
     credentials: true,
     allowedHeaders: ['Authorization', 'Content-Type', 'X-Dashboard-Token'],
   };
@@ -126,7 +121,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
   app.disable('x-powered-by');
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors(corsOptions));
-  app.use(express.json({ limit: '64kb' }));
+  app.use(express.json({ limit: '512kb' }));
   app.get('/', (_request, response) => response.json({ name: 'Twitch AI Viewers backend', version: 2 }));
   app.get('/health', (_request, response) => {
     const health = dependencies.health();
@@ -235,9 +230,19 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
   app.get('/api/bots', (_request, response) => response.json(dependencies.bots()));
   app.patch('/api/bots/:username', async (request, response, next) => {
     try {
-      const body = z.object({ enabled: z.boolean() }).parse(request.body);
-      const updated = await dependencies.setBotEnabled(request.params.username, body.enabled);
-      if (!updated) return response.status(404).json({ error: 'Бот не найден' });
+      const body = z.object({ enabled: z.boolean().optional(), personaId: z.string().trim().min(1).max(80).optional() })
+        .strict().refine((value) => value.enabled !== undefined || value.personaId !== undefined, 'Нужно передать enabled или personaId')
+        .parse(request.body);
+      if (body.personaId !== undefined) {
+        const assignment = await dependencies.assignBotPersona(request.params.username, body.personaId);
+        if (assignment === 'bot_not_found') return response.status(404).json({ error: 'Бот не найден' });
+        if (assignment === 'persona_not_found') return response.status(400).json({ error: 'Личность не найдена' });
+        if (assignment === 'persona_in_use') return response.status(409).json({ error: 'Эта личность уже назначена другому Twitch-аккаунту' });
+      }
+      if (body.enabled !== undefined) {
+        const updated = await dependencies.setBotEnabled(request.params.username, body.enabled);
+        if (!updated) return response.status(404).json({ error: 'Бот не найден' });
+      }
       return response.json({ ok: true });
     } catch (error) { return next(error); }
   });
@@ -260,14 +265,72 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     } catch (error) { next(error); }
   });
   app.get('/api/personas', (_request, response) => response.json(dependencies.personas()));
+  app.get('/api/persona-summaries', (_request, response) => response.json(dependencies.personaSummaries()));
+  app.get('/api/personas/:id', (request, response) => {
+    const persona = dependencies.persona(request.params.id);
+    return persona ? response.json(persona) : response.status(404).json({ error: 'Личность не найдена' });
+  });
+  app.post('/api/personas', async (request, response, next) => {
+    try {
+      const manual = z.object({ mode: z.literal('manual'), id: z.string().trim().min(1).max(80), name: z.string().trim().min(1).max(120) }).strict().safeParse(request.body);
+      if (manual.success) return response.status(201).json(await dependencies.createBlankPersona(manual.data.id, manual.data.name));
+      const template = z.object({ mode: z.literal('template'), username: z.string().trim().min(1).max(50), id: z.string().trim().min(1).max(80).optional() }).strict().safeParse(request.body);
+      if (template.success) return response.status(201).json(await dependencies.createPersonaTemplate(template.data.username, template.data.id));
+      const duplicate = z.object({ mode: z.literal('duplicate'), sourceId: z.string().trim().min(1).max(80), id: z.string().trim().min(1).max(80), name: z.string().trim().min(1).max(120) }).strict().safeParse(request.body);
+      if (duplicate.success) return response.status(201).json(await dependencies.duplicatePersona(duplicate.data.sourceId, duplicate.data.id, duplicate.data.name));
+      const persona = personaSchema.parse(request.body);
+      return response.status(201).json(await dependencies.createPersona(persona));
+    } catch (error) {
+      if (error instanceof Error && error.message === 'persona_already_exists') return response.status(409).json({ error: 'Личность с таким ID уже существует' });
+      if (error instanceof Error && error.message.includes('not found')) return response.status(404).json({ error: 'Исходная личность не найдена' });
+      if (error instanceof Error && error.message.startsWith('persona_relationship_')) return response.status(400).json({ error: 'Некорректная связь между личностями' });
+      return next(error);
+    }
+  });
   app.put('/api/personas/:id', async (request, response, next) => {
     try {
       const persona = personaSchema.parse({ ...request.body, id: request.params.id });
-      if (persona.verbosity.minWords > persona.verbosity.maxWords) {
+      if (persona.behavior.verbosity.minWords > persona.behavior.verbosity.maxWords) {
         return response.status(400).json({ error: 'Минимальное число слов не может быть больше максимального' });
       }
-      await dependencies.updatePersona(persona);
-      return response.json({ ok: true });
+      return response.json(await dependencies.updatePersona(persona));
+    } catch (error) {
+      if (error instanceof Error && error.message === 'persona_not_found') return response.status(404).json({ error: 'Личность не найдена' });
+      if (error instanceof Error && error.message.startsWith('persona_relationship_')) return response.status(400).json({ error: 'Некорректная связь между личностями' });
+      return next(error);
+    }
+  });
+  app.delete('/api/personas/:id', async (request, response, next) => {
+    try {
+      if (dependencies.bots().some((bot) => bot.personaId === request.params.id)) {
+        return response.status(409).json({ error: 'Нельзя удалить личность, пока она назначена Twitch-аккаунту' });
+      }
+      const deleted = await dependencies.deletePersona(request.params.id);
+      return deleted ? response.status(204).send() : response.status(404).json({ error: 'Личность не найдена' });
+    } catch (error) {
+      if (error instanceof Error && error.message === 'persona_in_use') return response.status(409).json({ error: 'Нельзя удалить личность, пока она назначена Twitch-аккаунту' });
+      if (error instanceof Error && error.message === 'persona_builtin') return response.status(409).json({ error: 'Встроенную демонстрационную личность нельзя удалить' });
+      return next(error);
+    }
+  });
+  app.get('/api/personas/:id/memories', async (request, response, next) => {
+    try {
+      if (!dependencies.persona(request.params.id)) return response.status(404).json({ error: 'Личность не найдена' });
+      const limit = z.coerce.number().int().min(1).max(200).default(50).parse(request.query.limit);
+      return response.json(await dependencies.personaMemories(request.params.id, limit));
+    } catch (error) { return next(error); }
+  });
+  app.delete('/api/personas/:id/memories/:memoryId', async (request, response, next) => {
+    try {
+      const deleted = await dependencies.deletePersonaMemory(request.params.id, request.params.memoryId);
+      return deleted ? response.status(204).send() : response.status(404).json({ error: 'Воспоминание не найдено' });
+    } catch (error) { return next(error); }
+  });
+  app.post('/api/personas/:id/context-preview', async (request, response, next) => {
+    try {
+      const body = z.object({ query: z.string().trim().min(1).max(1_000), username: z.string().trim().min(1).max(50).optional() }).strict().parse(request.body);
+      if (!dependencies.persona(request.params.id)) return response.status(404).json({ error: 'Личность не найдена' });
+      return response.json(await dependencies.previewPersonaContext(request.params.id, body.query, body.username));
     } catch (error) { return next(error); }
   });
 

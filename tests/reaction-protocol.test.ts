@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ReactionMemory } from '../src/learning/reaction-memory';
 import { Logger } from '../src/logger';
 import { BotHistory } from '../src/personas/bot-history';
+import { PersonaContextBuilder } from '../src/personas/persona-context-builder';
+import { PersonaMemory } from '../src/personas/persona-memory';
+import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { DEFAULT_PERSONAS } from '../src/personas/defaults';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
@@ -14,13 +17,16 @@ import { UsageTracker } from '../src/usage/usage-tracker';
 const event: StreamEvent = {
   id: 'event-1', timestamp: 1_700_000_000_000, type: 'fail',
   summary: 'стример промахнулся решающим ультимейтом', importance: 0.92,
-  confidence: 0.96, source: 'gemini-live', directMentions: ['bot-two'],
+  confidence: 0.96, source: 'gemini-live', directMentions: [],
 };
 
 function bot(username: string, index: number): ReactionBotCandidate {
   return {
     username,
-    persona: { ...DEFAULT_PERSONAS[index]!, minimumIntervalMs: 30_000 },
+    persona: {
+      ...DEFAULT_PERSONAS[index]!,
+      behavior: { ...DEFAULT_PERSONAS[index]!.behavior, minimumIntervalMs: 30_000 },
+    },
     enabled: true,
     connectionState: 'CONNECTED',
     chatConnected: true,
@@ -31,6 +37,8 @@ async function setup() {
   const repository = new MemoryRepository();
   await repository.initialize();
   const history = new BotHistory(repository);
+  const personaMemory = new PersonaMemory(repository, { now: () => event.timestamp });
+  const personaRuntime = new PersonaRuntimeStore(() => event.timestamp);
   const contextStore = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 100, maxEvents: 100, now: () => event.timestamp });
   contextStore.configure({ channel: 'streamer', category: 'Dota 2', streamContext: 'рейтинг с друзьями' });
   contextStore.addChat({
@@ -53,6 +61,9 @@ async function setup() {
     sender: { send: async (username, message) => { sent.push({ username, message }); return true; } },
     history,
     memory: new ReactionMemory({ enabled: true, reactionWindowMs: 1_000, repository }),
+    personaContext: new PersonaContextBuilder(personaMemory, personaRuntime),
+    personaMemory,
+    personaRuntime,
     contextStore,
     usage,
     logger: new Logger('TEST', 'error'),
@@ -67,16 +78,27 @@ async function setup() {
 afterEach(() => vi.useRealTimers());
 
 describe('single-session reaction protocol', () => {
-  it('returns every eligible persona, history, recent chat and direct-mention priority', async () => {
+  it('limits a direct question to exactly the addressed persona', async () => {
     const { coordinator } = await setup();
-    const prepared = await coordinator.prepare(event);
+    const directEvent: StreamEvent = {
+      ...event,
+      id: 'direct-event',
+      type: 'conversation',
+      source: 'chat',
+      directMentions: ['bot-two'],
+      viewerUsername: 'viewer',
+    };
+    const prepared = await coordinator.prepare(directEvent);
 
-    expect(prepared.eventId).toBe(event.id);
+    expect(prepared.eventId).toBe(directEvent.id);
     expect(prepared.recentChat[0]).toMatchObject({ username: 'viewer' });
-    expect(prepared.candidates.map((candidate) => candidate.username)).toEqual(['bot-one', 'bot-two', 'bot-three']);
-    expect(prepared.candidates.find((candidate) => candidate.username === 'bot-two')?.directMention).toBe(true);
-    expect(prepared.candidates.find((candidate) => candidate.username === 'bot-one')?.persona.name)
-      .not.toBe(prepared.candidates.find((candidate) => candidate.username === 'bot-two')?.persona.name);
+    expect(prepared.candidates.map((candidate) => candidate.username)).toEqual(['bot-two']);
+    expect(prepared.candidates[0]?.directMention).toBe(true);
+    const rejected = await coordinator.submitBatch({
+      eventId: directEvent.id,
+      reactions: [{ username: 'bot-three', message: 'пытаюсь ответить не своей личностью' }],
+    });
+    expect(rejected.rejected[0]).toMatchObject({ username: 'bot-three', reason: 'unknown_candidate' });
     await coordinator.stop();
   });
 
@@ -176,6 +198,21 @@ describe('single-session reaction protocol', () => {
     await coordinator.submitBatch({ eventId: event.id, reactions: [] });
     const replay = await coordinator.submitBatch({ eventId: event.id, reactions: [] });
     expect(replay).toMatchObject({ eventId: event.id, accepted: [], stale: true });
+    await coordinator.stop();
+  });
+
+  it('cancels a queued message when the account persona changes before send', async () => {
+    vi.useFakeTimers();
+    const { coordinator, sent, setCandidates } = await setup();
+    await coordinator.prepare(event);
+    const accepted = await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [{ username: 'bot-one', message: 'сообщение от старой личности' }],
+    });
+    expect(accepted.accepted).toHaveLength(1);
+    setCandidates([bot('bot-one', 3), bot('bot-two', 1), bot('bot-three', 2)]);
+    await vi.runAllTimersAsync();
+    expect(sent).toEqual([]);
     await coordinator.stop();
   });
 });

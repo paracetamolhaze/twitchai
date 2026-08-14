@@ -10,14 +10,16 @@ Twitch stream
 Streamlink → FFmpeg ── PCM 16 kHz ─┐
                     └─ JPEG ≤1 FPS ├──────────────┐
 Twitch IRC ─ recent chat / @mentions ─────────────┤
-PostgreSQL ─ events / history / ReactionMemory ───┤
+PostgreSQL ─ events / ReactionMemory ─────────────┤
+           └ persona canon / memory / threads ────┤
                                                   ▼
                            ONE Gemini 3.1 Flash Live session
                                       │
                           prepare_reaction_context
                                       │
-                 all eligible personas + each history + chat
-                         + retrieved examples + constraints
+          namespaced candidate contexts: stable canon + speech
+          + ≤6 relevant facts + ≤6 memories + own history/thread
+                  + recent chat + examples + constraints
                                       │
                             emit_reaction_batch (0..N)
                                       │
@@ -33,6 +35,24 @@ Railway backend ← authenticated HTTPS + Socket.IO → Vercel dashboard
 ```
 
 В production нет отдельных вызовов AI для каждого бота, `generateContent`, Flash Lite, Markov-генератора или правила «всегда ответить». Пустой `reactions: []` — нормальное решение промолчать. Backend не принимает творческих решений: он только проверяет аккаунт, соединение, cooldown, дубликаты, длину и лимиты, затем разносит готовые сообщения по естественным задержкам.
+
+## Глубокие постоянные личности
+
+Каждый Twitch-аккаунт связан ровно с одной отдельной вымышленной личностью. Старые четыре archetype больше не циклируются между аккаунтами. При первом запуске повторяющиеся назначения безопасно разделяются: для аккаунта создаётся и сохраняется собственный deterministic template без дополнительного LLM-вызова. PostgreSQL также защищает связь уникальным индексом.
+
+Canon хранится в `personas.config` как типизированная schema v2:
+
+- identity: имя, единственная стабильная `birthDate`, вычисляемый возраст, места, языки, работа и образование;
+- biography: родственники, timeline и структурированные personal facts;
+- persistent opinions и явные границы `expertise / familiar / weak / unknown`;
+- character, человеческие несовершенства, activity pattern и подробный speech fingerprint;
+- отдельное отношение к стримеру и необязательные отношения между персонажами.
+
+Canon меняется только оператором через защищённый dashboard API. Gemini и Twitch chat не имеют операции его записи. `PersonaMemory` хранится отдельно: слабые записи отбрасываются, средние получают TTL текущей сессии, а долгосрочно сохраняются только важные события и личные продолжения разговора. Короткий `viewer ↔ persona` thread живёт 10 минут и не смешивается с другими людьми или аккаунтами.
+
+`PersonaContextBuilder` не отправляет полную биографию на каждое событие. Он детерминированно ранжирует tags/keywords/category, выбирает не более шести релевантных canon-фактов и шести воспоминаний, всегда namespaced-ит payload по `username + personaId` и явно отмечает приоритет `canon > memory > chat`. Никакой второй модели для retrieval нет.
+
+В проекте есть десять полностью вымышленных демонстрационных людей с разными семьями, хронологиями, знаниями, мнениями и речью. Они предназначены как рабочие примеры, а не как реальные персональные данные.
 
 ## Локальная разработка
 
@@ -103,6 +123,15 @@ Access token не бывает бессрочным. Backend обновляет 
 
 `migrations/001_initial.sql` создаёт таблицы персон, метаданных ботов, ReactionMemory, истории сообщений, событий стрима, runtime settings и usage snapshots. `migrations/002_twitch_oauth.sql` добавляет зашифрованное хранилище обновляемых учётных данных Twitch; открытые токены в таблицу не записываются. `migrations/003_twitch_oauth_credential_version.sql` добавляет версию записи, чтобы устаревший экземпляр Railway не мог затереть результат успешного обновления токена.
 
+Новая `migrations/004_deep_personas.sql`:
+
+- создаёт `persona_memories`, `persona_conversation_messages` и `persona_relationships` с индексами по persona/time/importance/tags;
+- чинит старые dangling persona references;
+- разделяет повторные назначения старых archetype и вводит one-to-one индекс;
+- добавляет `bot_accounts.persona_id → personas.id` с `ON DELETE RESTRICT`.
+
+Старый JSON persona автоматически проходит runtime upgrade в schema v2 и сохраняется обратно. Сохранённые имя, описание, стиль и поведенческие параметры не заменяются. У исходной legacy-persona отсутствующие биографические поля остаются пустыми/unknown. Только дополнительные аккаунты, которые раньше делили с ней один archetype, получают собственный детерминированный шаблон; их старые настройки накладываются поверх него, поэтому миграция не выдаёт всем одну и ту же семью, профессию или место рождения.
+
 ```powershell
 $env:DATABASE_URL='postgresql://...'
 npm run db:migrate
@@ -157,7 +186,9 @@ Root Directory: `frontend/`, Framework: Vite, Output: `dist`. Единствен
 VITE_API_URL=https://your-backend.up.railway.app
 ```
 
-Dashboard показывает состояние backend/Twitch/Gemini, аккаунты и их refreshable OAuth-статус, события, чат, решения AI, usage, настройки канала и персон. Кнопка OAuth только начинает защищённый переход; Client Secret и полученные токены никогда не проходят через Vercel frontend. Постоянные Twitch/Gemini/FFmpeg соединения на Vercel не создаются.
+Dashboard показывает состояние backend/Twitch/Gemini, аккаунты и их обновляемый OAuth-статус, события, чат, решения AI и usage. Канал вводится в панели. Для каждой учётной записи можно без рестарта назначить только свободную личность и увидеть имя, вычисляемый возраст, город и работу.
+
+Русский редактор личностей содержит разделы «Основное», «Характер», «Семья», «Биография», «Интересы», «Мнения», «Речь», «Twitch» и «Память». Доступны ручное создание, уникальный backend-template, дублирование как основы, CRUD, индикатор заполненности, просмотр памяти и безопасный preview «что получила бы Gemini». Кнопка OAuth только начинает защищённый переход; Client Secret и полученные токены никогда не проходят через Vercel frontend. Постоянные Twitch/Gemini/FFmpeg соединения на Vercel не создаются.
 
 ## Проверка
 
@@ -184,6 +215,7 @@ npm run verify
 - [ ] Все секреты находятся только в Railway; `.env` не отслеживается Git.
 - [ ] Старые/показанные где-либо credentials отозваны и заменены.
 - [ ] PostgreSQL подключён, migration применена, `/health` показывает `database: true`.
+- [ ] У каждого Twitch-аккаунта отдельный `personaId`; в dashboard нет незаполненных shallow-личностей.
 - [ ] У каждого Twitch token правильный username и scopes.
 - [ ] OAuth callback совпадает в Twitch Console/Railway, а `TWITCH_TOKEN_ENCRYPTION_KEY` сохранён как стабильный secret.
 - [ ] `GEMINI_LIVE_MODEL` доступна, reconnect/usage отслеживаются.

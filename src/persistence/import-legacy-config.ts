@@ -3,8 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
-import { DEFAULT_PERSONAS } from '../personas/defaults';
 import { BotMessageRecord, BotPersona } from '../personas/types';
+import { upgradePersona } from '../personas/schema';
 import { normalizeChannel } from '../config';
 import { PostgresRepository } from './postgres-repository';
 
@@ -87,9 +87,11 @@ async function main(): Promise<void> {
     const botsAfterPersonaImport = new Map((await repository.listBots()).map((bot) => [bot.username, bot]));
     for (const [username, stats] of importedStats) {
       const previous = botsAfterPersonaImport.get(username);
+      const persona = previous ? undefined : legacyPersona(username);
+      if (persona) await repository.upsertPersona(persona);
       await repository.upsertBot({
         username,
-        personaId: previous?.personaId ?? DEFAULT_PERSONAS[0]!.id,
+        personaId: previous?.personaId ?? persona!.id,
         enabled: previous?.enabled ?? true,
         connectionState: 'DISCONNECTED',
         chatConnected: false,
@@ -108,16 +110,16 @@ async function main(): Promise<void> {
 }
 
 function legacyPersona(username: string, role?: string, instructions?: string): BotPersona {
-  const base = DEFAULT_PERSONAS[0]!;
-  return {
-    ...base,
+  return upgradePersona({
     id: `legacy-${username.replace(/[^a-z0-9_-]/g, '-').slice(0, 60)}`,
     name: `Импортированная персона: ${username}`,
     description: role ? `Персона из старой версии (${role}).` : 'Персона из старой версии.',
-    styleInstructions: instructions?.trim() || base.styleInstructions,
-    interests: [...base.interests],
-    verbosity: { ...base.verbosity },
-  };
+    styleInstructions: instructions?.trim() || 'Сохраняй старый стиль, но не выдумывай личные факты без заполненного canon.',
+    interests: [],
+    verbosity: { minWords: 2, maxWords: 14 },
+    reactionProbability: 0.4,
+    minimumIntervalMs: 60_000,
+  });
 }
 
 void main().catch((error: unknown) => {

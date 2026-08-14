@@ -53,7 +53,7 @@ export class ReactionPolicyGuard {
     const now = this.now();
     this.prune(now);
     const cooldownRemainingMs = candidate.lastReactionAt
-      ? Math.max(0, candidate.persona.minimumIntervalMs - (now - candidate.lastReactionAt))
+      ? Math.max(0, candidate.persona.behavior.minimumIntervalMs - (now - candidate.lastReactionAt))
       : 0;
     const busy = [...this.reservations.values()].some((reservation) => reservation.username === candidate.username.toLowerCase());
     return { cooldownRemainingMs, busy };
@@ -86,7 +86,7 @@ export class ReactionPolicyGuard {
       if (!message) { reject('empty_message'); continue; }
       if (isControlValue(message)) { reject('control_value'); continue; }
       if (Buffer.byteLength(message, 'utf8') > this.maxMessageBytes()) { reject('message_too_long'); continue; }
-      if (candidate.lastReactionAt && now - candidate.lastReactionAt < candidate.persona.minimumIntervalMs) {
+      if (candidate.lastReactionAt && now - candidate.lastReactionAt < candidate.persona.behavior.minimumIntervalMs) {
         reject('account_cooldown'); continue;
       }
       if ([...this.reservations.values()].some((reservation) => reservation.username === username)) {

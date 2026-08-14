@@ -7,9 +7,15 @@ describe('personas and per-bot history', () => {
   it('ships personas with materially different behavior', () => {
     const analyst = DEFAULT_PERSONAS.find((persona) => persona.id === 'analyst')!;
     const joker = DEFAULT_PERSONAS.find((persona) => persona.id === 'dry-joker')!;
-    expect(analyst.sarcasmLevel).toBeLessThan(joker.sarcasmLevel);
-    expect(analyst.verbosity.maxWords).not.toBe(joker.verbosity.maxWords);
-    expect(analyst.styleInstructions).not.toBe(joker.styleInstructions);
+    expect(analyst.behavior.sarcasmLevel).toBeLessThan(joker.behavior.sarcasmLevel);
+    expect(analyst.behavior.verbosity.maxWords).not.toBe(joker.behavior.verbosity.maxWords);
+    expect(analyst.behavior.styleInstructions).not.toBe(joker.behavior.styleInstructions);
+    expect(analyst.identity.firstName).not.toBe(joker.identity.firstName);
+    expect(analyst.family[0]?.name).not.toBe(joker.family[0]?.name);
+    expect(DEFAULT_PERSONAS).toHaveLength(10);
+    expect(new Set(DEFAULT_PERSONAS.map((persona) => persona.identity.firstName)).size).toBe(10);
+    expect(new Set(DEFAULT_PERSONAS.map((persona) => persona.speech.messageExamples.join('|'))).size).toBe(10);
+    expect(DEFAULT_PERSONAS.every((persona) => persona.fictionalPersona && persona.family.length > 0 && persona.timeline.length >= 3)).toBe(true);
   });
 
   it('keeps histories separate and rejects recent near-duplicates', async () => {

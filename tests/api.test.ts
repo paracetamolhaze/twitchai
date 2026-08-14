@@ -26,6 +26,7 @@ function server(twitchOAuth?: {
       streamBrain: { state: 'CONNECTED', mediaConnected: true, geminiConnected: true }, activeBots: 1, totalBots: 1, uptimeSeconds: 5 }),
     bots: () => [{ username: 'bot', personaId: 'analyst', enabled: true, connectionState: 'CONNECTED', chatConnected: true, messagesSent: 2 }],
     setBotEnabled: async () => true,
+    assignBotPersona: async () => 'updated',
     events: async () => [event],
     chat: () => [],
     usage: () => ({ startedAt: 0, uptimeSeconds: 1, streamMinutes: 0, audioMinutes: 0, videoMinutes: 0,
@@ -33,7 +34,26 @@ function server(twitchOAuth?: {
       preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0, guardRejections: 0,
       eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0 }),
     settings: async () => ({}), updateSettings: async () => ({ restartRequired: [] }),
-    personas: () => DEFAULT_PERSONAS, updatePersona: async () => undefined,
+    personas: () => DEFAULT_PERSONAS,
+    personaSummaries: () => DEFAULT_PERSONAS.map((persona) => ({
+      id: persona.id,
+      name: persona.name,
+      firstName: persona.identity.firstName,
+      age: 25,
+      city: persona.identity.currentLocation?.city,
+      occupation: persona.identity.occupation,
+      completeness: 100,
+    })),
+    persona: (id) => DEFAULT_PERSONAS.find((persona) => persona.id === id),
+    createPersona: async (persona) => persona,
+    createBlankPersona: async () => DEFAULT_PERSONAS[0]!,
+    createPersonaTemplate: async () => DEFAULT_PERSONAS[0]!,
+    duplicatePersona: async () => DEFAULT_PERSONAS[0]!,
+    updatePersona: async (persona) => persona,
+    deletePersona: async () => true,
+    personaMemories: async () => [],
+    deletePersonaMemory: async () => false,
+    previewPersonaContext: async () => { throw new Error('not used'); },
     twitchOAuth,
   });
   servers.push(api);
@@ -71,6 +91,35 @@ describe('dashboard API', () => {
     const events = await request(api.app).get('/api/events').set('Authorization', `Bearer ${token}`).expect(200);
     expect(bots.body[0]).toMatchObject({ username: 'bot', connectionState: 'CONNECTED', chatConnected: true });
     expect(events.body[0]).toMatchObject({ id: event.id, summary: event.summary });
+  });
+
+  it('exposes deep persona CRUD and blocks deletion while assigned', async () => {
+    const api = server();
+    const persona = await request(api.app).get('/api/personas/analyst').set('Authorization', `Bearer ${token}`).expect(200);
+    expect(persona.body).toMatchObject({ schemaVersion: 2, fictionalPersona: true, id: 'analyst' });
+    expect(persona.body.identity).toHaveProperty('birthDate');
+    const summaries = await request(api.app).get('/api/persona-summaries').set('Authorization', `Bearer ${token}`).expect(200);
+    expect(summaries.body[0]).toMatchObject({ completeness: 100, age: 25 });
+    await request(api.app)
+      .post('/api/personas')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ mode: 'template', username: 'new-bot' })
+      .expect(201);
+    await request(api.app)
+      .post('/api/personas')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ mode: 'manual', id: 'manual-persona', name: 'Новая личность' })
+      .expect(201);
+    await request(api.app)
+      .patch('/api/bots/bot')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ personaId: 'dry-joker' })
+      .expect(200);
+    const deletion = await request(api.app)
+      .delete('/api/personas/analyst')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(409);
+    expect(deletion.body.error).toContain('назначена');
   });
 
   it('starts OAuth behind dashboard auth and completes the public Twitch callback without exposing tokens', async () => {

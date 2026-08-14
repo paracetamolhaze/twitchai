@@ -1,8 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import { ApiServer, createApiServer } from './api/server';
 import { AppConfig, normalizeChannel } from './config';
 import { ReactionMemory } from './learning/reaction-memory';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
+import { PersonaContextBuilder } from './personas/persona-context-builder';
+import { PersonaMemory } from './personas/persona-memory';
+import { PersonaRuntimeStore } from './personas/persona-runtime-store';
 import { PersonaStore } from './personas/persona-store';
 import { AppRepository, BotAccountRecord } from './persistence/repository';
 import { MemoryRepository } from './persistence/memory-repository';
@@ -36,6 +40,9 @@ export class Application {
   private readonly policy: ReactionPolicyGuard;
   private readonly memory: ReactionMemory;
   private readonly history: BotHistory;
+  private readonly personaMemory: PersonaMemory;
+  private readonly personaRuntime: PersonaRuntimeStore;
+  private readonly personaContext: PersonaContextBuilder;
   private readonly decisions: ReactionDecisionRecord[] = [];
   private botManager!: TwitchBotManager;
   private brain!: StreamBrainService;
@@ -72,6 +79,9 @@ export class Application {
       logger: this.logger,
     });
     this.history = new BotHistory(this.repository, 50);
+    this.personaMemory = new PersonaMemory(this.repository);
+    this.personaRuntime = new PersonaRuntimeStore();
+    this.personaContext = new PersonaContextBuilder(this.personaMemory, this.personaRuntime);
   }
 
   async start(): Promise<void> {
@@ -106,6 +116,9 @@ export class Application {
       sender: this.botManager,
       history: this.history,
       memory: this.memory,
+      personaContext: this.personaContext,
+      personaMemory: this.personaMemory,
+      personaRuntime: this.personaRuntime,
       contextStore: this.contextStore,
       usage: this.usage,
       logger: this.logger,
@@ -214,6 +227,7 @@ export class Application {
       },
       bots: () => this.botManager.listStatuses(),
       setBotEnabled: (username, enabled) => this.botManager.setEnabled(username, enabled),
+      assignBotPersona: (username, personaId) => this.botManager.assignPersona(username, personaId),
       events: (limit) => this.repository.listStreamEvents(limit),
       chat: () => this.contextStore.snapshot().recentChat,
       usage: () => this.usage.snapshot(),
@@ -221,7 +235,17 @@ export class Application {
       settings: () => this.getSettings(),
       updateSettings: (settings) => this.updateSettings(settings),
       personas: () => this.personas.list(),
+      personaSummaries: () => this.personas.summaries(),
+      persona: (id) => this.personas.getOptional(id),
+      createPersona: (persona) => this.personas.create(persona),
+      createBlankPersona: (id, name) => this.personas.createBlank(id, name),
+      createPersonaTemplate: (username, id) => this.personas.createTemplate(username, id),
+      duplicatePersona: (sourceId, id, name) => this.personas.duplicate(sourceId, id, name),
       updatePersona: (persona) => this.personas.update(persona),
+      deletePersona: (id) => this.personas.delete(id),
+      personaMemories: (personaId, limit) => this.personaMemory.list(personaId, limit),
+      deletePersonaMemory: (personaId, memoryId) => this.personaMemory.delete(personaId, memoryId),
+      previewPersonaContext: (personaId, query, username) => this.previewPersonaContext(personaId, query, username),
       ...(this.twitchOAuth ? {
         twitchOAuth: {
           status: () => this.twitchOAuth!.status(),
@@ -302,18 +326,77 @@ export class Application {
     this.memory.recordChat(message);
     this.api.emitChat(message);
     if (message.kind !== 'viewer') return;
-    const mentions = this.botManager.listStatuses()
+    const statuses = this.botManager.listStatuses();
+    const explicitMentions = statuses
       .map((account) => account.username)
       .filter((username) => new RegExp(`@${escapeRegex(username)}\\b`, 'i').test(message.message));
-    if (mentions.length === 0) return;
+    const recentPersonaIds = explicitMentions.length === 0
+      ? await this.personaMemory.recentConversationPersonaIds(message.username, 3)
+      : [];
+    const targets = resolveViewerConversationTargets(statuses, explicitMentions, recentPersonaIds);
+    if (targets.length === 0) return;
+    await Promise.all(targets.map(async (account) => {
+      await this.personaMemory.addConversation({
+        personaId: account.personaId,
+        viewerUsername: message.username,
+        role: 'viewer',
+        message: message.message,
+        createdAt: message.timestamp,
+      });
+      const importance = viewerMemoryImportance(message.message);
+      if (importance >= 0.4) {
+        await this.personaMemory.remember({
+          personaId: account.personaId,
+          type: 'viewer',
+          summary: `${message.username} сказал(а): ${message.message}`,
+          importance,
+          tags: ['viewer', message.username],
+          viewerUsername: message.username,
+          createdAt: message.timestamp,
+        });
+      }
+    }));
     this.brain.requestReaction({
       timestamp: message.timestamp,
       type: 'conversation',
-      summary: `${message.username} directly addressed ${mentions.map((name) => `@${name}`).join(', ')}: ${message.message}`,
+      summary: explicitMentions.length > 0
+        ? `${message.username} directly addressed ${targets.map(({ username }) => `@${username}`).join(', ')}: ${message.message}`
+        : `${message.username} continued a recent conversation with @${targets[0]!.username}: ${message.message}`,
       speech: message.message,
       importance: 0.85,
       confidence: 1,
-      directMentions: mentions,
+      directMentions: targets.map(({ username }) => username),
+      viewerUsername: message.username.toLowerCase(),
+    });
+  }
+
+  private async previewPersonaContext(personaId: string, query: string, requestedUsername?: string) {
+    const persona = this.personas.get(personaId);
+    const assigned = this.botManager.listStatuses().find((bot) =>
+      bot.personaId === personaId && (!requestedUsername || bot.username === requestedUsername.toLowerCase()));
+    const username = assigned?.username ?? requestedUsername?.toLowerCase() ?? `preview-${personaId}`;
+    const recentMessages = assigned
+      ? (await this.history.recent(assigned.username)).map((message) => message.message)
+      : [];
+    return this.personaContext.build({
+      username,
+      persona,
+      event: {
+        id: randomUUID(),
+        timestamp: Date.now(),
+        type: 'conversation',
+        summary: query,
+        speech: query,
+        importance: 1,
+        confidence: 1,
+        source: 'chat',
+        directMentions: [username],
+      },
+      recentMessages,
+      directMention: true,
+      viewerUsername: 'dashboard-preview',
+      recentChat: this.contextStore.snapshot().recentChat,
+      observeRuntime: false,
     });
   }
 
@@ -422,7 +505,7 @@ export class Application {
       configured.set(authorized.username, {
         username: authorized.username,
         oauthToken: authorized.accessToken,
-        personaId: priorStatus?.personaId ?? priorConfig?.personaId ?? 'analyst',
+        personaId: priorStatus?.personaId ?? priorConfig?.personaId ?? '',
         // A validated refreshable credential is safe to enable; persisted dashboard state remains authoritative.
         enabled: true,
       });
@@ -439,7 +522,7 @@ export class Application {
     await this.botManager.upsertAuthorizedAccount({
       username: authorized.username,
       oauthToken: authorized.accessToken,
-      personaId: previous?.personaId ?? 'analyst',
+      personaId: previous?.personaId ?? '',
       enabled: previous?.enabled ?? true,
     }, authorized.previousUsername);
     const existingIndex = this.config.twitch.accounts.findIndex((account) =>
@@ -447,7 +530,7 @@ export class Application {
     const runtimeAccount = {
       username: authorized.username,
       oauthToken: authorized.accessToken,
-      personaId: previous?.personaId ?? 'analyst',
+      personaId: previous?.personaId ?? '',
       enabled: previous?.enabled ?? true,
     };
     if (existingIndex >= 0) this.config.twitch.accounts[existingIndex] = runtimeAccount;
@@ -470,7 +553,7 @@ export class Application {
         await this.botManager.upsertAuthorizedAccount({
           username: refreshed.username,
           oauthToken: refreshed.accessToken,
-          personaId: current?.personaId ?? 'analyst',
+          personaId: current?.personaId ?? '',
           enabled: current?.enabled ?? true,
         }, refreshed.previousUsername);
         return refreshed;
@@ -487,6 +570,30 @@ export class Application {
 }
 
 function escapeRegex(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+export function resolveViewerConversationTargets<T extends { username: string; personaId: string }>(
+  accounts: T[],
+  explicitMentions: string[],
+  recentPersonaIds: string[],
+): T[] {
+  if (explicitMentions.length > 0) {
+    const mentioned = new Set(explicitMentions.map((username) => username.toLowerCase()));
+    return accounts.filter((account) => mentioned.has(account.username.toLowerCase()));
+  }
+  for (const personaId of recentPersonaIds) {
+    const account = accounts.find((candidate) => candidate.personaId === personaId);
+    if (account) return [account];
+  }
+  return [];
+}
+
+function viewerMemoryImportance(message: string): number {
+  const normalized = message.toLowerCase();
+  if (/(запомни|обещаю|напомни)/u.test(normalized)) return 0.9;
+  if (/(я\s+(живу|работаю|учусь|еду|лечу|собираюсь|люблю|ненавижу)|у\s+меня)/u.test(normalized)) return 0.75;
+  if (normalized.length >= 80) return 0.45;
+  return 0.2;
+}
 function stringSetting(value: unknown, fallback: string): string { return typeof value === 'string' ? value : fallback; }
 function boundedNumberSetting(value: unknown, fallback: number, minimum: number, maximum: number): number {
   return typeof value === 'number' && value >= minimum && value <= maximum ? value : fallback;

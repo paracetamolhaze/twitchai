@@ -1,4 +1,5 @@
 import { BotPersona } from '../personas/types';
+import { PersonaReactionContext } from '../personas/persona-context-builder';
 import { BotConnectionState } from '../persistence/repository';
 import { ReactionExample } from '../learning/types';
 import { ChatMessage } from '../stream-brain/types';
@@ -22,14 +23,11 @@ export interface PlannedReaction {
   bot: ReactionBotCandidate;
   delayMs: number;
   directMention: boolean;
+  viewerUsername?: string;
   message: string;
 }
 
-export interface ReactionContextCandidate {
-  username: string;
-  persona: BotPersona;
-  recentMessages: string[];
-  directMention: boolean;
+export interface ReactionContextCandidate extends PersonaReactionContext {
   rateLimit: { cooldownRemainingMs: number; busy: boolean };
 }
 

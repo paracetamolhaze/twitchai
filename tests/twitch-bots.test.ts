@@ -54,7 +54,7 @@ describe('TwitchBotManager isolation', () => {
     });
     await manager.initialize();
     await manager.start();
-    return { manager, clients };
+    return { manager, clients, personas };
   }
 
   it('keeps healthy accounts connected when one token fails', async () => {
@@ -63,7 +63,8 @@ describe('TwitchBotManager isolation', () => {
       { username: 'broken', oauthToken: 'bad', enabled: true },
     ], 'persona-that-no-longer-exists');
     expect(manager.listStatuses().find((bot) => bot.username === 'good')?.connectionState).toBe('CONNECTED');
-    expect(manager.listStatuses().find((bot) => bot.username === 'good')?.personaId).toBe('analyst');
+    expect(manager.listStatuses().find((bot) => bot.username === 'good')?.personaId).not.toBe('persona-that-no-longer-exists');
+    expect(new Set(manager.listStatuses().map((bot) => bot.personaId)).size).toBe(2);
     expect(manager.listStatuses().find((bot) => bot.username === 'broken')?.connectionState).toBe('ERROR');
     await manager.stop();
   });
@@ -98,6 +99,21 @@ describe('TwitchBotManager isolation', () => {
       connectionState: 'DISABLED',
       chatConnected: false,
     });
+    await manager.stop();
+  });
+
+  it('validates one-to-one persona assignment without a restart', async () => {
+    const { manager, personas } = await setup([
+      { username: 'one', oauthToken: 'one', enabled: true },
+      { username: 'two', oauthToken: 'two', enabled: true },
+    ]);
+    const [one, two] = manager.listStatuses();
+    expect(one?.personaId).not.toBe(two?.personaId);
+    expect(await manager.assignPersona('two', one!.personaId)).toBe('persona_in_use');
+    expect(await manager.assignPersona('two', 'missing-persona')).toBe('persona_not_found');
+    const free = personas.list().find((persona) => !manager.listStatuses().some((bot) => bot.personaId === persona.id))!;
+    expect(await manager.assignPersona('two', free.id)).toBe('updated');
+    expect(manager.listStatuses().find((bot) => bot.username === 'two')?.personaId).toBe(free.id);
     await manager.stop();
   });
 });

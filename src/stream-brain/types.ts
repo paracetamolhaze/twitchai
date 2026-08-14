@@ -30,6 +30,8 @@ export interface StreamEvent {
   confidence: number;
   source: StreamEventSource;
   directMentions: string[];
+  /** Present only for chat-originated direct questions and follow-up threads. */
+  viewerUsername?: string;
 }
 
 export interface ChatMessage {

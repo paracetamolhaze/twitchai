@@ -29,6 +29,7 @@ export interface TwitchBotManagerOptions {
 }
 
 export type TwitchChatClient = Pick<tmi.Client, 'connect' | 'disconnect' | 'say' | 'on'>;
+export type PersonaAssignmentResult = 'updated' | 'bot_not_found' | 'persona_not_found' | 'persona_in_use';
 
 export class TwitchBotManager extends EventEmitter {
   private readonly bots = new Map<string, ManagedBot>();
@@ -60,24 +61,24 @@ export class TwitchBotManager extends EventEmitter {
 
   async initialize(): Promise<void> {
     const stored = new Map((await this.options.repository.listBots()).map((bot) => [bot.username, bot]));
-    for (const [index, bot] of [...this.bots.values()].entries()) {
-      const configuredPersonaId = this.options.personas.get(bot.config.personaId, index).id;
+    const managedUsernames = new Set(this.bots.keys());
+    const usedPersonaIds = new Set([...stored.values()]
+      .filter((bot) => !managedUsernames.has(bot.username))
+      .map((bot) => bot.personaId));
+    for (const bot of this.bots.values()) {
       const previous = stored.get(bot.config.username);
-      if (!previous) {
-        bot.config.personaId = configuredPersonaId;
-        bot.status.personaId = configuredPersonaId;
-        continue;
-      }
+      const preferredPersonaId = previous?.personaId ?? bot.config.personaId;
+      const persona = await this.options.personas.ensureUniqueForAccount(bot.config.username, preferredPersonaId, usedPersonaIds);
+      usedPersonaIds.add(persona.id);
+      bot.config.personaId = persona.id;
+      bot.status.personaId = persona.id;
+      if (!previous) continue;
       // Environment configuration is the safety ceiling: an account imported as
       // ineligible (for example, because its token lacks modern chat scopes)
       // must not be re-enabled by stale persisted dashboard state.
       bot.config.enabled = bot.config.enabled && previous.enabled;
-      bot.config.personaId = this.options.personas.has(previous.personaId)
-        ? previous.personaId
-        : configuredPersonaId;
       bot.status = {
         ...bot.status,
-        personaId: bot.config.personaId,
         enabled: bot.config.enabled,
         connectionState: bot.config.enabled ? 'DISCONNECTED' : 'DISABLED',
         messagesSent: previous.messagesSent,
@@ -115,9 +116,9 @@ export class TwitchBotManager extends EventEmitter {
   listStatuses(): BotAccountRecord[] { return [...this.bots.values()].map((bot) => structuredClone(bot.status)); }
 
   candidates(): ReactionBotCandidate[] {
-    return [...this.bots.values()].map((bot, index) => ({
+    return [...this.bots.values()].map((bot) => ({
       username: bot.config.username,
-      persona: this.options.personas.get(bot.config.personaId, index),
+      persona: this.options.personas.get(bot.config.personaId),
       enabled: bot.status.enabled,
       connectionState: bot.status.connectionState,
       chatConnected: bot.status.chatConnected,
@@ -140,11 +141,40 @@ export class TwitchBotManager extends EventEmitter {
     return true;
   }
 
+  async assignPersona(username: string, personaId: string): Promise<PersonaAssignmentResult> {
+    const bot = this.bots.get(username.toLowerCase());
+    if (!bot) return 'bot_not_found';
+    if (!this.options.personas.has(personaId)) return 'persona_not_found';
+    if (bot.config.personaId === personaId) return 'updated';
+    const alreadyAssigned = [...this.bots.values()].some((candidate) =>
+      candidate !== bot && candidate.config.personaId === personaId)
+      || (await this.options.repository.listBots()).some((candidate) =>
+        candidate.username !== bot.config.username && candidate.personaId === personaId);
+    if (alreadyAssigned) return 'persona_in_use';
+    const previousPersonaId = bot.config.personaId;
+    bot.config.personaId = personaId;
+    bot.status = { ...bot.status, personaId };
+    try {
+      await this.persist(bot);
+    } catch (error) {
+      bot.config.personaId = previousPersonaId;
+      bot.status = { ...bot.status, personaId: previousPersonaId };
+      throw error;
+    }
+    this.emit('status', this.listStatuses());
+    return 'updated';
+  }
+
   async upsertAuthorizedAccount(account: BotAccountConfig, previousUsername?: string): Promise<void> {
     const username = account.username.toLowerCase();
     const existing = this.bots.get(username) ?? (previousUsername ? this.bots.get(previousUsername.toLowerCase()) : undefined);
     if (!existing) {
-      const personaId = this.options.personas.get(account.personaId, this.bots.size).id;
+      const usedPersonaIds = new Set([
+        ...[...this.bots.values()].map((bot) => bot.config.personaId),
+        ...(await this.options.repository.listBots()).map((bot) => bot.personaId),
+      ]);
+      const persona = await this.options.personas.ensureUniqueForAccount(username, account.personaId, usedPersonaIds);
+      const personaId = persona.id;
       const bot: ManagedBot = {
         config: { ...account, username, personaId },
         sentAt: [],

@@ -1,5 +1,11 @@
 import { ReactionExample } from '../learning/types';
-import { BotMessageRecord, BotPersona } from '../personas/types';
+import {
+  BotMessageRecord,
+  BotPersona,
+  PersonaConversationMessage,
+  PersonaMemoryItem,
+  PersonaRelationship,
+} from '../personas/types';
 import { StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
 
@@ -52,6 +58,14 @@ export interface AppRepository {
   healthCheck(): Promise<boolean>;
   listPersonas(): Promise<BotPersona[]>;
   upsertPersona(persona: BotPersona): Promise<void>;
+  deletePersona(id: string): Promise<void>;
+  savePersonaMemory(memory: PersonaMemoryItem): Promise<void>;
+  listPersonaMemories(personaId: string, limit: number): Promise<PersonaMemoryItem[]>;
+  deletePersonaMemory(id: string, personaId: string): Promise<boolean>;
+  savePersonaConversationMessage(message: PersonaConversationMessage): Promise<void>;
+  listPersonaConversationMessages(personaId: string, viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]>;
+  listRecentPersonaConversationMessages(viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]>;
+  listPersonaRelationships(personaId: string): Promise<PersonaRelationship[]>;
   listBots(): Promise<BotAccountRecord[]>;
   upsertBot(bot: BotAccountRecord): Promise<void>;
   listTwitchCredentials(): Promise<EncryptedTwitchCredentialRecord[]>;
