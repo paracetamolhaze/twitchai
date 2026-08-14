@@ -30,6 +30,10 @@ describe('Gemini Live three-tool protocol', () => {
     expect(STREAM_BRAIN_INSTRUCTION).toContain('Every reaction.username MUST be copied exactly from candidates[].username');
     expect(STREAM_BRAIN_INSTRUCTION).toContain('A clear streamer greeting to chat at the beginning of a stream');
     expect(STREAM_BRAIN_INSTRUCTION).toContain('Do not make every candidate respond');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Speech lists and messageExamples are descriptive style evidence, never response templates');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Never concatenate openingPatterns, fillerWords, favoriteExpressions, or endingPatterns');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('compare the draft against that candidate\'s recentMessages');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('The event summary is evidence, not a caption to paraphrase');
   });
 
   it('handles every tool call in a server message and correlates synchronous responses by id', async () => {

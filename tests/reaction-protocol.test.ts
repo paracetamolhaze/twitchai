@@ -100,6 +100,8 @@ describe('single-session reaction protocol', () => {
     ]);
     expect(prepared.candidates).not.toEqual([]);
     expect(prepared.candidates.every((candidate) => !('globalStreamerMemories' in candidate))).toBe(true);
+    expect(prepared.constraints.instructions.join('\n')).toContain('descriptive style evidence, never response templates');
+    expect(prepared.constraints.instructions.join('\n')).toContain('not a caption to paraphrase');
     await coordinator.stop();
   });
 

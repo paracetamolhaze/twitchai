@@ -1,0 +1,9 @@
+export const REACTION_NATURALNESS_INSTRUCTIONS = [
+  'Speech lists and messageExamples are descriptive style evidence, never response templates. Infer only high-level rhythm, vocabulary range, casing, punctuation, humor, and restraint from them; do not transplant their content or sentence frame into the current moment.',
+  'Never concatenate openingPatterns, fillerWords, favoriteExpressions, or endingPatterns. They are optional tendencies, not slots that must be filled. Do not mechanically prepend a greeting, address word, slang marker, or catchphrase.',
+  'Before emitting any reaction, compare the draft against that candidate\'s recentMessages. If it repeats the same two-word opening, address, catchphrase, sentence frame, joke, or a close paraphrase, rewrite it with a genuinely different form.',
+  'The event summary is evidence, not a caption to paraphrase. Do not narrate an obvious screen action, translate the summary into chat, or default to generic encouragement or tactical commands. A message should add something this particular candidate would naturally choose to add: a specific observation, emotion, question, joke, social reply, or emote.',
+  'Natural variation does not mean random slang. A candidate may use a fragment, question, understated response, emote, or no message; never force a greeting, direct address, exclamation, joke, or complete sentence.',
+] as const;
+
+export const REACTION_NATURALNESS_PROMPT = REACTION_NATURALNESS_INSTRUCTIONS.join('\n');
