@@ -19,7 +19,7 @@ import { PersonaRegenerationPreview } from '../personas/persona-store';
 import { personaSchema } from '../personas/schema';
 import { BotPersona, PersonaAuditReport, PersonaMemoryItem, PersonaSummary } from '../personas/types';
 import { BotAccountRecord } from '../persistence/repository';
-import { ReactionDecisionRecord } from '../reaction/types';
+import { ReactionDecisionRecord, ReactionTraceRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
@@ -61,6 +61,7 @@ export interface ApiServerDependencies {
   chat: () => ChatMessage[];
   usage: () => UsageSnapshot;
   decisions?: () => ReactionDecisionRecord[];
+  reactionTraces?: () => ReactionTraceRecord[];
   settings: () => Promise<Record<string, unknown>>;
   updateSettings: (settings: Record<string, unknown>) => Promise<{ restartRequired: string[] }>;
   personas: () => BotPersona[];
@@ -110,6 +111,7 @@ export interface ApiServer {
   emitBots(bots: BotAccountRecord[]): void;
   emitBrain(status: StreamBrainStatus): void;
   emitDecision(decision: ReactionDecisionRecord): void;
+  emitReactionTrace(trace: ReactionTraceRecord): void;
   emitStreamerMemories(memories: StreamerMemory[]): void;
   emitStreamerMemory(memory: StreamerMemory): void;
   emitStreamerMemoryStats(stats: GlobalStreamerMemoryStats): void;
@@ -314,6 +316,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
   app.get('/api/chat', (_request, response) => response.json(dependencies.chat()));
   app.get('/api/usage', (_request, response) => response.json(dependencies.usage()));
   app.get('/api/decisions', (_request, response) => response.json(dependencies.decisions?.() ?? []));
+  app.get('/api/reaction-traces', (_request, response) => response.json(dependencies.reactionTraces?.() ?? []));
   app.get('/api/streamer-memories', async (request, response, next) => {
     try { return response.json(await dependencies.streamerMemories(streamerMemoryListSchema.parse(request.query))); }
     catch (error) { return next(error); }
@@ -488,6 +491,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     socket.emit('overview', dependencies.overview());
     socket.emit('bots', dependencies.bots());
     socket.emit('chat:init', dependencies.chat());
+    socket.emit('reaction-traces:init', dependencies.reactionTraces?.() ?? []);
     void dependencies.events(50)
       .then((events) => socket.emit('events:init', events))
       .catch((error: unknown) => logger.warn('Initial realtime event load failed', { error }));
@@ -521,6 +525,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     emitBots: (bots) => io.emit('bots', bots),
     emitBrain: (status) => io.emit('brain', status),
     emitDecision: (decision) => io.emit('decision', decision),
+    emitReactionTrace: (trace) => io.emit('reaction-trace', trace),
     emitStreamerMemories: (memories) => io.emit('streamer-memories:init', memories),
     emitStreamerMemory: (memory) => io.emit('streamer-memory', memory),
     emitStreamerMemoryStats: (stats) => io.emit('streamer-memory-stats', stats),

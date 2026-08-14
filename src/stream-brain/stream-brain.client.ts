@@ -1,12 +1,13 @@
-import { StreamContextSnapshot, StreamEventCandidate } from './types';
+import { GeminiLiveDiagnostics, StreamContextSnapshot, StreamEventCandidate } from './types';
 
 export interface StreamBrainClient {
   start(): Promise<void>;
   stop(): void;
-  sendAudio(pcm: Buffer): void;
-  sendVideo(jpeg: Buffer): void;
-  updateContext(snapshot: StreamContextSnapshot): void;
-  requestReaction(candidate: StreamEventCandidate): void;
+  sendAudio(pcm: Buffer): boolean;
+  sendVideo(jpeg: Buffer): boolean;
+  updateContext(snapshot: StreamContextSnapshot): boolean;
+  requestReaction(candidate: StreamEventCandidate): boolean;
   isConnected(): boolean;
   getSessionStartedAt?(): number | undefined;
+  getDiagnostics?(): GeminiLiveDiagnostics;
 }

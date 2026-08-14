@@ -251,14 +251,30 @@ export class TwitchBotManager extends EventEmitter {
 
   async send(username: string, message: string): Promise<boolean> {
     const bot = this.bots.get(username.toLowerCase());
-    if (!bot?.client || bot.status.connectionState !== 'CONNECTED' || !bot.status.chatConnected) return false;
+    if (!bot?.client || bot.status.connectionState !== 'CONNECTED' || !bot.status.chatConnected) {
+      this.logger.warn('Twitch send skipped because account is unavailable', {
+        bot: username,
+        channel: this.channel,
+        reason: 'account_unavailable',
+        connectionState: bot?.status.connectionState ?? 'UNKNOWN',
+        chatConnected: bot?.status.chatConnected ?? false,
+      });
+      return false;
+    }
     const now = Date.now();
     bot.sentAt = bot.sentAt.filter((at) => at > now - 30_000);
     if (bot.sentAt.length >= 18 || now - (bot.sentAt.at(-1) ?? 0) < 1_100) {
-      this.logger.warn('Bot message blocked by local Twitch rate limiter', { bot: username });
+      this.logger.warn('Bot message blocked by local Twitch rate limiter', {
+        bot: username, channel: this.channel, reason: 'local_rate_limit',
+      });
       return false;
     }
     try {
+      this.logger.info('Twitch send attempt', {
+        bot: username,
+        channel: this.channel,
+        messageBytes: Buffer.byteLength(message, 'utf8'),
+      });
       await bot.client.say(`#${this.channel}`, message);
       bot.sentAt.push(Date.now());
       await this.patch(bot, {
@@ -267,10 +283,12 @@ export class TwitchBotManager extends EventEmitter {
         lastReactionAt: Date.now(),
         lastError: undefined,
       });
+      this.logger.info('Twitch send succeeded', { bot: username, channel: this.channel });
       return true;
     } catch (cause) {
-      await this.patch(bot, { lastError: cause instanceof Error ? cause.message : String(cause) });
-      this.logger.warn('Twitch message send failed', { bot: username, cause });
+      const error = cause instanceof Error ? cause.message : String(cause);
+      await this.patch(bot, { lastError: error });
+      this.logger.warn('Twitch message send failed', { bot: username, channel: this.channel, error: error.slice(0, 240) });
       return false;
     }
   }

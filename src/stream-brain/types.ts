@@ -54,14 +54,67 @@ export interface StreamContextSnapshot {
   updatedAt: number;
 }
 
+export type GeminiClientState = 'STOPPED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'FATAL_CONFIG_ERROR';
+
+export interface GeminiOutboundTraceEntry {
+  at: number;
+  type: string;
+  bytes?: number;
+}
+
+export interface GeminiLiveDiagnostics {
+  state: GeminiClientState;
+  connected: boolean;
+  stable: boolean;
+  sessionActive: boolean;
+  sessionStartedAt?: number;
+  lastCloseCode?: number;
+  lastCloseReason?: string;
+  lastCloseWasClean?: boolean;
+  lastSessionAgeMs?: number;
+  lastOutbound?: string;
+  lastToolCall?: string;
+  lastToolResponse?: string;
+  lastMediaInput?: 'audio' | 'video';
+  outboundTrace: GeminiOutboundTraceEntry[];
+  resumeAttempts: number;
+  freshReconnects: number;
+  audioChunksSent: number;
+  videoFramesSent: number;
+  transcriptsReceived: number;
+  protocolErrorsInWindow: number;
+}
+
 export interface StreamBrainStatus {
-  state: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'DISABLED';
+  state: 'STOPPED' | 'OFFLINE' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'FATAL_CONFIG_ERROR' | 'DISABLED';
+  mediaState: 'STOPPED' | 'CONNECTING' | 'STREAMING' | 'OFFLINE' | 'ERROR';
+  geminiState: 'STOPPED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'FATAL_CONFIG_ERROR' | 'DISABLED';
   mediaConnected: boolean;
   geminiConnected: boolean;
+  geminiStable: boolean;
+  geminiSessionActive: boolean;
+  geminiSessionReason: 'twitch_live' | 'twitch_offline' | 'media_connecting' | 'media_error' | 'fatal_error' | 'application_stopped' | 'disabled';
   model?: string;
   sessionStartedAt?: number;
   lastEventAt?: number;
   lastError?: string;
+  lastCloseCode?: number;
+  lastCloseReason?: string;
+  lastCloseWasClean?: boolean;
+  lastSessionAgeMs?: number;
+  lastOutbound?: string;
+  lastToolCall?: string;
+  lastToolResponse?: string;
+  lastMediaInput?: 'audio' | 'video';
+  outboundTrace?: GeminiOutboundTraceEntry[];
+  protocolErrorsInWindow?: number;
+  resumeAttempts?: number;
+  freshReconnects?: number;
+  audioChunksSent?: number;
+  videoFramesSent?: number;
+  transcriptsReceived?: number;
+  spokenMentionsDetected?: number;
+  eligibleBots?: number;
 }
 
 export type StreamEventCandidate = Omit<

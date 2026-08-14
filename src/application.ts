@@ -15,7 +15,7 @@ import { MemoryRepository } from './persistence/memory-repository';
 import { PostgresRepository } from './persistence/postgres-repository';
 import { ReactionCoordinator } from './reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from './reaction/reaction-policy-guard';
-import { ReactionDecisionRecord } from './reaction/types';
+import { ReactionDecisionRecord, ReactionTraceRecord } from './reaction/types';
 import { ContextStore } from './stream-brain/context-store';
 import { EventDetector } from './stream-brain/event-detector';
 import { GeminiLiveClient } from './stream-brain/gemini-live.client';
@@ -30,6 +30,8 @@ import { AuthorizedTwitchAccount, TwitchOAuthService } from './twitch/oauth-serv
 import { OfficialTwitchTokenValidator } from './twitch/oauth-validator';
 import { UsageTracker } from './usage/usage-tracker';
 import { isAccountClassificationQuestion } from './shared/account-classification';
+
+import { detectSpokenReactionSignal } from './shared/bot-mention-matcher';
 
 const TWITCH_OAUTH_REFRESH_INTERVAL_MS = 60_000;
 const TWITCH_OAUTH_REFRESH_LEAD_MS = 5 * 60_000;
@@ -48,6 +50,7 @@ export class Application {
   private readonly personaRuntime: PersonaRuntimeStore;
   private readonly personaContext: PersonaContextBuilder;
   private readonly decisions: ReactionDecisionRecord[] = [];
+  private readonly reactionTraces: ReactionTraceRecord[] = [];
   private botManager!: TwitchBotManager;
   private brain!: StreamBrainService;
   private coordinator!: ReactionCoordinator;
@@ -65,6 +68,12 @@ export class Application {
   private runtimeSettings: Record<string, unknown> = {};
   /** Serializes STREAMING/OFFLINE/reconfigure/heartbeat transitions. */
   private globalMemoryLifecycle: Promise<void> = Promise.resolve();
+
+  private transcriptAccumulator = '';
+  private transcriptTimer?: NodeJS.Timeout;
+  private mediaStreaming = false;
+  private streamGeneration = 0;
+  private greetedStreamGeneration = 0;
 
   constructor(private readonly config: AppConfig) {
     this.logger = new Logger('APP', config.app.logLevel);
@@ -156,10 +165,13 @@ export class Application {
             return this.coordinator.prepare(event);
           },
           onEmitReactionBatch: (batch) => this.coordinator.submitBatch(batch),
-          onTranscript: (text) => this.logger.debug('Gemini input transcription received', { characters: text.length }),
-          onStatus: (connected, error) => {
+          onTranscript: (text) => {
+            this.logger.debug('Gemini input transcription received', { characters: text.length });
+            this.handleSpokenTranscript(text);
+          },
+          onStatus: (connected, error, diagnostics) => {
             if (!connected) this.coordinator.clearPendingContexts();
-            this.brain.onGeminiStatus(connected, error);
+            this.brain.onGeminiStatus(connected, error, diagnostics);
             if (connected) void this.refreshGlobalMemorySnapshot();
           },
         },
@@ -250,6 +262,7 @@ export class Application {
       chat: () => this.contextStore.snapshot().recentChat,
       usage: () => this.usage.snapshot(),
       decisions: () => [...this.decisions].reverse(),
+      reactionTraces: () => [...this.reactionTraces].reverse(),
       settings: () => this.getSettings(),
       updateSettings: (settings) => this.updateSettings(settings),
       personas: () => this.personas.list(),
@@ -336,6 +349,7 @@ export class Application {
     if (this.healthTimer) clearInterval(this.healthTimer);
     if (this.oauthRefreshTimer) clearInterval(this.oauthRefreshTimer);
     if (this.sessionHeartbeatTimer) clearInterval(this.sessionHeartbeatTimer);
+    this.clearTranscriptAccumulator();
     this.categoryTimer = undefined;
     this.usageTimer = undefined;
     this.healthTimer = undefined;
@@ -365,9 +379,16 @@ export class Application {
     });
     this.brain.on('media', ({ state, mediaConnected }: { state: string; mediaConnected: boolean }) => {
       if (mediaConnected) {
+        if (!this.mediaStreaming) {
+          this.mediaStreaming = true;
+          this.streamGeneration += 1;
+        }
         void this.enqueueGlobalMemoryLifecycle(() => this.startGlobalMemorySession());
-      } else if (state === 'OFFLINE') {
-        void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
+      } else {
+        if (this.mediaStreaming) this.clearTranscriptAccumulator();
+        this.mediaStreaming = false;
+        if (state === 'OFFLINE') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
+        else if (state === 'ERROR') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
       }
     });
     this.globalMemory.on('memory', ({ memory }: { memory: StreamerMemory }) => {
@@ -380,6 +401,13 @@ export class Application {
       if (this.decisions.length > 100) this.decisions.shift();
       this.api.emitDecision(decision);
     });
+    this.coordinator.on('trace', (trace: ReactionTraceRecord) => {
+      const existing = this.reactionTraces.findIndex((item) => item.eventId === trace.eventId);
+      if (existing >= 0) this.reactionTraces.splice(existing, 1);
+      this.reactionTraces.push(trace);
+      if (this.reactionTraces.length > 100) this.reactionTraces.shift();
+      this.api.emitReactionTrace(trace);
+    });
     this.botManager.on('status', (bots: BotAccountRecord[]) => {
       this.contextStore.configure({ botUsernames: bots.map((bot) => bot.username) });
       this.api.emitBots(bots);
@@ -388,6 +416,52 @@ export class Application {
     this.botManager.on('chat', (message: ChatMessage) => {
       void this.handleChat(message).catch((cause: unknown) => this.logger.warn('Chat context handling failed', { cause }));
     });
+  }
+
+  private getEligibleBotAccounts(): BotAccountRecord[] {
+    return this.botManager.listStatuses().filter((bot) => bot.enabled && bot.connectionState === 'CONNECTED' && bot.chatConnected);
+  }
+
+  private handleSpokenTranscript(text: string): void {
+    if (!text.trim()) return;
+    this.transcriptAccumulator = (this.transcriptAccumulator + ' ' + text).trim();
+    if (this.transcriptTimer) clearTimeout(this.transcriptTimer);
+    this.transcriptTimer = setTimeout(() => {
+      const accumulated = this.transcriptAccumulator;
+      this.transcriptAccumulator = '';
+      this.processAccumulatedTranscript(accumulated);
+    }, 2000);
+  }
+
+  private processAccumulatedTranscript(text: string): void {
+    if (!this.mediaStreaming || !this.brain.getStatus().geminiConnected) return;
+    const eligible = this.getEligibleBotAccounts();
+    const candidates = this.botManager.listStatuses().map(bot => {
+      const persona = this.personas.getOptional(bot.personaId);
+      return { username: bot.username, aliases: persona?.spokenAliases ?? [] };
+    });
+    const signal = detectSpokenReactionSignal(
+      text,
+      candidates,
+      this.greetedStreamGeneration !== this.streamGeneration,
+    );
+    if (!signal) return;
+    if (signal.kind === 'greeting') this.greetedStreamGeneration = this.streamGeneration;
+    if (signal.kind === 'direct_mention') this.brain.recordSpokenMention(eligible.length);
+    const queued = this.brain.requestReaction(signal.candidate);
+    this.logger.info('Spoken reaction signal detected', {
+      kind: signal.kind,
+      directMentions: signal.candidate.directMentions,
+      eligibleBots: eligible.length,
+      queued,
+      streamGeneration: this.streamGeneration,
+    });
+  }
+
+  private clearTranscriptAccumulator(): void {
+    if (this.transcriptTimer) clearTimeout(this.transcriptTimer);
+    this.transcriptTimer = undefined;
+    this.transcriptAccumulator = '';
   }
 
   private async handleChat(message: ChatMessage): Promise<void> {
@@ -495,8 +569,11 @@ export class Application {
       try {
         const info = await helix.getStream(this.config.twitch.channel);
         const previous = this.contextStore.snapshot();
-        this.contextStore.configure({ category: info.category, isLive: info.isLive });
+        // Helix enriches category metadata only. MediaPipeline STREAMING/OFFLINE is the
+        // sole lifecycle authority for isLive and the Gemini Live session.
+        this.contextStore.configure({ category: info.category });
         if (previous.category !== info.category) this.logger.info('Twitch category updated', { category: info.category || 'offline' });
+        this.logger.debug('Twitch Helix liveness observed (informational only)', { helixLive: info.isLive });
         this.api.emitOverview();
       } catch (cause) {
         this.logger.warn('Twitch category refresh failed', { cause });
@@ -570,7 +647,7 @@ export class Application {
   }
 
   private async refreshGlobalMemorySnapshot(): Promise<void> {
-    if (!this.gemini || !this.config.twitch.channel) return;
+    if (!this.gemini || !this.config.twitch.channel || !this.mediaStreaming || !this.brain?.getStatus().geminiConnected) return;
     try {
       const memories = await this.globalMemory.startupSnapshot(
         this.config.twitch.channel,

@@ -83,13 +83,15 @@ export class ReactionPolicyGuard {
       const message = normalizeMessage(submitted.message);
       const reject = (reason: ReactionRejection['reason']): void => { rejected.push({ username, reason }); };
 
+      const candidate = current.get(username);
+      if (!input.permittedUsernames.has(username) || !candidate || submitted.username !== candidate.username) {
+        reject('unknown_candidate'); continue;
+      }
       if (seen.has(username)) { reject('duplicate_username'); continue; }
       seen.add(username);
       if (accepted.length >= this.options.maxReactionsPerEvent) {
         reject('too_many_reactions'); continue;
       }
-      if (!input.permittedUsernames.has(username)) { reject('unknown_candidate'); continue; }
-      const candidate = current.get(username);
       if (!candidate?.enabled || candidate.connectionState !== 'CONNECTED' || !candidate.chatConnected) {
         reject('not_connected'); continue;
       }

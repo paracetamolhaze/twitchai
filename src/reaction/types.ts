@@ -95,3 +95,40 @@ export interface ReactionDecisionRecord {
   candidateCount: number;
   silentCandidateCount: number;
 }
+
+export type DirectTargetUnavailableReason = 'unknown_bot' | 'disabled' | 'not_connected' | 'chat_disconnected';
+
+export type ReactionTraceStage =
+  | 'EVENT_DETECTED'
+  | 'CANDIDATES_PREPARED'
+  | 'GEMINI_SELECTED'
+  | 'POLICY_VALIDATED'
+  | 'SCHEDULED'
+  | 'SEND_SUCCEEDED'
+  | 'SEND_FAILED'
+  | 'STOPPED';
+
+export type ReactionTraceOutcome = 'PENDING' | 'SILENT' | 'SCHEDULED' | 'SENT' | 'PARTIAL' | 'FAILED' | 'STALE';
+
+/** Metadata-only, end-to-end explanation of why a detected event did or did not reach Twitch chat. */
+export interface ReactionTraceRecord {
+  eventId: string;
+  timestamp: number;
+  updatedAt: number;
+  eventType: StreamEvent['type'];
+  summary: string;
+  stage: ReactionTraceStage;
+  outcome: ReactionTraceOutcome;
+  eligibleBots: number;
+  eligibleUsernames: string[];
+  candidateCount: number;
+  directMentions: string[];
+  directTargetUnavailable: Array<{ username: string; reason: DirectTargetUnavailableReason }>;
+  geminiSelected: string[];
+  policyAccepted: string[];
+  policyRejected: ReactionRejection[];
+  scheduled: string[];
+  sent: string[];
+  sendFailed: Array<{ username: string; reason: string }>;
+  terminalReason?: string;
+}

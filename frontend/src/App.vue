@@ -5,15 +5,38 @@ import { io, Socket } from 'socket.io-client'
 type Page = 'overview' | 'bots' | 'brain' | 'memories' | 'chat' | 'settings'
 type PersonaTab = 'main' | 'character' | 'family' | 'biography' | 'interests' | 'opinions' | 'speech' | 'twitch' | 'memory' | 'quality'
 type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'DISABLED'
+type BrainState = 'STOPPED' | 'OFFLINE' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'FATAL_CONFIG_ERROR' | 'DISABLED'
 
 interface BrainStatus {
-  state: ConnectionState
+  state: BrainState
+  mediaState: 'STOPPED' | 'CONNECTING' | 'STREAMING' | 'OFFLINE' | 'ERROR'
+  geminiState: 'STOPPED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'FATAL_CONFIG_ERROR' | 'DISABLED'
   mediaConnected: boolean
   geminiConnected: boolean
+  geminiStable: boolean
+  geminiSessionActive: boolean
+  geminiSessionReason: 'twitch_live' | 'twitch_offline' | 'media_connecting' | 'media_error' | 'fatal_error' | 'application_stopped' | 'disabled'
   model?: string
   sessionStartedAt?: number
   lastEventAt?: number
   lastError?: string
+  lastCloseCode?: number
+  lastCloseReason?: string
+  lastCloseWasClean?: boolean
+  lastSessionAgeMs?: number
+  lastOutbound?: string
+  lastToolCall?: string
+  lastToolResponse?: string
+  lastMediaInput?: 'audio' | 'video'
+  outboundTrace?: Array<{ at: number; type: string; bytes?: number }>
+  protocolErrorsInWindow?: number
+  resumeAttempts?: number
+  freshReconnects?: number
+  audioChunksSent?: number
+  videoFramesSent?: number
+  transcriptsReceived?: number
+  spokenMentionsDetected?: number
+  eligibleBots?: number
 }
 interface Overview {
   channel: string
@@ -77,6 +100,10 @@ interface Usage {
   streamMinutes: number
   audioMinutes: number
   videoMinutes: number
+  capturedAudioMinutes: number
+  capturedVideoMinutes: number
+  geminiAudioSentMinutes: number
+  geminiVideoSentMinutes: number
   geminiReconnects: number
   geminiInputTokens: number
   geminiOutputTokens: number
@@ -94,6 +121,19 @@ interface Usage {
   memoriesMerged: number
   memoriesSuperseded: number
   memoryRetrievals: number
+  currentStream: {
+    active: boolean
+    startedAt?: number
+    durationMinutes: number
+    capturedAudioMinutes: number
+    capturedVideoMinutes: number
+    geminiAudioSentMinutes: number
+    geminiVideoSentMinutes: number
+    geminiReconnects: number
+    geminiInputTokens: number
+    geminiOutputTokens: number
+    sentResponses: number
+  }
 }
 type StreamerMemoryType = 'fact' | 'preference' | 'person' | 'relationship' | 'plan' | 'promise' | 'result' | 'place' | 'trip' | 'running_joke' | 'important_event' | 'recurring_context' | 'other'
 type StreamerMemoryStatus = 'active' | 'resolved' | 'superseded' | 'expired'
@@ -141,6 +181,7 @@ interface Persona {
   fictionalPersona: true
   id: string
   name: string
+  spokenAliases?: string[]
   description: string
   identity: {
     firstName: string; preferredName?: string; nickname?: string; nicknameOrigin?: string; birthDate?: string
@@ -224,6 +265,27 @@ interface ReactionDecision {
   candidateCount: number
   silentCandidateCount: number
 }
+interface ReactionTrace {
+  eventId: string
+  timestamp: number
+  updatedAt: number
+  eventType: string
+  summary: string
+  stage: 'EVENT_DETECTED' | 'CANDIDATES_PREPARED' | 'GEMINI_SELECTED' | 'POLICY_VALIDATED' | 'SCHEDULED' | 'SEND_SUCCEEDED' | 'SEND_FAILED' | 'STOPPED'
+  outcome: 'PENDING' | 'SILENT' | 'SCHEDULED' | 'SENT' | 'PARTIAL' | 'FAILED' | 'STALE'
+  eligibleBots: number
+  eligibleUsernames: string[]
+  candidateCount: number
+  directMentions: string[]
+  directTargetUnavailable: Array<{ username: string; reason: string }>
+  geminiSelected: string[]
+  policyAccepted: string[]
+  policyRejected: Array<{ username: string; reason: ReactionRejectionReason }>
+  scheduled: string[]
+  sent: string[]
+  sendFailed: Array<{ username: string; reason: string }>
+  terminalReason?: string
+}
 
 const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3000').replace(/\/$/, '')
 const PERSONA_SIMILARITY_WARNING_THRESHOLD = 0.65
@@ -239,15 +301,25 @@ const saveMessage = ref('')
 const oauthConnecting = ref(false)
 const overview = reactive<Overview>({
   channel: '', category: '', isLive: false, twitchConnected: false,
-  streamBrain: { state: 'DISCONNECTED', mediaConnected: false, geminiConnected: false },
+  streamBrain: {
+    state: 'STOPPED', mediaState: 'STOPPED', geminiState: 'STOPPED',
+    mediaConnected: false, geminiConnected: false, geminiStable: false,
+    geminiSessionActive: false, geminiSessionReason: 'application_stopped',
+  },
   activeBots: 0, totalBots: 0, uptimeSeconds: 0,
 })
 const usage = reactive<Usage>({
   uptimeSeconds: 0, streamMinutes: 0, audioMinutes: 0, videoMinutes: 0,
+  capturedAudioMinutes: 0, capturedVideoMinutes: 0, geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0,
   geminiReconnects: 0, geminiInputTokens: 0, geminiOutputTokens: 0, geminiToolCalls: 0,
   preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0,
   guardRejections: 0, eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0,
   memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0,
+  currentStream: {
+    active: false, durationMinutes: 0, capturedAudioMinutes: 0, capturedVideoMinutes: 0,
+    geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0, geminiReconnects: 0,
+    geminiInputTokens: 0, geminiOutputTokens: 0, sentResponses: 0,
+  },
 })
 const bots = ref<Bot[]>([])
 const events = ref<StreamEvent[]>([])
@@ -264,6 +336,7 @@ const personaBusy = ref(false)
 const regenerationPreview = ref<PersonaRegenerationPreview | null>(null)
 const bulkRegenerationPreview = ref<BulkRegenerationPreview | null>(null)
 const decisions = ref<ReactionDecision[]>([])
+const reactionTraces = ref<ReactionTrace[]>([])
 const streamerMemories = ref<StreamerMemory[]>([])
 const streamerMemoryStats = reactive<StreamerMemoryStats>({
   channel: '', total: 0, active: 0, resolved: 0, superseded: 0, expired: 0,
@@ -343,10 +416,20 @@ const timeline = computed(() => [
 ].sort((a, b) => b.timestamp - a.timestamp).slice(0, 80))
 
 const healthItems = computed(() => [
-  { label: 'Сервер', ok: backendOnline.value, detail: backendOnline.value ? 'Интерфейс сервера доступен' : 'Нет соединения' },
-  { label: 'Чат Twitch', ok: overview.twitchConnected, detail: `${overview.activeBots} из ${overview.totalBots} ботов в чате` },
-  { label: 'Медиапоток', ok: overview.streamBrain.mediaConnected, detail: overview.streamBrain.mediaConnected ? 'Аудио и выбранные видеокадры' : stateLabel(overview.streamBrain.state) },
-  { label: 'Gemini Live', ok: overview.streamBrain.geminiConnected, detail: overview.streamBrain.geminiConnected ? 'Единая Live-сессия подключена' : overview.streamBrain.lastError || 'Отключено' },
+  { label: 'Сервер', tone: backendOnline.value ? 'ok' : 'error', status: backendOnline.value ? 'Работает' : 'Требует внимания', detail: backendOnline.value ? 'Интерфейс сервера доступен' : 'Нет соединения' },
+  { label: 'Чат Twitch', tone: overview.twitchConnected ? 'ok' : 'error', status: overview.twitchConnected ? 'Работает' : 'Требует внимания', detail: `${overview.activeBots} из ${overview.totalBots} ботов в чате` },
+  {
+    label: 'Медиапоток',
+    tone: overview.streamBrain.mediaConnected ? 'ok' : overview.streamBrain.mediaState === 'ERROR' ? 'error' : overview.streamBrain.mediaState === 'CONNECTING' ? 'pending' : 'idle',
+    status: overview.streamBrain.mediaConnected ? 'Идёт стрим' : overview.streamBrain.mediaState === 'ERROR' ? 'Требует внимания' : overview.streamBrain.mediaState === 'CONNECTING' ? 'Поиск медиапотока…' : 'Стрим офлайн — норма',
+    detail: overview.streamBrain.mediaConnected ? 'Аудио и выбранные видеокадры' : stateLabel(overview.streamBrain.mediaState),
+  },
+  {
+    label: 'Gemini Live',
+    tone: overview.streamBrain.geminiStable ? 'ok' : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) ? 'error' : overview.streamBrain.geminiSessionActive ? 'pending' : 'idle',
+    status: overview.streamBrain.geminiStable ? 'Стабильно' : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) ? 'Требует внимания' : overview.streamBrain.geminiSessionActive ? 'Подключение…' : 'Физически остановлена',
+    detail: overview.streamBrain.geminiStable ? 'Единая Live-сессия стабильна' : overview.streamBrain.lastError || sessionReasonLabel(overview.streamBrain.geminiSessionReason),
+  },
 ])
 const refreshableUsernames = computed(() => new Set(
   twitchOAuth.accounts.filter((account) => account.refreshable).map((account) => account.username),
@@ -393,11 +476,11 @@ async function loadDashboard(): Promise<void> {
   if (!authenticated.value) return
   loading.value = true
   try {
-    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData, personaSummaryData, personaAuditData, decisionData, oauthData, memoryData, memoryStatsData] = await Promise.all([
+    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData, personaSummaryData, personaAuditData, decisionData, traceData, oauthData, memoryData, memoryStatsData] = await Promise.all([
       api<Overview>('/api/overview'), api<Bot[]>('/api/bots'), api<StreamEvent[]>('/api/events?limit=100'),
       api<ChatMessage[]>('/api/chat'), api<Usage>('/api/usage'), api<Record<string, unknown>>('/api/settings'),
       api<Persona[]>('/api/personas'), api<PersonaSummary[]>('/api/persona-summaries'), api<PersonaAuditReport>('/api/persona-audit'),
-      api<ReactionDecision[]>('/api/decisions'), api<TwitchOAuthStatus>('/api/twitch/oauth/status'),
+      api<ReactionDecision[]>('/api/decisions'), api<ReactionTrace[]>('/api/reaction-traces'), api<TwitchOAuthStatus>('/api/twitch/oauth/status'),
       api<StreamerMemory[]>('/api/streamer-memories?limit=100'), api<StreamerMemoryStats>('/api/streamer-memories/stats'),
     ])
     Object.assign(overview, overviewData)
@@ -413,6 +496,7 @@ async function loadDashboard(): Promise<void> {
     }
     if (selectedPersona.value) preparePersonaForEditing(selectedPersona.value)
     decisions.value = decisionData
+    reactionTraces.value = traceData
     streamerMemories.value = memoryData
     Object.assign(streamerMemoryStats, memoryStatsData)
     Object.assign(twitchOAuth, oauthData)
@@ -444,6 +528,10 @@ function connectRealtime(): void {
   socket.on('chat:init', (value: ChatMessage[]) => { chat.value = value })
   socket.on('chat', (value: ChatMessage) => { chat.value = [...chat.value.filter((item) => item.id !== value.id), value].slice(-300) })
   socket.on('decision', (value: ReactionDecision) => { decisions.value = [value, ...decisions.value].slice(0, 100) })
+  socket.on('reaction-traces:init', (value: ReactionTrace[]) => { reactionTraces.value = value })
+  socket.on('reaction-trace', (value: ReactionTrace) => {
+    reactionTraces.value = [value, ...reactionTraces.value.filter((item) => item.eventId !== value.eventId)].slice(0, 100)
+  })
   socket.on('streamer-memories:init', (value: StreamerMemory[]) => { streamerMemories.value = value })
   socket.on('streamer-memory', (value: StreamerMemory) => {
     streamerMemories.value = [value, ...streamerMemories.value.filter((memory) => memory.id !== value.id)]
@@ -867,6 +955,7 @@ function replacePersona(persona: Persona): void {
 }
 
 function preparePersonaForEditing(persona: Persona): void {
+  persona.spokenAliases ||= []
   persona.identity.birthplace ||= { country: '', city: '' }
   persona.identity.grewUpIn ||= { country: '', city: '' }
   persona.identity.currentLocation ||= { country: '', city: '' }
@@ -923,8 +1012,32 @@ function formatSessionDuration(startedAt?: number): string {
   return startedAt ? formatDuration(Math.max(0, Math.floor((Date.now() - startedAt) / 1000))) : '—'
 }
 function stateClass(state: ConnectionState): string { return state.toLowerCase() }
-function stateLabel(state: ConnectionState): string {
-  return ({ DISCONNECTED: 'Отключено', CONNECTING: 'Подключение', CONNECTED: 'Подключено', ERROR: 'Ошибка', DISABLED: 'Выключено' })[state]
+function stateLabel(state: ConnectionState | BrainState | BrainStatus['mediaState']): string {
+  return ({
+    DISCONNECTED: 'Отключено', STOPPED: 'Остановлено', OFFLINE: 'Стрим офлайн',
+    CONNECTING: 'Подключение', CONNECTED: 'Подключено', STREAMING: 'Медиапоток идёт',
+    ERROR: 'Ошибка', FATAL_CONFIG_ERROR: 'Фатальная ошибка конфигурации', DISABLED: 'Выключено',
+  } as Record<string, string>)[state] || state
+}
+function sessionReasonLabel(reason: BrainStatus['geminiSessionReason']): string {
+  return ({
+    twitch_live: 'Медиапоток подтверждает прямой эфир', twitch_offline: 'Стрим офлайн',
+    media_connecting: 'Ожидание медиапотока', media_error: 'Ошибка медиапотока',
+    fatal_error: 'Переподключения остановлены', application_stopped: 'Приложение остановлено', disabled: 'Gemini выключена',
+  })[reason]
+}
+function reactionTraceStageLabel(stage: ReactionTrace['stage']): string {
+  return ({
+    EVENT_DETECTED: 'событие найдено', CANDIDATES_PREPARED: 'кандидаты подготовлены',
+    GEMINI_SELECTED: 'Gemini выбрала', POLICY_VALIDATED: 'политика проверила', SCHEDULED: 'запланировано',
+    SEND_SUCCEEDED: 'отправлено', SEND_FAILED: 'ошибка отправки', STOPPED: 'цепочка остановлена',
+  })[stage]
+}
+function reactionTraceOutcomeLabel(outcome: ReactionTrace['outcome']): string {
+  return ({
+    PENDING: 'в процессе', SILENT: 'осознанная тишина', SCHEDULED: 'ожидает отправки',
+    SENT: 'доставлено в Twitch', PARTIAL: 'частично отправлено', FAILED: 'не отправлено', STALE: 'контекст устарел',
+  })[outcome]
 }
 function kindLabel(kind: ChatMessage['kind']): string {
   return ({ viewer: 'зритель', bot: 'бот', system: 'система' })[kind]
@@ -1083,8 +1196,8 @@ onBeforeUnmount(() => {
           <div class="page-heading"><div><p class="eyebrow">ЦЕНТР УПРАВЛЕНИЯ</p><h1>Обзор</h1></div><p class="muted">Один стрим, один мультимодальный мозг, {{ overview.totalBots }} самостоятельных личностей.</p></div>
           <section class="health-grid" aria-label="Состояние системы">
             <article v-for="item in healthItems" :key="item.label" class="health-card">
-              <div><span :class="['status-light', item.ok ? 'ok' : '']"></span><span>{{ item.label }}</span></div>
-              <strong>{{ item.ok ? 'Работает' : 'Требует внимания' }}</strong><small>{{ item.detail }}</small>
+              <div><span :class="['status-light', item.tone]"></span><span>{{ item.label }}</span></div>
+              <strong>{{ item.status }}</strong><small>{{ item.detail }}</small>
             </article>
           </section>
           <section class="metric-strip">
@@ -1151,14 +1264,26 @@ onBeforeUnmount(() => {
           <section class="brain-summary">
             <div><span>Сессия Gemini Live</span><strong>{{ stateLabel(overview.streamBrain.state) }}</strong></div>
             <div><span>Модель</span><strong>{{ overview.streamBrain.model || '—' }}</strong></div>
-            <div><span>Аудио</span><strong>{{ usage.audioMinutes.toFixed(1) }} мин</strong></div>
-            <div><span>Выбранное видео</span><strong>{{ usage.videoMinutes.toFixed(1) }} мин</strong></div>
+            <div><span>Сессия физически активна</span><strong>{{ overview.streamBrain.geminiSessionActive ? 'Да' : 'Нет' }}</strong></div>
+            <div><span>Причина состояния</span><strong>{{ sessionReasonLabel(overview.streamBrain.geminiSessionReason) }}</strong></div>
             <div><span>Длительность сессии</span><strong>{{ formatSessionDuration(overview.streamBrain.sessionStartedAt) }}</strong></div>
             <div><span>Последнее событие</span><strong>{{ formatTime(overview.streamBrain.lastEventAt) }}</strong></div>
           </section>
           <section class="panel metric-strip"><div><span>Медиа</span><strong>→</strong></div><div><span>Gemini Live</span><strong>→</strong></div><div><span>Контекст персон</span><strong>→</strong></div><div><span>Единый пакет</span><strong>→</strong></div><div><span>Чат Twitch</span><strong>✓</strong></div></section>
           <section class="metric-strip">
-            <div><span>События</span><strong>{{ usage.eventsDetected }}</strong></div><div><span>Контексты / инструменты</span><strong>{{ usage.preparedReactionContexts }} / {{ usage.geminiToolCalls }}</strong></div><div><span>Создано / отправлено</span><strong>{{ usage.generatedResponses }} / {{ usage.sentResponses }}</strong></div><div><span>Отклонено фильтром</span><strong>{{ usage.guardRejections }}</strong></div><div><span>Токены вход / выход</span><strong>{{ usage.geminiInputTokens }} / {{ usage.geminiOutputTokens }}</strong></div>
+            <div><span>Текущий стрим</span><strong>{{ usage.currentStream.active ? `${usage.currentStream.durationMinutes.toFixed(1)} мин` : 'не активен' }}</strong></div><div><span>Захвачено аудио / видео</span><strong>{{ usage.currentStream.capturedAudioMinutes.toFixed(1) }} / {{ usage.currentStream.capturedVideoMinutes.toFixed(1) }} мин</strong></div><div><span>Отправлено Gemini аудио / видео</span><strong>{{ usage.currentStream.geminiAudioSentMinutes.toFixed(1) }} / {{ usage.currentStream.geminiVideoSentMinutes.toFixed(1) }} мин</strong></div><div><span>Токены текущего стрима</span><strong>{{ usage.currentStream.geminiInputTokens }} / {{ usage.currentStream.geminiOutputTokens }}</strong></div><div><span>Reconnect / сообщения</span><strong>{{ usage.currentStream.geminiReconnects }} / {{ usage.currentStream.sentResponses }}</strong></div>
+          </section>
+          <section class="panel metric-strip">
+            <div><span>Всего захвачено аудио / видео</span><strong>{{ usage.capturedAudioMinutes.toFixed(1) }} / {{ usage.capturedVideoMinutes.toFixed(1) }} мин</strong></div><div><span>Всего отправлено Gemini</span><strong>{{ usage.geminiAudioSentMinutes.toFixed(1) }} / {{ usage.geminiVideoSentMinutes.toFixed(1) }} мин</strong></div><div><span>Reconnect всего</span><strong>{{ usage.geminiReconnects }}</strong></div><div><span>Токены всего</span><strong>{{ usage.geminiInputTokens }} / {{ usage.geminiOutputTokens }}</strong></div><div><span>Создано / отправлено</span><strong>{{ usage.generatedResponses }} / {{ usage.sentResponses }}</strong></div>
+          </section>
+          <section class="panel debug-context">
+            <div><h3>Диагностика Gemini Live</h3><p>Стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние сокета: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · protocol errors: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Последнее закрытие: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ overview.streamBrain.lastCloseReason || 'причина отсутствует' }} · возраст сессии {{ overview.streamBrain.lastSessionAgeMs !== undefined ? `${(overview.streamBrain.lastSessionAgeMs / 1000).toFixed(1)} с` : '—' }}</p><p>Последние операции: outbound <b>{{ overview.streamBrain.lastOutbound || '—' }}</b> · tool call <b>{{ overview.streamBrain.lastToolCall || '—' }}</b> · tool response <b>{{ overview.streamBrain.lastToolResponse || '—' }}</b> · media <b>{{ overview.streamBrain.lastMediaInput || '—' }}</b></p><p>Распознано устных обращений: <b>{{ overview.streamBrain.spokenMentionsDetected || 0 }}</b> · доступных ботов при последнем обращении: <b>{{ overview.streamBrain.eligibleBots ?? '—' }}</b></p></div>
+            <pre>{{ (overview.streamBrain.outboundTrace || []).map(item => `${formatTime(item.at)} ${item.type}${item.bytes !== undefined ? ` (${item.bytes} B)` : ''}`).join('\n') || 'Исходящих операций пока нет.' }}</pre>
+          </section>
+          <div class="section-heading"><div><p class="eyebrow">СКВОЗНОЙ REACTION TRACE</p><h2>Почему сообщение дошло или остановилось</h2></div></div>
+          <section class="event-grid">
+            <article v-for="trace in reactionTraces" :key="`${trace.eventId}-${trace.updatedAt}`" class="event-card"><div class="event-top"><time>{{ formatTime(trace.updatedAt) }}</time><span>{{ reactionTraceStageLabel(trace.stage) }}</span><b>{{ reactionTraceOutcomeLabel(trace.outcome) }}</b></div><h3>{{ trace.summary }}</h3><p>Доступно: {{ trace.eligibleBots }} · передано Gemini: {{ trace.candidateCount }} · выбрано: {{ trace.geminiSelected.length }} · принято: {{ trace.policyAccepted.length }} · запланировано: {{ trace.scheduled.length }} · отправлено: {{ trace.sent.length }}</p><small v-if="trace.directTargetUnavailable.length">Прямой адресат недоступен: {{ trace.directTargetUnavailable.map(item => `@${item.username}: ${item.reason}`).join(', ') }}</small><small v-if="trace.policyRejected.length">Отклонено политикой: {{ trace.policyRejected.map(item => `${item.username}: ${rejectionLabel(item.reason)}`).join(', ') }}</small><small v-if="trace.sendFailed.length">Ошибка отправки: {{ trace.sendFailed.map(item => `${item.username}: ${item.reason}`).join(', ') }}</small><small v-if="trace.terminalReason">Итоговая причина: {{ trace.terminalReason }}</small></article>
+            <div v-if="!reactionTraces.length" class="empty-state panel">Трассировок реакций пока нет.</div>
           </section>
           <div class="section-heading"><div><p class="eyebrow">ПОСЛЕДНИЕ РЕШЕНИЯ AI</p><h2>Кто решил реагировать</h2></div></div>
           <section class="event-grid">
@@ -1317,6 +1442,7 @@ onBeforeUnmount(() => {
 
             <section v-else-if="personaTab === 'twitch'" class="persona-section">
               <div class="two-fields"><label>Впервые увидел стрим<input v-model="selectedPersona.streamerRelationship.firstSeen" placeholder="2024-03" /></label><label>Любимые типы стримов<input :value="selectedPersona.streamerRelationship.favoriteStreamTypes.join(', ')" @change="selectedPersona.streamerRelationship.favoriteStreamTypes = ($event.target as HTMLInputElement).value.split(',').map(value => value.trim()).filter(Boolean)" /></label></div>
+              <label>Произносимые псевдонимы для прямого обращения<input :value="(selectedPersona.spokenAliases || []).join(', ')" placeholder="например: супер, супер си эс" @change="selectedPersona.spokenAliases = ($event.target as HTMLInputElement).value.split(',').map(value => value.trim()).filter(Boolean)" /></label>
               <div class="slider-grid"><label>Знакомство со стримером <b>{{ selectedPersona.streamerRelationship.familiarity.toFixed(2) }}</b><input v-model.number="selectedPersona.streamerRelationship.familiarity" type="range" min="0" max="1" step="0.05" /></label><label>Поддержка <b>{{ selectedPersona.streamerRelationship.supportiveness.toFixed(2) }}</b><input v-model.number="selectedPersona.streamerRelationship.supportiveness" type="range" min="0" max="1" step="0.05" /></label><label>Поддразнивание <b>{{ selectedPersona.streamerRelationship.teasingLevel.toFixed(2) }}</b><input v-model.number="selectedPersona.streamerRelationship.teasingLevel" type="range" min="0" max="1" step="0.05" /></label></div>
               <div class="subsection-heading"><h4>Повторяющиеся ссылки</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.streamerRelationship.recurringReferences, 'новая ссылка')">+</button></div><div v-for="(_, index) in selectedPersona.streamerRelationship.recurringReferences" :key="index" class="inline-edit"><input v-model="selectedPersona.streamerRelationship.recurringReferences[index]" /><button type="button" @click="selectedPersona.streamerRelationship.recurringReferences.splice(index, 1)">×</button></div>
               <div class="subsection-heading"><div><h4>Знакомства с другими личностями</h4><p class="muted">Не создают принудительный разговор; используются только при естественном поводе.</p></div><button class="secondary" type="button" @click="addPersonaRelationship(selectedPersona)">+ Знакомство</button></div><article v-for="(relationship, index) in selectedPersona.relationships" :key="relationship.targetPersonaId" class="nested-card"><label>Другая личность<select v-model="relationship.targetPersonaId"><option v-for="candidate in personas.filter(candidate => candidate.id !== selectedPersona!.id)" :key="candidate.id" :value="candidate.id">{{ candidate.name }}</option></select></label><div class="two-fields"><label>Знакомство <b>{{ relationship.familiarity.toFixed(2) }}</b><input v-model.number="relationship.familiarity" type="range" min="0" max="1" step="0.05" /></label><label>Отношение <b>{{ relationship.sentiment.toFixed(2) }}</b><input v-model.number="relationship.sentiment" type="range" min="-1" max="1" step="0.05" /></label></div><div class="subsection-heading"><h4>Заметки</h4><button type="button" class="text-button" @click="addTextItem(relationship.notes, 'новая заметка')">+</button></div><div v-for="(_, noteIndex) in relationship.notes" :key="noteIndex" class="inline-edit"><input v-model="relationship.notes[noteIndex]" /><button type="button" @click="relationship.notes.splice(noteIndex, 1)">×</button></div><button class="danger-button compact" type="button" @click="selectedPersona.relationships.splice(index, 1)">Удалить знакомство</button></article>

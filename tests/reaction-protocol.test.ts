@@ -10,7 +10,7 @@ import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
-import { ReactionBotCandidate } from '../src/reaction/types';
+import { ReactionBotCandidate, ReactionTraceRecord } from '../src/reaction/types';
 import { ContextStore } from '../src/stream-brain/context-store';
 import { StreamEvent } from '../src/stream-brain/types';
 import { UsageTracker } from '../src/usage/usage-tracker';
@@ -36,7 +36,7 @@ function bot(username: string, index: number): ReactionBotCandidate {
   };
 }
 
-async function setup() {
+async function setup(senderResult = true) {
   const repository = new MemoryRepository();
   await repository.initialize();
   const history = new BotHistory(repository);
@@ -63,7 +63,7 @@ async function setup() {
   });
   const coordinator = new ReactionCoordinator({
     policy,
-    sender: { send: async (username, message) => { sent.push({ username, message }); return true; } },
+    sender: { send: async (username, message) => { sent.push({ username, message }); return senderResult; } },
     history,
     memory: new ReactionMemory({ enabled: true, reactionWindowMs: 1_000, repository }),
     globalMemory,
@@ -227,6 +227,8 @@ describe('single-session reaction protocol', () => {
 
   it('limits a direct question to exactly the addressed persona', async () => {
     const { coordinator } = await setup();
+    const traces: ReactionTraceRecord[] = [];
+    coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
     const directEvent: StreamEvent = {
       ...event,
       id: 'direct-event',
@@ -246,12 +248,58 @@ describe('single-session reaction protocol', () => {
       reactions: [{ username: 'bot-three', message: 'пытаюсь ответить не своей личностью' }],
     });
     expect(rejected.rejected[0]).toMatchObject({ username: 'bot-three', reason: 'unknown_candidate' });
+    expect(traces.at(-1)).toMatchObject({
+      eventId: directEvent.id,
+      stage: 'POLICY_VALIDATED',
+      outcome: 'FAILED',
+      geminiSelected: ['bot-three'],
+      policyRejected: [{ username: 'bot-three', reason: 'unknown_candidate' }],
+      terminalReason: 'all_selected_reactions_rejected',
+    });
+    await coordinator.stop();
+  });
+
+  it('supplies all four eligible bots for an ordinary event', async () => {
+    const { coordinator, setCandidates } = await setup();
+    setCandidates([
+      bot('bot-one', 0), bot('bot-two', 1), bot('bot-three', 2), bot('bot-four', 3),
+    ]);
+
+    const prepared = await coordinator.prepare({ ...event, id: 'four-candidates' });
+
+    expect(prepared.candidates.map((candidate) => candidate.username)).toEqual([
+      'bot-one', 'bot-two', 'bot-three', 'bot-four',
+    ]);
+    await coordinator.stop();
+  });
+
+  it('traces direct-target unavailability with a concrete reason', async () => {
+    const { coordinator, setCandidates } = await setup();
+    const traces: ReactionTraceRecord[] = [];
+    coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
+    setCandidates([
+      bot('bot-one', 0),
+      { ...bot('bot-two', 1), connectionState: 'DISCONNECTED', chatConnected: false },
+    ]);
+    const directEvent = { ...event, id: 'unavailable-direct-target', directMentions: ['bot-two'] };
+
+    const prepared = await coordinator.prepare(directEvent);
+
+    expect(prepared.candidates).toEqual([]);
+    expect(traces.at(-1)).toMatchObject({
+      eventId: directEvent.id,
+      eligibleBots: 1,
+      candidateCount: 0,
+      directTargetUnavailable: [{ username: 'bot-two', reason: 'not_connected' }],
+    });
     await coordinator.stop();
   });
 
   it('schedules exactly the usernames and final messages selected by Gemini', async () => {
     vi.useFakeTimers();
     const { coordinator, sent } = await setup();
+    const traces: ReactionTraceRecord[] = [];
+    coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
     await coordinator.prepare(event);
     const result = await coordinator.submitBatch({
       eventId: event.id,
@@ -264,6 +312,17 @@ describe('single-session reaction protocol', () => {
     expect(sent).toEqual([]);
     await vi.runAllTimersAsync();
     expect(sent).toEqual([{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }]);
+    expect(traces.at(-1)).toMatchObject({
+      eventId: event.id,
+      stage: 'SEND_SUCCEEDED',
+      eligibleBots: 3,
+      candidateCount: 3,
+      geminiSelected: ['bot-three'],
+      policyAccepted: ['bot-three'],
+      scheduled: ['bot-three'],
+      sent: ['bot-three'],
+      outcome: 'SENT',
+    });
     await coordinator.stop();
   });
 
@@ -274,6 +333,32 @@ describe('single-session reaction protocol', () => {
     expect(result).toMatchObject({ accepted: [], rejected: [] });
     expect(sent).toEqual([]);
     expect(usage.snapshot().emptyReactionBatches).toBe(1);
+    await coordinator.stop();
+  });
+
+  it('traces a scheduled Twitch send failure to its terminal reason', async () => {
+    vi.useFakeTimers();
+    const { coordinator } = await setup(false);
+    const traces: ReactionTraceRecord[] = [];
+    coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
+    const failedEvent = { ...event, id: 'send-failure-event' };
+    await coordinator.prepare(failedEvent);
+    const result = await coordinator.submitBatch({
+      eventId: failedEvent.id,
+      reactions: [{ username: 'bot-one', message: 'valid message that the sender cannot deliver' }],
+    });
+    expect(result.accepted).toHaveLength(1);
+
+    await vi.runAllTimersAsync();
+
+    expect(traces.at(-1)).toMatchObject({
+      eventId: failedEvent.id,
+      stage: 'SEND_FAILED',
+      outcome: 'FAILED',
+      scheduled: ['bot-one'],
+      sent: [],
+      sendFailed: [{ username: 'bot-one', reason: 'twitch_sender_returned_false' }],
+    });
     await coordinator.stop();
   });
 
@@ -304,6 +389,27 @@ describe('single-session reaction protocol', () => {
     ]));
     await vi.runAllTimersAsync();
     expect(sent.map((item) => item.username)).toEqual(['bot-one', 'bot-three']);
+    await coordinator.stop();
+  });
+
+  it('rejects candidate usernames whose casing or whitespace is not copied exactly', async () => {
+    const { coordinator } = await setup();
+    const exactEvent = { ...event, id: 'exact-username-event' };
+    await coordinator.prepare(exactEvent);
+
+    const result = await coordinator.submitBatch({
+      eventId: exactEvent.id,
+      reactions: [
+        { username: 'BOT-ONE', message: 'wrong casing' },
+        { username: ' bot-two ', message: 'extra whitespace' },
+      ],
+    });
+
+    expect(result.accepted).toEqual([]);
+    expect(result.rejected).toEqual([
+      { username: 'bot-one', reason: 'unknown_candidate' },
+      { username: 'bot-two', reason: 'unknown_candidate' },
+    ]);
     await coordinator.stop();
   });
 

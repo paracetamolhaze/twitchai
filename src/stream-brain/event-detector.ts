@@ -30,6 +30,7 @@ export interface EventNormalizationContext {
   timestamp?: number;
   source?: StreamEventSource;
   botUsernames?: string[];
+  mentionMatcher?: import('../shared/bot-mention-matcher').BotMentionMatcher;
 }
 
 export class EventDetector {
@@ -47,18 +48,25 @@ export class EventDetector {
     if (!result.success || result.data.confidence < this.minimumConfidence) return null;
 
     const candidate: StreamEventCandidate = result.data;
-    const allowedBots = new Set((context.botUsernames ?? []).map((name) => name.toLowerCase()));
+    const allowedBots = new Set(context.botUsernames?.map((n) => n.toLowerCase()) ?? []);
     const directMentions = new Set(
       (candidate.directMentions ?? [])
         .map((name) => name.replace(/^@/, '').toLowerCase())
         .filter((name) => allowedBots.has(name)),
     );
     const searchable = [candidate.summary, candidate.speech].filter(Boolean).join(' ').toLowerCase();
-    for (const username of context.botUsernames ?? []) {
-      const normalized = username.toLowerCase();
-      const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (new RegExp(`(?:^|[^a-z0-9_])@?${escaped}(?:$|[^a-z0-9_])`, 'i').test(searchable)) {
-        directMentions.add(normalized);
+
+    if (context.mentionMatcher) {
+      for (const username of context.mentionMatcher.match(searchable)) {
+        if (allowedBots.has(username)) directMentions.add(username);
+      }
+    } else {
+      for (const username of context.botUsernames ?? []) {
+        const normalized = username.toLowerCase();
+        const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp(`(?:^|[^a-z0-9_])@?${escaped}(?:$|[^a-z0-9_])`, 'i').test(searchable)) {
+          directMentions.add(normalized);
+        }
       }
     }
 

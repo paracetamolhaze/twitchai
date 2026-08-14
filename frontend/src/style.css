@@ -39,6 +39,8 @@ nav button.active { background: rgba(88,230,169,.075); border-color: rgba(88,230
 .sidebar-foot .text-button { grid-column: 2; justify-self: start; }
 .connection-dot, .status-light { width: 7px; height: 7px; border-radius: 50%; background: var(--red); box-shadow: 0 0 10px rgba(255,109,117,.35); }
 .connection-dot.ok, .status-light.ok { background: var(--green); box-shadow: 0 0 10px rgba(88,230,169,.45); }
+.status-light.idle { background: var(--faint); box-shadow: none; }
+.status-light.pending { background: var(--amber); box-shadow: 0 0 10px rgba(255,197,104,.4); }
 
 .workspace { min-width: 0; }
 .topbar { height: 76px; padding: 0 34px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line); background: rgba(9,11,15,.88); backdrop-filter: blur(16px); position: sticky; top: 0; z-index: 5; }

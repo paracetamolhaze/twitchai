@@ -264,6 +264,7 @@ export interface BotPersona {
   id: string;
   name: string;
   description: string;
+  spokenAliases?: string[];
   identity: PersonaIdentity;
   familyBackground: string;
   family: PersonaRelative[];

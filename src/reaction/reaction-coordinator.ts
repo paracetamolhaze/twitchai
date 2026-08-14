@@ -19,6 +19,7 @@ import {
   ReactionBotCandidate,
   ReactionDecisionRecord,
   ReactionRejection,
+  ReactionTraceRecord,
   REACTION_BATCH_PROTOCOL_MAX_ITEMS,
   REACTION_MESSAGE_PROTOCOL_MAX_CHARACTERS,
   SubmittedReaction,
@@ -60,7 +61,7 @@ const batchEnvelopeSchema = z.object({
   reactions: z.array(z.unknown()).max(REACTION_BATCH_PROTOCOL_MAX_ITEMS),
 }).strict();
 const reactionItemSchema = z.object({
-  username: z.string().trim().min(1).max(50),
+  username: z.string().min(1).max(50).refine((value) => value.trim().length > 0),
   message: z.string().max(REACTION_MESSAGE_PROTOCOL_MAX_CHARACTERS),
 }).strict();
 
@@ -70,6 +71,7 @@ export class ReactionCoordinator extends EventEmitter {
   private readonly contextTtlMs: number;
   private readonly timers = new Map<NodeJS.Timeout, PlannedReaction>();
   private readonly pendingContexts = new Map<string, PendingContext>();
+  private readonly traces = new Map<string, ReactionTraceRecord>();
   private stopped = false;
 
   constructor(private readonly options: ReactionCoordinatorOptions) {
@@ -83,12 +85,44 @@ export class ReactionCoordinator extends EventEmitter {
     if (this.stopped) throw new Error('reaction_coordinator_stopped');
     const snapshot = this.options.contextStore.snapshot();
     this.options.memory.recordEvent(event, snapshot);
-    const eligibleCandidates = this.options.candidates()
+    const allCandidates = this.options.candidates();
+    const eligibleCandidates = allCandidates
       .filter((candidate) => candidate.enabled && candidate.connectionState === 'CONNECTED' && candidate.chatConnected);
     const directTargets = new Set(event.directMentions.map((username) => username.toLowerCase()));
     const candidates = directTargets.size > 0
       ? eligibleCandidates.filter((candidate) => directTargets.has(candidate.username.toLowerCase()))
       : eligibleCandidates;
+    const directTargetUnavailable = [...directTargets]
+      .filter((username) => !candidates.some((candidate) => candidate.username.toLowerCase() === username))
+      .map((username) => ({ username, reason: directTargetUnavailableReason(username, allCandidates) }));
+    const trace: ReactionTraceRecord = {
+      eventId: event.id,
+      timestamp: event.timestamp,
+      updatedAt: this.now(),
+      eventType: event.type,
+      summary: event.summary,
+      stage: 'EVENT_DETECTED',
+      outcome: 'PENDING',
+      eligibleBots: eligibleCandidates.length,
+      eligibleUsernames: eligibleCandidates.map((candidate) => candidate.username),
+      candidateCount: candidates.length,
+      directMentions: [...event.directMentions],
+      directTargetUnavailable,
+      geminiSelected: [],
+      policyAccepted: [],
+      policyRejected: [],
+      scheduled: [],
+      sent: [],
+      sendFailed: [],
+    };
+    this.traces.set(event.id, trace);
+    this.emitTrace(trace);
+    this.logger.info('Reaction trace: event detected', {
+      eventId: event.id,
+      eligibleBots: eligibleCandidates.length,
+      candidateCount: candidates.length,
+      directTargetUnavailable,
+    });
     const [histories, reactionExamples, globalStreamerMemories] = await Promise.all([
       Promise.all(candidates.map((candidate) => this.options.history.recent(candidate.username))),
       this.options.memory.retrieve(event, snapshot, this.options.retrievalLimit),
@@ -119,7 +153,7 @@ export class ReactionCoordinator extends EventEmitter {
     }));
     const expiresAt = this.now() + this.contextTtlMs;
     this.removePending(event.id);
-    const timer = setTimeout(() => this.removePending(event.id), this.contextTtlMs);
+    const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
     this.pendingContexts.set(event.id, {
       event,
       expiresAt,
@@ -129,6 +163,7 @@ export class ReactionCoordinator extends EventEmitter {
       viewerByUsername,
     });
     this.options.usage.recordReactionContextPrepared();
+    this.updateTrace(event.id, { stage: 'CANDIDATES_PREPARED' });
     return {
       eventId: event.id,
       event,
@@ -167,9 +202,14 @@ export class ReactionCoordinator extends EventEmitter {
     const parsed: ReactionBatch = { eventId: envelope.eventId, reactions };
     this.options.usage.recordReactionBatch();
     const pending = this.pendingContexts.get(parsed.eventId);
+    this.updateTrace(parsed.eventId, {
+      stage: 'GEMINI_SELECTED',
+      geminiSelected: envelope.reactions.map((reaction, index) => rawUsername(reaction, index)),
+    });
     if (!pending || pending.expiresAt <= this.now()) {
       this.removePending(parsed.eventId);
       this.options.usage.recordGuardRejection();
+      this.updateTrace(parsed.eventId, { stage: 'STOPPED', outcome: 'STALE', terminalReason: 'reaction_context_stale' });
       return { eventId: parsed.eventId, accepted: [], rejected: itemRejections, stale: true };
     }
     this.removePending(parsed.eventId);
@@ -177,6 +217,12 @@ export class ReactionCoordinator extends EventEmitter {
     itemRejections.forEach(() => this.options.usage.recordGuardRejection());
     if (parsed.reactions.length === 0) {
       this.options.usage.recordEmptyReactionBatch();
+      this.updateTrace(parsed.eventId, {
+        stage: 'POLICY_VALIDATED',
+        outcome: 'SILENT',
+        policyRejected: itemRejections,
+        terminalReason: 'gemini_selected_silence',
+      });
       this.emitDecision({
         eventId: parsed.eventId, timestamp: this.now(), selected: [], rejected: itemRejections,
         candidateCount: pending.candidateCount, silentCandidateCount: pending.candidateCount,
@@ -196,6 +242,13 @@ export class ReactionCoordinator extends EventEmitter {
       this.options.usage.recordGuardRejection();
       this.logger.warn('Gemini reaction rejected by policy', { eventId: parsed.eventId, bot: rejection.username, reason: rejection.reason });
     }
+    this.updateTrace(parsed.eventId, {
+      stage: 'POLICY_VALIDATED',
+      outcome: result.accepted.length > 0 ? 'PENDING' : 'FAILED',
+      policyAccepted: result.accepted.map((plan) => plan.bot.username),
+      policyRejected: allRejections,
+      ...(result.accepted.length === 0 ? { terminalReason: 'all_selected_reactions_rejected' } : {}),
+    });
     for (const plan of result.accepted) {
       const viewerUsername = pending.viewerByUsername.get(plan.bot.username.toLowerCase());
       if (viewerUsername) plan.viewerUsername = viewerUsername;
@@ -224,7 +277,12 @@ export class ReactionCoordinator extends EventEmitter {
   }
 
   clearPendingContexts(): void {
-    for (const pending of this.pendingContexts.values()) clearTimeout(pending.timer);
+    for (const [eventId, pending] of this.pendingContexts) {
+      clearTimeout(pending.timer);
+      this.updateTrace(eventId, {
+        stage: 'STOPPED', outcome: 'FAILED', terminalReason: 'gemini_disconnected_before_reaction_batch',
+      });
+    }
     this.pendingContexts.clear();
   }
 
@@ -234,6 +292,7 @@ export class ReactionCoordinator extends EventEmitter {
     for (const [timer, plan] of this.timers) {
       clearTimeout(timer);
       this.options.policy.releaseReservation(plan.reservationId);
+      this.recordSendFailure(plan.event.id, plan.bot.username, 'coordinator_stopped');
     }
     this.timers.clear();
   }
@@ -244,19 +303,28 @@ export class ReactionCoordinator extends EventEmitter {
       void this.execute(plan);
     }, plan.delayMs);
     this.timers.set(timer, plan);
+    const trace = this.traces.get(plan.event.id);
+    this.updateTrace(plan.event.id, {
+      stage: 'SCHEDULED',
+      outcome: 'SCHEDULED',
+      scheduled: appendUnique(trace?.scheduled ?? [], plan.bot.username),
+    });
     this.logger.info('Bot reaction queued', { bot: plan.bot.username, eventId: plan.event.id, delayMs: plan.delayMs });
   }
 
   private async execute(plan: PlannedReaction): Promise<void> {
+    this.logger.info('Reaction scheduler fired', { bot: plan.bot.username, eventId: plan.event.id });
     try {
       const current = this.options.candidates().find((candidate) => candidate.username === plan.bot.username);
       if (!current?.enabled || current.connectionState !== 'CONNECTED' || !current.chatConnected) {
         this.options.usage.recordSkipped();
+        this.recordSendFailure(plan.event.id, plan.bot.username, 'account_unavailable_at_send');
         return;
       }
       if (current.persona.id !== plan.bot.persona.id) {
         this.options.usage.recordSkipped();
         this.options.usage.recordGuardRejection();
+        this.recordSendFailure(plan.event.id, plan.bot.username, 'persona_reassigned');
         this.logger.warn('Queued reaction cancelled after persona reassignment', {
           bot: current.username,
           eventId: plan.event.id,
@@ -268,11 +336,13 @@ export class ReactionCoordinator extends EventEmitter {
       if (await this.options.history.isDuplicate(current.username, plan.message)) {
         this.options.usage.recordSkipped();
         this.options.usage.recordGuardRejection();
+        this.recordSendFailure(plan.event.id, plan.bot.username, 'recent_duplicate_at_send');
         return;
       }
       const sent = await this.options.sender.send(current.username, plan.message);
       if (!sent) {
         this.options.usage.recordSkipped();
+        this.recordSendFailure(plan.event.id, plan.bot.username, 'twitch_sender_returned_false');
         return;
       }
       await this.options.history.add(current.username, plan.message, plan.event.id);
@@ -297,9 +367,11 @@ export class ReactionCoordinator extends EventEmitter {
       }
       this.options.policy.recordSent(this.now(), plan.reservationId);
       this.options.usage.recordSentResponse();
+      this.recordSendSuccess(plan.event.id, current.username);
       this.logger.info('Bot reaction sent', { bot: current.username, eventId: plan.event.id, message: plan.message });
     } catch (cause) {
       this.options.usage.recordSkipped();
+      this.recordSendFailure(plan.event.id, plan.bot.username, safeErrorReason(cause));
       this.logger.warn('Queued bot reaction failed', { bot: plan.bot.username, eventId: plan.event.id, cause });
     } finally {
       this.options.policy.releaseReservation(plan.reservationId);
@@ -312,7 +384,78 @@ export class ReactionCoordinator extends EventEmitter {
     this.pendingContexts.delete(eventId);
   }
 
+  private expirePending(eventId: string): void {
+    this.removePending(eventId);
+    this.updateTrace(eventId, {
+      stage: 'STOPPED', outcome: 'FAILED', terminalReason: 'reaction_context_expired_before_gemini_batch',
+    });
+  }
+
+  private recordSendSuccess(eventId: string, username: string): void {
+    const trace = this.traces.get(eventId);
+    if (!trace) return;
+    const sent = appendUnique(trace.sent, username);
+    const completed = sent.length + trace.sendFailed.length >= trace.scheduled.length;
+    this.updateTrace(eventId, {
+      stage: 'SEND_SUCCEEDED',
+      sent,
+      outcome: completed ? (trace.sendFailed.length > 0 ? 'PARTIAL' : 'SENT') : 'SCHEDULED',
+      ...(completed ? { terminalReason: undefined } : {}),
+    });
+  }
+
+  private recordSendFailure(eventId: string, username: string, reason: string): void {
+    const trace = this.traces.get(eventId);
+    if (!trace) return;
+    const sendFailed = trace.sendFailed.some((item) => item.username === username)
+      ? trace.sendFailed
+      : [...trace.sendFailed, { username, reason }];
+    const completed = trace.sent.length + sendFailed.length >= trace.scheduled.length;
+    this.updateTrace(eventId, {
+      stage: 'SEND_FAILED',
+      sendFailed,
+      outcome: completed ? (trace.sent.length > 0 ? 'PARTIAL' : 'FAILED') : 'SCHEDULED',
+      terminalReason: reason,
+    });
+  }
+
+  private updateTrace(eventId: string, patch: Partial<ReactionTraceRecord>): void {
+    const current = this.traces.get(eventId);
+    if (!current) return;
+    const updated = { ...current, ...patch, updatedAt: this.now() };
+    this.traces.set(eventId, updated);
+    this.emitTrace(updated);
+    this.logger.info('Reaction trace advanced', {
+      eventId,
+      stage: updated.stage,
+      outcome: updated.outcome,
+      eligibleBots: updated.eligibleBots,
+      candidateCount: updated.candidateCount,
+      geminiSelected: updated.geminiSelected.length,
+      policyAccepted: updated.policyAccepted.length,
+      policyRejected: updated.policyRejected.length,
+      scheduled: updated.scheduled.length,
+      sent: updated.sent.length,
+      sendFailed: updated.sendFailed.length,
+      terminalReason: updated.terminalReason,
+    });
+  }
+
   private emitDecision(decision: ReactionDecisionRecord): void { this.emit('decision', decision); }
+  private emitTrace(trace: ReactionTraceRecord): void {
+    this.emit('trace', {
+      ...trace,
+      eligibleUsernames: [...trace.eligibleUsernames],
+      directMentions: [...trace.directMentions],
+      directTargetUnavailable: trace.directTargetUnavailable.map((item) => ({ ...item })),
+      geminiSelected: [...trace.geminiSelected],
+      policyAccepted: [...trace.policyAccepted],
+      policyRejected: trace.policyRejected.map((item) => ({ ...item })),
+      scheduled: [...trace.scheduled],
+      sent: [...trace.sent],
+      sendFailed: trace.sendFailed.map((item) => ({ ...item })),
+    } satisfies ReactionTraceRecord);
+  }
 }
 
 function globalMemoryQuery(
@@ -349,3 +492,23 @@ function directViewerFor(chat: Array<{ timestamp: number; username: string; mess
 }
 
 function escapeRegex(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function appendUnique(values: string[], value: string): string[] {
+  return values.includes(value) ? values : [...values, value];
+}
+
+function directTargetUnavailableReason(
+  username: string,
+  candidates: ReactionBotCandidate[],
+): 'unknown_bot' | 'disabled' | 'not_connected' | 'chat_disconnected' {
+  const candidate = candidates.find((item) => item.username.toLowerCase() === username);
+  if (!candidate) return 'unknown_bot';
+  if (!candidate.enabled) return 'disabled';
+  if (candidate.connectionState !== 'CONNECTED') return 'not_connected';
+  return 'chat_disconnected';
+}
+
+function safeErrorReason(cause: unknown): string {
+  if (cause instanceof Error) return cause.message.slice(0, 160) || cause.name;
+  return 'unknown_send_error';
+}

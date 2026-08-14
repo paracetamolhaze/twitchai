@@ -16,7 +16,13 @@ import { STREAMER_MEMORY_TYPES } from '../global-memory/types';
 import type { RecordStreamerMemoriesInput, StreamerMemory } from '../global-memory/types';
 import { ExponentialBackoff } from '../shared/backoff';
 import { UsageTracker } from '../usage/usage-tracker';
-import { StreamContextSnapshot, StreamEventCandidate } from './types';
+import {
+  GeminiClientState,
+  GeminiLiveDiagnostics,
+  GeminiOutboundTraceEntry,
+  StreamContextSnapshot,
+  StreamEventCandidate,
+} from './types';
 import { StreamBrainClient } from './stream-brain.client';
 
 export const PREPARE_REACTION_CONTEXT_TOOL = 'prepare_reaction_context';
@@ -30,7 +36,7 @@ export interface GeminiLiveClientHandlers {
   onPrepareReactionContext: (candidate: StreamEventCandidate) => Promise<unknown>;
   onEmitReactionBatch: (batch: unknown) => Promise<unknown>;
   onTranscript?: (text: string) => void;
-  onStatus?: (connected: boolean, error?: string) => void;
+  onStatus?: (connected: boolean, error?: string, diagnostics?: GeminiLiveDiagnostics) => void;
 }
 
 export interface GeminiLiveClientOptions {
@@ -41,8 +47,32 @@ export interface GeminiLiveClientOptions {
   usage: UsageTracker;
   reconnectMinimumMs?: number;
   reconnectMaximumMs?: number;
+  stabilityWindowMs?: number;
+  protocolErrorLimit?: number;
+  protocolErrorWindowMs?: number;
   connect?: (parameters: LiveConnectParameters) => Promise<Session>;
 }
+
+type InternalState = 'STOPPED' | 'DISCONNECTED' | 'CONNECTING' | 'SETUP_PENDING' | 'READY' | 'ERROR' | 'FATAL_CONFIG_ERROR';
+
+interface LiveFunctionCallLike {
+  id?: string;
+  name?: string;
+  args?: Record<string, unknown>;
+}
+
+interface DisconnectDetails {
+  connectionId: number;
+  source: 'close' | 'connect_failed' | 'go_away' | 'local_protocol';
+  message: string;
+  code?: number;
+  reason?: string;
+  wasClean?: boolean;
+  reconnectDelayMs?: number;
+}
+
+const OUTBOUND_TRACE_LIMIT = 20;
+const DEFERRED_TEXT_LIMIT = 10;
 
 export class GeminiLiveClient implements StreamBrainClient {
   private readonly ai: GoogleGenAI;
@@ -50,13 +80,38 @@ export class GeminiLiveClient implements StreamBrainClient {
   private readonly backoff: ExponentialBackoff;
   private session?: Session;
   private sessionStartedAt?: number;
-  private running = false;
-  private connecting?: Promise<void>;
+  private state: InternalState = 'STOPPED';
+  private desiredRunning = false;
+  private generation = 0;
+  private connectionSequence = 0;
+  private activeConnectionId?: number;
+  private connectPromise?: Promise<void>;
   private reconnectTimer?: NodeJS.Timeout;
+  private stabilityTimer?: NodeJS.Timeout;
   private resumptionHandle?: string;
   private lastContext?: StreamContextSnapshot;
-  /** Kept on the Live client so reconnects can replay it without overloading ContextStore. */
+  private contextDirty = false;
   private globalMemorySnapshot?: readonly StreamerMemory[];
+  private globalMemoryDirty = false;
+  private readonly deferredTextInputs: string[] = [];
+  private toolQueue: Promise<void> = Promise.resolve();
+  private pendingToolBatches = 0;
+  private readonly outboundTrace: GeminiOutboundTraceEntry[] = [];
+  private readonly protocolErrorTimes: number[] = [];
+  private stable = false;
+  private lastError?: string;
+  private lastCloseCode?: number;
+  private lastCloseReason?: string;
+  private lastCloseWasClean?: boolean;
+  private lastSessionAgeMs?: number;
+  private lastToolCall?: string;
+  private lastToolResponse?: string;
+  private lastMediaInput?: 'audio' | 'video';
+  private resumeAttempts = 0;
+  private freshReconnects = 0;
+  private audioChunksSent = 0;
+  private videoFramesSent = 0;
+  private transcriptsReceived = 0;
 
   constructor(private readonly options: GeminiLiveClientOptions) {
     this.ai = new GoogleGenAI({ apiKey: options.apiKey });
@@ -67,70 +122,160 @@ export class GeminiLiveClient implements StreamBrainClient {
     );
   }
 
-  isConnected(): boolean { return this.session !== undefined; }
+  isConnected(): boolean { return this.state === 'READY'; }
   getSessionStartedAt(): number | undefined { return this.sessionStartedAt; }
+  getDiagnostics(): GeminiLiveDiagnostics {
+    const lastOutbound = this.outboundTrace.at(-1)?.type;
+    return {
+      state: this.publicState(),
+      connected: this.isConnected(),
+      stable: this.stable,
+      sessionActive: Boolean(this.session),
+      ...(this.sessionStartedAt !== undefined ? { sessionStartedAt: this.sessionStartedAt } : {}),
+      ...(this.lastCloseCode !== undefined ? { lastCloseCode: this.lastCloseCode } : {}),
+      ...(this.lastCloseReason !== undefined ? { lastCloseReason: this.lastCloseReason } : {}),
+      ...(this.lastCloseWasClean !== undefined ? { lastCloseWasClean: this.lastCloseWasClean } : {}),
+      ...(this.lastSessionAgeMs !== undefined ? { lastSessionAgeMs: this.lastSessionAgeMs } : {}),
+      ...(lastOutbound ? { lastOutbound } : {}),
+      ...(this.lastToolCall ? { lastToolCall: this.lastToolCall } : {}),
+      ...(this.lastToolResponse ? { lastToolResponse: this.lastToolResponse } : {}),
+      ...(this.lastMediaInput ? { lastMediaInput: this.lastMediaInput } : {}),
+      outboundTrace: this.outboundTrace.map((entry) => ({ ...entry })),
+      audioChunksSent: this.audioChunksSent,
+      videoFramesSent: this.videoFramesSent,
+      transcriptsReceived: this.transcriptsReceived,
+      resumeAttempts: this.resumeAttempts,
+      freshReconnects: this.freshReconnects,
+      protocolErrorsInWindow: this.protocolErrorTimes.length,
+    };
+  }
 
   async start(): Promise<void> {
-    if (this.running) return this.connecting;
-    this.running = true;
-    await this.connect();
+    if (this.desiredRunning) {
+      if (this.connectPromise) return this.connectPromise;
+      if (this.state === 'DISCONNECTED' || this.state === 'ERROR') return this.connect(this.generation);
+      return;
+    }
+    this.desiredRunning = true;
+    this.generation += 1;
+    this.clearReconnectTimer();
+    this.clearStabilityTimer();
+    this.protocolErrorTimes.splice(0);
+    this.resumptionHandle = undefined;
+    this.stable = false;
+    this.lastError = undefined;
+    this.pendingToolBatches = 0;
+    this.toolQueue = Promise.resolve();
+    this.deferredTextInputs.splice(0);
+    await this.connect(this.generation);
   }
 
   stop(): void {
-    this.running = false;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = undefined;
+    this.desiredRunning = false;
+    this.generation += 1;
+    this.clearReconnectTimer();
+    this.clearStabilityTimer();
+    this.activeConnectionId = undefined;
     const session = this.session;
     this.session = undefined;
     this.sessionStartedAt = undefined;
+    this.connectPromise = undefined;
+    this.resumptionHandle = undefined;
+    this.pendingToolBatches = 0;
+    this.toolQueue = Promise.resolve();
+    this.deferredTextInputs.splice(0);
+    this.stable = false;
+    this.lastError = undefined;
     try { session?.close(); } catch { /* the socket may already be closed */ }
-    this.options.handlers.onStatus?.(false);
+    this.state = 'STOPPED';
+    this.notifyStatus();
   }
 
-  sendAudio(pcm: Buffer): void {
-    this.session?.sendRealtimeInput({
+  sendAudio(pcm: Buffer): boolean {
+    const session = this.session;
+    if (!this.canSendRealtime() || !session || pcm.length === 0) return false;
+    this.lastMediaInput = 'audio';
+    this.traceOperation('audio', pcm.length);
+    this.audioChunksSent += 1;
+    session.sendRealtimeInput({
       audio: { data: pcm.toString('base64'), mimeType: 'audio/pcm;rate=16000' },
     });
+    return true;
   }
 
-  sendVideo(jpeg: Buffer): void {
-    this.session?.sendRealtimeInput({
+  sendVideo(jpeg: Buffer): boolean {
+    const session = this.session;
+    if (!this.canSendRealtime() || !session || jpeg.length === 0) return false;
+    this.lastMediaInput = 'video';
+    this.traceOperation('video', jpeg.length);
+    this.videoFramesSent += 1;
+    session.sendRealtimeInput({
       video: { data: jpeg.toString('base64'), mimeType: 'image/jpeg' },
     });
+    return true;
   }
 
-  updateContext(snapshot: StreamContextSnapshot): void {
+  updateContext(snapshot: StreamContextSnapshot): boolean {
     this.lastContext = snapshot;
-    this.session?.sendRealtimeInput({ text: buildContextUpdate(snapshot) });
+    this.contextDirty = true;
+    if (!this.canSendRealtime()) return false;
+    return this.sendContextSnapshot();
   }
 
   updateGlobalMemorySnapshot(snapshot: readonly StreamerMemory[]): void {
     this.globalMemorySnapshot = snapshot.slice(0, GLOBAL_MEMORY_SNAPSHOT_MAX_ITEMS).map(cloneStreamerMemoryForSnapshot);
-    this.sendGlobalMemorySnapshot();
+    this.globalMemoryDirty = true;
+    if (this.canSendRealtime()) this.sendGlobalMemorySnapshot();
   }
 
-  requestReaction(candidate: StreamEventCandidate): void {
-    this.session?.sendRealtimeInput({
-      text: `TRUSTED REACTION SIGNAL\n${JSON.stringify(candidate)}\nEvaluate it now. If it is meaningful, call ${PREPARE_REACTION_CONTEXT_TOOL} first.`,
+  requestReaction(candidate: StreamEventCandidate): boolean {
+    if (!this.desiredRunning) return false;
+    const text = `TRUSTED REACTION SIGNAL\n${JSON.stringify(candidate)}\nEvaluate it now. If it is meaningful, call ${PREPARE_REACTION_CONTEXT_TOOL} first.`;
+    if (!this.canSendRealtime()) {
+      this.deferredTextInputs.push(text);
+      if (this.deferredTextInputs.length > DEFERRED_TEXT_LIMIT) this.deferredTextInputs.shift();
+      return false;
+    }
+    this.sendTextInput(text, 'reaction_signal');
+    return true;
+  }
+
+  private async connect(generation: number): Promise<void> {
+    if (!this.desiredRunning || generation !== this.generation || this.connectPromise || this.session) return this.connectPromise;
+    this.state = 'CONNECTING';
+    this.stable = false;
+    this.notifyStatus();
+    const connectionId = ++this.connectionSequence;
+    this.activeConnectionId = connectionId;
+    const connecting = this.openSession(generation, connectionId);
+    this.connectPromise = connecting;
+    await connecting.finally(() => {
+      if (this.connectPromise === connecting) this.connectPromise = undefined;
     });
   }
 
-  private async connect(): Promise<void> {
-    if (!this.running || this.connecting || this.session) return this.connecting;
-    this.options.handlers.onStatus?.(false);
-    this.connecting = this.openSession().finally(() => { this.connecting = undefined; });
-    return this.connecting;
-  }
-
-  private async openSession(): Promise<void> {
+  private async openSession(generation: number, connectionId: number): Promise<void> {
     try {
+      if (this.resumptionHandle) this.resumeAttempts += 1;
+      else this.freshReconnects += 1;
+
       const parameters: LiveConnectParameters = {
         model: this.options.model,
         callbacks: {
-          onopen: () => this.logger.info('Gemini Live socket opened', { model: this.options.model }),
-          onmessage: (message) => { void this.handleMessage(message); },
-          onerror: (event) => this.handleDisconnect(event.message || 'Gemini Live socket error'),
-          onclose: (event) => this.handleDisconnect(`Gemini Live socket closed (${event.code})`),
+          onopen: () => this.logger.info('Gemini Live socket opened', { model: this.options.model, connectionId }),
+          onmessage: (message) => { this.handleMessage(message, connectionId); },
+          onerror: (event) => this.logger.warn('Gemini Live socket error observed', {
+            connectionId,
+            error: event.message || 'Gemini Live socket error',
+          }),
+          onclose: (event) => this.handleDisconnect({
+            connectionId,
+            source: 'close',
+            message: `Gemini Live socket closed (${event.code})`,
+            code: event.code,
+            reason: event.reason || '',
+            wasClean: event.wasClean,
+          }),
         },
         config: {
           responseModalities: [Modality.AUDIO],
@@ -147,29 +292,42 @@ export class GeminiLiveClient implements StreamBrainClient {
           ] }],
         },
       };
+      this.traceOperation('connect');
       const session = await (this.options.connect ?? ((input) => this.ai.live.connect(input)))(parameters);
-      if (!this.running) {
+      if (!this.desiredRunning || generation !== this.generation || connectionId !== this.activeConnectionId) {
         session.close();
         return;
       }
       this.session = session;
+      this.state = 'SETUP_PENDING';
       this.sessionStartedAt = Date.now();
-      this.backoff.reset();
-      this.options.handlers.onStatus?.(true);
-      this.logger.info('Gemini Live connected', { model: this.options.model, resumed: Boolean(this.resumptionHandle) });
-      if (this.lastContext) this.updateContext(this.lastContext);
-      this.sendGlobalMemorySnapshot();
+      this.notifyStatus();
+      this.logger.info('Gemini Live connected, awaiting setup', { model: this.options.model, resumed: Boolean(this.resumptionHandle) });
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       this.logger.error('Gemini Live connection failed', { cause });
-      this.options.handlers.onStatus?.(false, message);
-      this.scheduleReconnect();
+      this.handleDisconnect({ connectionId, source: 'connect_failed', message });
     }
   }
 
-  private async handleMessage(message: LiveServerMessage): Promise<void> {
+  private handleMessage(message: LiveServerMessage & { setupComplete?: unknown }, connectionId: number): void {
+    if (connectionId !== this.activeConnectionId || !this.desiredRunning) return;
+    if (this.state === 'SETUP_PENDING' && message.setupComplete !== undefined) {
+      this.state = 'READY';
+      this.lastError = undefined;
+      this.backoff.reset();
+      this.contextDirty = Boolean(this.lastContext);
+      this.globalMemoryDirty = Boolean(this.globalMemorySnapshot);
+      this.logger.info('Gemini Live setup complete, starting transmission');
+      this.notifyStatus();
+      this.scheduleStable(connectionId);
+      this.flushDeferredInputs();
+    }
+
     if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate.newHandle) {
       this.resumptionHandle = message.sessionResumptionUpdate.newHandle;
+    } else if (message.sessionResumptionUpdate?.resumable === false) {
+      this.resumptionHandle = undefined;
     }
     if (message.usageMetadata) {
       this.options.usage.recordGeminiTokens(
@@ -178,80 +336,244 @@ export class GeminiLiveClient implements StreamBrainClient {
       );
     }
     const transcript = message.serverContent?.inputTranscription?.text?.trim();
-    if (transcript) this.options.handlers.onTranscript?.(transcript);
+    if (transcript) {
+      this.transcriptsReceived += 1;
+      this.options.handlers.onTranscript?.(transcript);
+    }
     for (const part of message.serverContent?.modelTurn?.parts ?? []) {
       if (part.text) this.logger.debug('Ignored Gemini voice-output text', { characters: part.text.length });
       if (part.inlineData?.data) this.logger.debug('Ignored Gemini voice-output audio', { bytes: part.inlineData.data.length });
     }
-    for (const call of message.toolCall?.functionCalls ?? []) await this.handleToolCall(call.id, call.name, call.args ?? {});
+    const calls = (message.toolCall?.functionCalls ?? []) as LiveFunctionCallLike[];
+    const toolProcessing = calls.length > 0 ? this.enqueueToolCalls(calls, connectionId, this.generation) : undefined;
     if (message.goAway) {
       const reason = 'Gemini Live requested a session rollover';
       this.logger.warn(reason, { timeLeft: message.goAway.timeLeft });
-      const session = this.session;
-      this.session = undefined;
-      this.sessionStartedAt = undefined;
-      this.options.handlers.onStatus?.(false, reason);
-      try { session?.close(); } catch { /* reconnect below */ }
-      this.scheduleReconnect(50);
-    }
-  }
-
-  private async handleToolCall(id: string | undefined, name: string | undefined, args: Record<string, unknown>): Promise<void> {
-    const activeSession = this.session;
-    if (!activeSession || !name) return;
-    this.options.usage.recordGeminiToolCall();
-    try {
-      let output: unknown;
-      if (name === PREPARE_REACTION_CONTEXT_TOOL) {
-        output = await this.options.handlers.onPrepareReactionContext(args as unknown as StreamEventCandidate);
-      } else if (name === EMIT_REACTION_BATCH_TOOL) {
-        output = await this.options.handlers.onEmitReactionBatch(args);
-      } else if (name === RECORD_STREAM_MEMORIES_TOOL) {
-        if (!isRecordStreamerMemoriesInput(args) || !this.options.handlers.onRecordStreamMemories) {
-          throw new Error('invalid memory batch');
-        }
-        output = await this.options.handlers.onRecordStreamMemories(args);
-      } else {
-        output = { error: 'unknown_tool' };
-      }
-      if (this.session !== activeSession) return;
-      activeSession.sendToolResponse({
-        functionResponses: [{ id, name, response: toToolResponse(output) }],
+      const disconnect = (): void => this.handleDisconnect({
+        connectionId,
+        source: 'go_away',
+        message: reason,
+        code: 1000,
+        reason,
+        wasClean: true,
+        reconnectDelayMs: 50,
       });
-    } catch (cause) {
-      const error = name === PREPARE_REACTION_CONTEXT_TOOL
-        ? 'invalid_event'
-        : name === RECORD_STREAM_MEMORIES_TOOL
-          ? 'invalid_memory_batch'
-          : 'invalid_reaction_batch';
-      this.logger.warn('Gemini Live tool call rejected', { tool: name, cause });
-      if (this.session !== activeSession) return;
-      activeSession.sendToolResponse({ functionResponses: [{ id, name, response: { error } }] });
+      if (toolProcessing) void toolProcessing.finally(disconnect);
+      else disconnect();
     }
   }
 
-  private handleDisconnect(error: string): void {
-    if (!this.running) return;
+  private enqueueToolCalls(calls: LiveFunctionCallLike[], connectionId: number, generation: number): Promise<void> {
+    this.pendingToolBatches += 1;
+    const processing = this.toolQueue.then(() => this.handleToolCalls(calls, connectionId));
+    this.toolQueue = processing.catch((cause: unknown) => {
+      this.logger.warn('Gemini Live tool batch failed', { cause });
+    }).finally(() => {
+      if (generation !== this.generation) return;
+      this.pendingToolBatches = Math.max(0, this.pendingToolBatches - 1);
+      if (this.pendingToolBatches === 0) this.flushDeferredInputs();
+    });
+    return this.toolQueue;
+  }
+
+  private async handleToolCalls(calls: LiveFunctionCallLike[], connectionId: number): Promise<void> {
+    const activeSession = this.session;
+    if (!activeSession || connectionId !== this.activeConnectionId) return;
+    const responses: Array<{ id: string; name: string; response: Record<string, unknown> }> = [];
+
+    for (const call of calls) {
+      const id = call.id?.trim();
+      const name = call.name?.trim();
+      if (!id || !name) {
+        this.handleDisconnect({
+          connectionId,
+          source: 'local_protocol',
+          message: 'Gemini Live tool call missing required id or name',
+          code: 1007,
+          reason: 'Tool call cannot be correlated without id and name',
+          wasClean: false,
+        });
+        return;
+      }
+      this.lastToolCall = name;
+      this.options.usage.recordGeminiToolCall();
+      try {
+        let output: unknown;
+        const args = call.args ?? {};
+        if (name === PREPARE_REACTION_CONTEXT_TOOL) {
+          output = await this.options.handlers.onPrepareReactionContext(args as unknown as StreamEventCandidate);
+        } else if (name === EMIT_REACTION_BATCH_TOOL) {
+          output = await this.options.handlers.onEmitReactionBatch(args);
+        } else if (name === RECORD_STREAM_MEMORIES_TOOL) {
+          if (!isRecordStreamerMemoriesInput(args) || !this.options.handlers.onRecordStreamMemories) {
+            throw new Error('invalid memory batch');
+          }
+          output = await this.options.handlers.onRecordStreamMemories(args);
+        } else {
+          output = { error: 'unknown_tool' };
+        }
+        responses.push({ id, name, response: toToolResponse(output) });
+      } catch (cause) {
+        const error = name === PREPARE_REACTION_CONTEXT_TOOL
+          ? 'invalid_event'
+          : name === RECORD_STREAM_MEMORIES_TOOL
+            ? 'invalid_memory_batch'
+            : 'invalid_reaction_batch';
+        this.logger.warn('Gemini Live tool call rejected', { tool: name, cause });
+        responses.push({ id, name, response: { error } });
+      }
+    }
+
+    if (this.session !== activeSession || connectionId !== this.activeConnectionId) return;
+    for (const response of responses) {
+      this.lastToolResponse = response.name;
+      this.traceOperation(`tool_response:${response.name}`);
+    }
+    activeSession.sendToolResponse({ functionResponses: responses });
+  }
+
+  private handleDisconnect(details: DisconnectDetails): void {
+    if (details.connectionId !== this.activeConnectionId) return;
+    const now = Date.now();
+    const sessionAgeMs = this.sessionStartedAt ? now - this.sessionStartedAt : 0;
+    const reason = details.reason?.trim();
+    const error = reason ? `${details.message}: ${reason}` : details.message;
+    const protocolError = details.code === 1007 || /invalid (?:argument|payload|tool response)|malformed/i.test(error);
+    if (protocolError) {
+      this.protocolErrorTimes.push(now);
+      const windowMs = this.options.protocolErrorWindowMs ?? 2 * 60_000;
+      while (this.protocolErrorTimes[0] !== undefined && this.protocolErrorTimes[0] < now - windowMs) {
+        this.protocolErrorTimes.shift();
+      }
+      this.resumptionHandle = undefined;
+    } else if (details.source !== 'go_away') {
+      this.protocolErrorTimes.splice(0);
+    }
+
+    this.clearStabilityTimer();
+    const session = this.session;
     this.session = undefined;
     this.sessionStartedAt = undefined;
-    this.options.handlers.onStatus?.(false, error);
-    this.logger.warn('Gemini Live disconnected', { error });
-    this.scheduleReconnect();
+    this.activeConnectionId = undefined;
+    this.stable = false;
+    this.lastError = error;
+    this.lastCloseCode = details.code;
+    this.lastCloseReason = reason || details.message;
+    this.lastCloseWasClean = details.wasClean;
+    this.lastSessionAgeMs = sessionAgeMs;
+    const circuitOpen = protocolError && this.protocolErrorTimes.length >= (this.options.protocolErrorLimit ?? 3);
+    this.state = circuitOpen ? 'FATAL_CONFIG_ERROR' : 'ERROR';
+    if (circuitOpen) this.desiredRunning = false;
+
+    this.logger.warn('Gemini disconnected', {
+      code: details.code,
+      reason: this.lastCloseReason,
+      wasClean: details.wasClean,
+      sessionAgeMs,
+      state: this.publicState(),
+      lastOutbound: this.outboundTrace.at(-1)?.type,
+      lastToolCall: this.lastToolCall,
+      lastToolResponse: this.lastToolResponse,
+      lastMediaInput: this.lastMediaInput,
+      outboundTrace: this.outboundTrace.map((entry) => entry.type),
+      protocolErrorsInWindow: this.protocolErrorTimes.length,
+      resumed: Boolean(this.resumptionHandle),
+    });
+    this.notifyStatus(error);
+
+    if (details.source !== 'close') {
+      try { session?.close(); } catch { /* a broken socket may reject close */ }
+    }
+    if (!circuitOpen) this.scheduleReconnect(details.reconnectDelayMs);
   }
 
   private scheduleReconnect(delayOverride?: number): void {
-    if (!this.running || this.reconnectTimer) return;
+    if (!this.desiredRunning || this.reconnectTimer || this.state === 'FATAL_CONFIG_ERROR') return;
+    const generation = this.generation;
     const delay = delayOverride ?? this.backoff.next();
-    this.options.usage.recordGeminiReconnect();
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      void this.connect();
+      if (!this.desiredRunning || generation !== this.generation) return;
+      this.options.usage.recordGeminiReconnect();
+      this.state = 'DISCONNECTED';
+      void this.connect(generation);
     }, delay);
   }
 
-  private sendGlobalMemorySnapshot(): void {
-    if (!this.session || !this.globalMemorySnapshot) return;
-    this.session.sendRealtimeInput({ text: buildGlobalMemorySnapshotUpdate(this.globalMemorySnapshot) });
+  private scheduleStable(connectionId: number): void {
+    this.clearStabilityTimer();
+    const delay = this.options.stabilityWindowMs ?? 30_000;
+    this.stabilityTimer = setTimeout(() => {
+      this.stabilityTimer = undefined;
+      if (connectionId !== this.activeConnectionId || this.state !== 'READY' || !this.desiredRunning) return;
+      this.stable = true;
+      this.protocolErrorTimes.splice(0);
+      this.notifyStatus();
+    }, delay);
+  }
+
+  private sendContextSnapshot(): boolean {
+    if (!this.canSendRealtime() || !this.lastContext) return false;
+    const text = buildContextUpdate(this.lastContext);
+    this.contextDirty = false;
+    this.sendTextInput(text, 'context_update');
+    return true;
+  }
+
+  private sendGlobalMemorySnapshot(): boolean {
+    if (!this.canSendRealtime() || !this.globalMemorySnapshot) return false;
+    const text = buildGlobalMemorySnapshotUpdate(this.globalMemorySnapshot);
+    this.globalMemoryDirty = false;
+    this.sendTextInput(text, 'memory_snapshot');
+    return true;
+  }
+
+  private flushDeferredInputs(): void {
+    if (!this.canSendRealtime()) return;
+    if (this.contextDirty) this.sendContextSnapshot();
+    if (this.globalMemoryDirty) this.sendGlobalMemorySnapshot();
+    while (this.deferredTextInputs.length > 0 && this.canSendRealtime()) {
+      this.sendTextInput(this.deferredTextInputs.shift()!, 'reaction_signal');
+    }
+  }
+
+  private sendTextInput(text: string, type: string): void {
+    if (!this.session) return;
+    this.traceOperation(type, Buffer.byteLength(text, 'utf8'));
+    this.session.sendRealtimeInput({ text });
+  }
+
+  private canSendRealtime(): boolean {
+    return this.desiredRunning && this.state === 'READY' && Boolean(this.session) && this.pendingToolBatches === 0;
+  }
+
+  private traceOperation(type: string, bytes?: number): void {
+    this.outboundTrace.push({ at: Date.now(), type, ...(bytes !== undefined ? { bytes } : {}) });
+    if (this.outboundTrace.length > OUTBOUND_TRACE_LIMIT) {
+      this.outboundTrace.splice(0, this.outboundTrace.length - OUTBOUND_TRACE_LIMIT);
+    }
+  }
+
+  private publicState(): GeminiClientState {
+    if (this.state === 'READY') return 'CONNECTED';
+    if (this.state === 'CONNECTING' || this.state === 'SETUP_PENDING' || this.state === 'DISCONNECTED') return 'CONNECTING';
+    if (this.state === 'FATAL_CONFIG_ERROR') return 'FATAL_CONFIG_ERROR';
+    if (this.state === 'ERROR') return 'ERROR';
+    return 'STOPPED';
+  }
+
+  private notifyStatus(error = this.lastError): void {
+    this.options.handlers.onStatus?.(this.isConnected(), error, this.getDiagnostics());
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+  }
+
+  private clearStabilityTimer(): void {
+    if (this.stabilityTimer) clearTimeout(this.stabilityTimer);
+    this.stabilityTimer = undefined;
   }
 }
 
@@ -264,6 +586,9 @@ For each meaningful moment:
 3. Review every eligible candidate, their behavioral context, targeted relevant canon, relevant memories, recent viewer conversation, recent messages, recent chat, retrieved real-viewer reaction examples, direct-mention flags, and constraints.
 4. Select zero or more appropriate candidates and write each final Twitch message yourself.
 5. Call emit_reaction_batch exactly once for that event. An empty reactions array is the preferred no-response result when nobody has something natural to add.
+
+Every reaction.username MUST be copied exactly from candidates[].username returned by prepare_reaction_context. Never invent, shorten, normalize, translate, alias, or replace a username.
+A clear streamer greeting to chat at the beginning of a stream is a socially meaningful conversation event. It is usually natural for one or occasionally two suitable active regulars to answer briefly, unless context strongly suggests silence. Do not make every candidate respond.
 
 Global Streamer Memory is durable channel knowledge shared across streams, not a raw transcript and not persona memory. A compact trusted snapshot may be supplied by the backend at stream start or after reconnect.
 Long-term memory is selective. Call record_stream_memories only when an observation is likely to remain useful on a future stream: a durable fact or preference, recurring person or relationship, plan or promise, meaningful result, trip/place, recurring joke, or important event.
@@ -325,8 +650,8 @@ const EMIT_REACTION_BATCH_DECLARATION = {
         items: {
           type: 'object', additionalProperties: false, required: ['username', 'message'],
           properties: {
-            username: { type: 'string', maxLength: 50 },
-            message: { type: 'string', maxLength: REACTION_MESSAGE_PROTOCOL_MAX_CHARACTERS },
+            username: { type: 'string', description: 'Copy exactly from candidates[].username returned by prepare_reaction_context.' },
+            message: { type: 'string', description: `Final Twitch message; backend limit is ${REACTION_MESSAGE_PROTOCOL_MAX_CHARACTERS} characters.` },
           },
         },
       },
@@ -346,18 +671,18 @@ const RECORD_STREAM_MEMORIES_DECLARATION = {
           type: 'object', additionalProperties: false, required: ['type', 'summary', 'importance', 'confidence'],
           properties: {
             type: { type: 'string', enum: STREAMER_MEMORY_TYPES },
-            summary: { type: 'string', minLength: 1, maxLength: 600 },
+            summary: { type: 'string', description: 'Concise durable memory summary; backend limit is 600 characters.' },
             details: { type: 'object', additionalProperties: true },
-            entities: { type: 'array', maxItems: 16, items: { type: 'string', minLength: 1, maxLength: 120 } },
-            tags: { type: 'array', maxItems: 16, items: { type: 'string', minLength: 1, maxLength: 80 } },
+            entities: { type: 'array', maxItems: 16, items: { type: 'string' } },
+            tags: { type: 'array', maxItems: 16, items: { type: 'string' } },
             importance: { type: 'number', minimum: 0, maximum: 1 },
             confidence: { type: 'number', minimum: 0, maximum: 1 },
-            occurredAt: { description: 'Optional epoch milliseconds or ISO-8601 time of the observed fact.' },
-            expiresAt: { description: 'Optional epoch milliseconds or ISO-8601 expiry; use null for no expiry.' },
+            occurredAt: { type: 'string', description: 'Optional ISO-8601 time of the observed fact.' },
+            expiresAt: { type: 'string', description: 'Optional ISO-8601 expiry; omit when the memory does not expire.' },
             expiresInHours: { type: 'number', minimum: 1, maximum: 8760 },
-            sourceEventId: { type: 'string', maxLength: 120 },
-            resolvesMemoryId: { type: 'string', maxLength: 120 },
-            supersedesMemoryId: { type: 'string', maxLength: 120 },
+            sourceEventId: { type: 'string' },
+            resolvesMemoryId: { type: 'string' },
+            supersedesMemoryId: { type: 'string' },
           },
         },
       },

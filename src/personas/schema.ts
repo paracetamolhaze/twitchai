@@ -196,6 +196,7 @@ export const personaSchema: z.ZodType<BotPersona> = z.object({
     rememberedStreamerMoments: stringList(50, 500),
   }).strict(),
   relationships: z.array(personaRelationshipSchema).max(100),
+  spokenAliases: stringList(10, 80).optional(),
 }).strict();
 
 export function upgradePersona(input: unknown, fallbackIndex = 0): BotPersona {
@@ -248,6 +249,7 @@ export function upgradePersona(input: unknown, fallbackIndex = 0): BotPersona {
     disclosure: mergeDisclosure(raw.disclosure),
     streamerRelationship: mergeStreamerRelationship(raw.streamerRelationship),
     relationships: validItems(raw.relationships, personaRelationshipSchema),
+    ...(raw.spokenAliases ? { spokenAliases: stringArray(raw.spokenAliases) } : {}),
   };
   return personaSchema.parse(persona);
 }

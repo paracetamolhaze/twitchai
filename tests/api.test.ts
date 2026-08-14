@@ -36,17 +36,27 @@ function server(twitchOAuth?: {
     port: 0, frontendUrls: ['http://localhost:5173'], dashboardToken: token, logger: new Logger('TEST', 'error'),
     health: () => ({ status: 'ok', twitch: true, streamBrain: true, gemini: true, database: true }),
     overview: () => ({ channel: 'channel', category: 'Dota 2', isLive: true, twitchConnected: true,
-      streamBrain: { state: 'CONNECTED', mediaConnected: true, geminiConnected: true }, activeBots: 1, totalBots: 1, uptimeSeconds: 5 }),
+      streamBrain: {
+        state: 'CONNECTED', mediaState: 'STREAMING', geminiState: 'CONNECTED',
+        mediaConnected: true, geminiConnected: true, geminiStable: true,
+        geminiSessionActive: true, geminiSessionReason: 'twitch_live',
+      }, activeBots: 1, totalBots: 1, uptimeSeconds: 5 }),
     bots: () => [{ username: 'bot', personaId: testPersona.id, enabled: true, connectionState: 'CONNECTED', chatConnected: true, messagesSent: 2 }],
     setBotEnabled: async () => 'updated',
     assignBotPersona: async () => 'updated',
     events: async () => [event],
     chat: () => [],
     usage: () => ({ startedAt: 0, uptimeSeconds: 1, streamMinutes: 0, audioMinutes: 0, videoMinutes: 0,
+      capturedAudioMinutes: 0, capturedVideoMinutes: 0, geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0,
       geminiReconnects: 0, geminiInputTokens: 0, geminiOutputTokens: 0, geminiToolCalls: 0,
       preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0, guardRejections: 0,
       eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0,
-      memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0 }),
+      memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0,
+      currentStream: {
+        active: true, startedAt: 0, durationMinutes: 0, capturedAudioMinutes: 0, capturedVideoMinutes: 0,
+        geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0, geminiReconnects: 0,
+        geminiInputTokens: 0, geminiOutputTokens: 0, sentResponses: 0,
+      } }),
     settings: async () => ({}), updateSettings: async () => ({ restartRequired: [] }),
     personas: () => testPersonas,
     personaSummaries: () => testPersonas.map((persona) => personaSummary(persona)),
@@ -131,8 +141,10 @@ describe('dashboard API', () => {
     const api = server();
     const bots = await request(api.app).get('/api/bots').set('Authorization', `Bearer ${token}`).expect(200);
     const events = await request(api.app).get('/api/events').set('Authorization', `Bearer ${token}`).expect(200);
+    const traces = await request(api.app).get('/api/reaction-traces').set('Authorization', `Bearer ${token}`).expect(200);
     expect(bots.body[0]).toMatchObject({ username: 'bot', connectionState: 'CONNECTED', chatConnected: true });
     expect(events.body[0]).toMatchObject({ id: event.id, summary: event.summary });
+    expect(traces.body).toEqual([]);
   });
 
   it('protects, edits and previews global streamer memories', async () => {
