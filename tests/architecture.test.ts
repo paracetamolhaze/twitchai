@@ -21,6 +21,6 @@ describe('single Stream Brain architecture', () => {
     expect(source).not.toContain('record_stream_event');
     expect(source.match(/new GeminiLiveClient\(/g)).toHaveLength(1);
     expect(readFileSync(join(process.cwd(), 'src', 'persistence', 'run-migrations.ts'), 'utf8'))
-      .toContain('004_deep_personas.sql');
+      .toContain('005_deep_persona_generation_v3.sql');
   });
 });

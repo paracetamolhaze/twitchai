@@ -19,6 +19,7 @@
     "test": "vitest run",
     "verify": "npm run lint && npm run typecheck && npm test && npm run build",
     "db:migrate": "tsx src/persistence/migrate.ts",
+    "personas:audit": "tsx src/personas/audit-cli.ts",
     "db:import:legacy": "tsx src/persistence/import-legacy-config.ts",
     "railway:import:twitch-accounts": "node scripts/import-twitch-accounts.mjs",
     "railway:migrate:variables": "node scripts/migrate-railway-variables.mjs"

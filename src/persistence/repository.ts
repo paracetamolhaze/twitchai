@@ -52,6 +52,15 @@ export interface TwitchOAuthNonceRecord {
   expiresAt: number;
 }
 
+export interface PersonaCanonBackupRecord {
+  personaId: string;
+  username?: string;
+  reason: string;
+  generationVersion: number;
+  canon: BotPersona;
+  createdAt: number;
+}
+
 export interface AppRepository {
   initialize(): Promise<void>;
   close(): Promise<void>;
@@ -59,6 +68,8 @@ export interface AppRepository {
   listPersonas(): Promise<BotPersona[]>;
   upsertPersona(persona: BotPersona): Promise<void>;
   deletePersona(id: string): Promise<void>;
+  savePersonaCanonBackup(backup: PersonaCanonBackupRecord): Promise<void>;
+  listPersonaCanonBackups(personaId: string, limit: number): Promise<PersonaCanonBackupRecord[]>;
   savePersonaMemory(memory: PersonaMemoryItem): Promise<void>;
   listPersonaMemories(personaId: string, limit: number): Promise<PersonaMemoryItem[]>;
   deletePersonaMemory(id: string, personaId: string): Promise<boolean>;

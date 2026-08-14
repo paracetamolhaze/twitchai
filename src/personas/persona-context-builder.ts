@@ -5,7 +5,7 @@ import { PersonaRuntimeStore } from './persona-runtime-store';
 import { BotPersona, PersonaConversationMessage, PersonaMemoryItem, PersonaRuntimeState } from './types';
 
 export interface RelevantCanonItem {
-  kind: 'relative' | 'fact' | 'timeline' | 'opinion';
+  kind: 'identity' | 'family-background' | 'relative' | 'fact' | 'timeline' | 'opinion';
   id: string;
   value: string;
   importance: number;
@@ -17,7 +17,9 @@ export interface PersonaReactionContext {
   fictionalPersona: true;
   identity: {
     firstName: string;
+    preferredName?: string;
     nickname?: string;
+    nicknameOrigin?: string;
     age?: number;
     birthDate?: string;
     birthplace?: string;
@@ -36,11 +38,15 @@ export interface PersonaReactionContext {
   speech: {
     summary: string;
     favoriteExpressions: string[];
+    openingPatterns: string[];
+    endingPatterns: string[];
     fillerWords: string[];
+    abbreviations: string[];
     laughStyles: string[];
     avoidedExpressions: string[];
     typoStyle: string[];
     emojiPreferences: string[];
+    twitchEmotes: string[];
     profanityLevel: number;
     messageExamples: string[];
   };
@@ -59,6 +65,7 @@ export interface PersonaReactionContext {
   };
   knowledge: BotPersona['knowledge'];
   interests: BotPersona['interests'];
+  disclosure: BotPersona['disclosure'];
   streamerRelationship: Pick<BotPersona['streamerRelationship'], 'firstSeen' | 'familiarity' | 'supportiveness' | 'teasingLevel' | 'favoriteStreamTypes' | 'recurringReferences'>;
   runtime: PersonaRuntimeState;
   canonicalAuthority: string;
@@ -110,13 +117,16 @@ export class PersonaContextBuilder {
     ]);
     const identity = input.persona.identity;
     const age = ageFromBirthDate(identity.birthDate, new Date(input.event.timestamp));
+    const exposeNicknameOrigin = input.directMention && /ник|nickname|зовут|имя|откуда/iu.test(topic);
     return {
       username: input.username,
       personaId: input.persona.id,
       fictionalPersona: true,
       identity: {
         firstName: identity.firstName,
+        ...(identity.preferredName ? { preferredName: identity.preferredName } : {}),
         ...(identity.nickname ? { nickname: identity.nickname } : {}),
+        ...(exposeNicknameOrigin && identity.nicknameOrigin ? { nicknameOrigin: identity.nicknameOrigin } : {}),
         ...(age !== undefined ? { age } : {}),
         ...(identity.birthDate ? { birthDate: identity.birthDate } : {}),
         ...(identity.birthplace && (identity.birthplace.city || identity.birthplace.country) ? { birthplace: formatLocation(identity.birthplace) } : {}),
@@ -135,13 +145,17 @@ export class PersonaContextBuilder {
       speech: {
         summary: `${input.persona.speech.averageMessageWords} слов в среднем; ${input.persona.speech.punctuationStyle}; ${input.persona.speech.capitalizationStyle}`,
         favoriteExpressions: input.persona.speech.favoriteExpressions.slice(0, 5),
+        openingPatterns: input.persona.speech.openingPatterns.slice(0, 4),
+        endingPatterns: input.persona.speech.endingPatterns.slice(0, 4),
         fillerWords: input.persona.speech.fillerWords.slice(0, 5),
+        abbreviations: input.persona.speech.abbreviations.slice(0, 5),
         laughStyles: input.persona.speech.laughStyles.slice(0, 4),
         avoidedExpressions: input.persona.speech.avoidedExpressions.slice(0, 5),
         typoStyle: input.persona.speech.typoStyle.slice(0, 3),
         emojiPreferences: input.persona.speech.emojiPreferences.slice(0, 4),
+        twitchEmotes: input.persona.speech.twitchEmotes.slice(0, 4),
         profanityLevel: input.persona.speech.profanityLevel,
-        messageExamples: input.persona.speech.messageExamples.slice(0, 4),
+        messageExamples: selectSpeechExamples(input.persona, topic, 5),
       },
       behavior: {
         styleInstructions: input.persona.behavior.styleInstructions,
@@ -149,6 +163,7 @@ export class PersonaContextBuilder {
         activity: {
           ...input.persona.behavior.activity,
           preferredEventTypes: input.persona.behavior.activity.preferredEventTypes.slice(0, 8),
+          ignoredEventTypes: input.persona.behavior.activity.ignoredEventTypes.slice(0, 8),
         },
         reactionProbability: input.persona.behavior.reactionProbability,
         uppercaseProbability: input.persona.behavior.uppercaseProbability,
@@ -176,6 +191,7 @@ export class PersonaContextBuilder {
         food: input.persona.interests.food.slice(0, 6),
         other: input.persona.interests.other.slice(0, 6),
       },
+      disclosure: structuredClone(input.persona.disclosure),
       streamerRelationship: {
         ...(input.persona.streamerRelationship.firstSeen ? { firstSeen: input.persona.streamerRelationship.firstSeen } : {}),
         familiarity: input.persona.streamerRelationship.familiarity,
@@ -210,6 +226,16 @@ export function selectRelevantCanon(persona: BotPersona, query: string, limit = 
 }
 
 function canonDocuments(persona: BotPersona): CanonDocument[] {
+  const identity: CanonDocument[] = [
+    ...(persona.identity.nicknameOrigin ? [{
+      item: { kind: 'identity' as const, id: `${persona.id}-nickname-origin`, importance: 1, value: `История ника ${persona.identity.nickname ?? ''}: ${persona.identity.nicknameOrigin}` },
+      searchable: `ник nickname откуда имя ${persona.identity.nickname ?? ''} ${persona.identity.nicknameOrigin}`,
+    }] : []),
+    ...(persona.familyBackground ? [{
+      item: { kind: 'family-background' as const, id: `${persona.id}-family-background`, importance: 0.88, value: persona.familyBackground },
+      searchable: `семья детство родители родственники ${persona.familyBackground}`,
+    }] : []),
+  ];
   const relatives: CanonDocument[] = persona.family.map((relative) => ({
     item: {
       kind: 'relative', id: relative.id, importance: 0.95,
@@ -228,7 +254,16 @@ function canonDocuments(persona: BotPersona): CanonDocument[] {
     item: { kind: 'opinion', id: opinion.id, value: `${opinion.topic}: ${opinion.stance}`, importance: opinion.strength },
     searchable: `${opinion.topic} ${opinion.stance} ${opinion.reasoning ?? ''} ${opinion.tags.join(' ')}`,
   }));
-  return [...relatives, ...facts, ...timeline, ...opinions];
+  return [...identity, ...relatives, ...facts, ...timeline, ...opinions];
+}
+
+function selectSpeechExamples(persona: BotPersona, query: string, limit: number): string[] {
+  const queryTokens = semanticTokens(query);
+  return persona.speech.messageExamples
+    .map((example, index) => ({ example, index, score: relevanceScore(queryTokens, example) }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .slice(0, limit)
+    .map(({ example }) => example);
 }
 
 function expandRelationWords(value: string): string {

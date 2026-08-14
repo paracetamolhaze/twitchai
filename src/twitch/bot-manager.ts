@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import tmi from 'tmi.js';
 import { BotAccountConfig } from '../config';
 import { Logger } from '../logger';
-import { PersonaStore } from '../personas/persona-store';
+import { PersonaAssignmentProblem, PersonaStore } from '../personas/persona-store';
 import { AppRepository, BotAccountRecord } from '../persistence/repository';
 import { ReactionBotCandidate } from '../reaction/types';
 import { ChatMessage } from '../stream-brain/types';
@@ -29,7 +29,8 @@ export interface TwitchBotManagerOptions {
 }
 
 export type TwitchChatClient = Pick<tmi.Client, 'connect' | 'disconnect' | 'say' | 'on'>;
-export type PersonaAssignmentResult = 'updated' | 'bot_not_found' | 'persona_not_found' | 'persona_in_use';
+export type PersonaAssignmentResult = 'updated' | 'bot_not_found' | 'persona_not_found' | 'persona_in_use' | PersonaAssignmentProblem;
+export type BotEnabledResult = 'updated' | 'bot_not_found' | PersonaAssignmentProblem;
 
 export class TwitchBotManager extends EventEmitter {
   private readonly bots = new Map<string, ManagedBot>();
@@ -72,19 +73,31 @@ export class TwitchBotManager extends EventEmitter {
       usedPersonaIds.add(persona.id);
       bot.config.personaId = persona.id;
       bot.status.personaId = persona.id;
-      if (!previous) continue;
-      // Environment configuration is the safety ceiling: an account imported as
-      // ineligible (for example, because its token lacks modern chat scopes)
-      // must not be re-enabled by stale persisted dashboard state.
-      bot.config.enabled = bot.config.enabled && previous.enabled;
-      bot.status = {
-        ...bot.status,
-        enabled: bot.config.enabled,
-        connectionState: bot.config.enabled ? 'DISCONNECTED' : 'DISABLED',
-        messagesSent: previous.messagesSent,
-        ...(previous.lastMessage ? { lastMessage: previous.lastMessage } : {}),
-        ...(previous.lastReactionAt ? { lastReactionAt: previous.lastReactionAt } : {}),
-      };
+      if (previous) {
+        // Environment configuration is the safety ceiling: an account imported as
+        // ineligible (for example, because its token lacks modern chat scopes)
+        // must not be re-enabled by stale persisted dashboard state.
+        bot.config.enabled = bot.config.enabled && previous.enabled;
+        bot.status = {
+          ...bot.status,
+          enabled: bot.config.enabled,
+          connectionState: bot.config.enabled ? 'DISCONNECTED' : 'DISABLED',
+          messagesSent: previous.messagesSent,
+          ...(previous.lastMessage ? { lastMessage: previous.lastMessage } : {}),
+          ...(previous.lastReactionAt ? { lastReactionAt: previous.lastReactionAt } : {}),
+        };
+      }
+      const assignmentProblem = this.options.personas.assignmentProblem(bot.config.username, persona.id);
+      if (assignmentProblem) {
+        bot.config.enabled = false;
+        bot.status = {
+          ...bot.status,
+          enabled: false,
+          connectionState: 'DISABLED',
+          chatConnected: false,
+          lastError: assignmentProblemMessage(assignmentProblem),
+        };
+      }
     }
     await Promise.all([...this.bots.values()].map((bot) => this.persist(bot)));
   }
@@ -126,25 +139,31 @@ export class TwitchBotManager extends EventEmitter {
     }));
   }
 
-  async setEnabled(username: string, enabled: boolean): Promise<boolean> {
+  async setEnabled(username: string, enabled: boolean): Promise<BotEnabledResult> {
     const bot = this.bots.get(username.toLowerCase());
-    if (!bot) return false;
+    if (!bot) return 'bot_not_found';
+    if (enabled) {
+      const assignmentProblem = this.options.personas.assignmentProblem(bot.config.username, bot.config.personaId);
+      if (assignmentProblem) return assignmentProblem;
+    }
     bot.config.enabled = enabled;
     if (!enabled) {
       try { await bot.client?.disconnect(); } catch { /* no-op */ }
       bot.client = undefined;
       await this.patch(bot, { enabled: false, connectionState: 'DISABLED', chatConnected: false });
     } else {
-      await this.patch(bot, { enabled: true, connectionState: 'DISCONNECTED', chatConnected: false });
+      await this.patch(bot, { enabled: true, connectionState: 'DISCONNECTED', chatConnected: false, lastError: undefined });
       void this.connectBot(bot);
     }
-    return true;
+    return 'updated';
   }
 
   async assignPersona(username: string, personaId: string): Promise<PersonaAssignmentResult> {
     const bot = this.bots.get(username.toLowerCase());
     if (!bot) return 'bot_not_found';
     if (!this.options.personas.has(personaId)) return 'persona_not_found';
+    const assignmentProblem = this.options.personas.assignmentProblem(bot.config.username, personaId);
+    if (assignmentProblem) return assignmentProblem;
     if (bot.config.personaId === personaId) return 'updated';
     const alreadyAssigned = [...this.bots.values()].some((candidate) =>
       candidate !== bot && candidate.config.personaId === personaId)
@@ -153,7 +172,7 @@ export class TwitchBotManager extends EventEmitter {
     if (alreadyAssigned) return 'persona_in_use';
     const previousPersonaId = bot.config.personaId;
     bot.config.personaId = personaId;
-    bot.status = { ...bot.status, personaId };
+    bot.status = { ...bot.status, personaId, lastError: undefined };
     try {
       await this.persist(bot);
     } catch (error) {
@@ -161,8 +180,27 @@ export class TwitchBotManager extends EventEmitter {
       bot.status = { ...bot.status, personaId: previousPersonaId };
       throw error;
     }
+    this.options.personas.unregisterAssignment(previousPersonaId);
+    this.options.personas.registerAssignment(bot.config.username, personaId);
     this.emit('status', this.listStatuses());
     return 'updated';
+  }
+
+  async revalidatePersona(personaId: string): Promise<void> {
+    const affected = [...this.bots.values()].filter((bot) => bot.config.personaId === personaId);
+    await Promise.allSettled(affected.map(async (bot) => {
+      const assignmentProblem = this.options.personas.assignmentProblem(bot.config.username, personaId);
+      if (!assignmentProblem) return;
+      bot.config.enabled = false;
+      try { await bot.client?.disconnect(); } catch { /* the account is disabled regardless of disconnect outcome */ }
+      bot.client = undefined;
+      await this.patch(bot, {
+        enabled: false,
+        connectionState: 'DISABLED',
+        chatConnected: false,
+        lastError: assignmentProblemMessage(assignmentProblem),
+      });
+    }));
   }
 
   async upsertAuthorizedAccount(account: BotAccountConfig, previousUsername?: string): Promise<void> {
@@ -175,22 +213,25 @@ export class TwitchBotManager extends EventEmitter {
       ]);
       const persona = await this.options.personas.ensureUniqueForAccount(username, account.personaId, usedPersonaIds);
       const personaId = persona.id;
+      const assignmentProblem = this.options.personas.assignmentProblem(username, personaId);
+      const enabled = account.enabled && !assignmentProblem;
       const bot: ManagedBot = {
-        config: { ...account, username, personaId },
+        config: { ...account, username, personaId, enabled },
         sentAt: [],
         status: {
           username,
           personaId,
-          enabled: account.enabled,
-          connectionState: account.enabled ? 'DISCONNECTED' : 'DISABLED',
+          enabled,
+          connectionState: enabled ? 'DISCONNECTED' : 'DISABLED',
           chatConnected: false,
           messagesSent: 0,
+          ...(assignmentProblem ? { lastError: assignmentProblemMessage(assignmentProblem) } : {}),
         },
       };
       this.bots.set(username, bot);
       await this.persist(bot);
       this.emit('status', this.listStatuses());
-      if (this.channel && account.enabled) await this.connectBot(bot);
+      if (this.channel && enabled) await this.connectBot(bot);
       return;
     }
 
@@ -198,10 +239,12 @@ export class TwitchBotManager extends EventEmitter {
     try { await existing.client?.disconnect(); } catch { /* already disconnected */ }
     existing.client = undefined;
     existing.config.oauthToken = account.oauthToken;
+    const assignmentProblem = this.options.personas.assignmentProblem(existing.config.username, existing.config.personaId);
+    if (assignmentProblem) existing.config.enabled = false;
     await this.patch(existing, {
       connectionState: existing.config.enabled ? 'DISCONNECTED' : 'DISABLED',
       chatConnected: false,
-      lastError: undefined,
+      lastError: assignmentProblem ? assignmentProblemMessage(assignmentProblem) : undefined,
     });
     if (this.channel && existing.config.enabled) await this.connectBot(existing);
   }
@@ -350,4 +393,10 @@ export class TwitchBotManager extends EventEmitter {
   }
 
   private async persist(bot: ManagedBot): Promise<void> { await this.options.repository.upsertBot(bot.status); }
+}
+
+function assignmentProblemMessage(problem: PersonaAssignmentProblem): string {
+  return problem === 'persona_username_mismatch'
+    ? 'Личность создана для другого Twitch-аккаунта'
+    : 'Заполните и проверьте ручную личность перед включением аккаунта';
 }

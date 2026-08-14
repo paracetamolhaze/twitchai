@@ -7,6 +7,7 @@ const MIGRATIONS = [
   '002_twitch_oauth.sql',
   '003_twitch_oauth_credential_version.sql',
   '004_deep_personas.sql',
+  '005_deep_persona_generation_v3.sql',
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

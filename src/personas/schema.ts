@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import {
   BotPersona,
+  PERSONA_EDITABLE_PATHS,
+  PERSONA_GENERATION_VERSION,
   PERSONA_SCHEMA_VERSION,
   PersonaSummary,
 } from './types';
@@ -18,7 +20,9 @@ export const personaLocationSchema = z.object({
 
 export const personaIdentitySchema = z.object({
   firstName: z.string().trim().max(100),
+  preferredName: optionalText(100),
   nickname: optionalText(100),
+  nicknameOrigin: optionalText(1_000),
   birthDate: isoDate,
   birthplace: personaLocationSchema.optional(),
   grewUpIn: personaLocationSchema.optional(),
@@ -51,7 +55,7 @@ export const personaLifeEventSchema = z.object({
 
 export const personaFactSchema = z.object({
   id: nonEmpty(100),
-  category: z.enum(['family', 'childhood', 'education', 'work', 'gaming', 'food', 'music', 'travel', 'technology', 'relationships', 'habit', 'preference', 'story', 'other']),
+  category: z.enum(['family', 'childhood', 'education', 'work', 'gaming', 'food', 'music', 'travel', 'technology', 'automotive', 'animals', 'art', 'biology', 'law', 'money', 'sport', 'imperfection', 'relationships', 'habit', 'preference', 'story', 'other']),
   fact: nonEmpty(600),
   importance: probability,
   privateByDefault: z.boolean().optional(),
@@ -70,16 +74,20 @@ export const personaOpinionSchema = z.object({
 
 export const speechFingerprintSchema = z.object({
   averageMessageWords: z.number().int().min(1).max(80),
+  openingPatterns: stringList(30, 160),
+  endingPatterns: stringList(30, 160),
   vocabulary: stringList(80, 100),
   favoriteExpressions: stringList(30, 160),
   rareExpressions: stringList(30, 160),
   avoidedExpressions: stringList(30, 160),
   fillerWords: stringList(30, 80),
+  abbreviations: stringList(30, 80),
   typoStyle: stringList(20, 200),
   punctuationStyle: nonEmpty(300),
   capitalizationStyle: nonEmpty(300),
   laughStyles: stringList(20, 80),
   emojiPreferences: stringList(20, 40),
+  twitchEmotes: stringList(20, 80),
   profanityLevel: probability,
   messageExamples: stringList(20, 400),
 }).strict();
@@ -89,6 +97,7 @@ const activitySchema = z.object({
   directReplyLikelihood: probability,
   eventSelectivity: probability,
   preferredEventTypes: stringList(20, 80),
+  ignoredEventTypes: stringList(20, 80),
   averageDelayMs: z.object({
     min: z.number().int().min(0).max(300_000),
     max: z.number().int().min(0).max(300_000),
@@ -128,11 +137,18 @@ export const personaBehaviorSchema = z.object({
 
 export const personaSchema: z.ZodType<BotPersona> = z.object({
   schemaVersion: z.literal(PERSONA_SCHEMA_VERSION),
+  generationVersion: z.number().int().min(0).max(10_000),
+  source: z.enum(['generated', 'manual']),
+  generatedFromUsername: optionalText(100),
+  manuallyEdited: z.boolean(),
+  manualOverrides: z.array(z.enum(PERSONA_EDITABLE_PATHS)).max(PERSONA_EDITABLE_PATHS.length),
+  legacyManualReviewRequired: z.boolean(),
   fictionalPersona: z.literal(true),
   id: nonEmpty(80).regex(/^[a-z0-9][a-z0-9_-]*$/),
   name: nonEmpty(120),
   description: nonEmpty(1_000),
   identity: personaIdentitySchema,
+  familyBackground: z.string().trim().max(2_000),
   family: z.array(personaRelativeSchema).max(30),
   timeline: z.array(personaLifeEventSchema).max(100),
   facts: z.array(personaFactSchema).max(500),
@@ -159,6 +175,17 @@ export const personaSchema: z.ZodType<BotPersona> = z.object({
   }).strict(),
   speech: speechFingerprintSchema,
   behavior: personaBehaviorSchema,
+  disclosure: z.object({
+    defaultLevel: z.enum(['open', 'moderate', 'private']),
+    privatePerson: z.boolean(),
+    topics: z.object({
+      family: z.enum(['open', 'moderate', 'private']),
+      work: z.enum(['open', 'moderate', 'private']),
+      relationships: z.enum(['open', 'moderate', 'private']),
+      money: z.enum(['open', 'moderate', 'private']),
+      location: z.enum(['open', 'moderate', 'private']),
+    }).strict(),
+  }).strict(),
   streamerRelationship: z.object({
     firstSeen: optionalText(80),
     familiarity: probability,
@@ -184,13 +211,21 @@ export function upgradePersona(input: unknown, fallbackIndex = 0): BotPersona {
   const legacyInterests = stringArray(raw.interests);
   const persona: BotPersona = {
     schemaVersion: PERSONA_SCHEMA_VERSION,
+    generationVersion: integer(raw.generationVersion, 0, 0, 10_000),
+    source: raw.source === 'generated' ? 'generated' : 'manual',
+    ...optional('generatedFromUsername', textOrUndefined(raw.generatedFromUsername)),
+    manuallyEdited: typeof raw.manuallyEdited === 'boolean' ? raw.manuallyEdited : true,
+    manualOverrides: stringArray(raw.manualOverrides).filter(isPersonaEditablePath),
+    legacyManualReviewRequired: raw.legacyManualReviewRequired === true,
     fictionalPersona: true,
     id,
     name,
     description: text(raw.description) || 'Вымышленный постоянный зритель; биография пока не заполнена.',
     identity: {
       firstName: text(identityRaw.firstName) || name.split(/\s+/)[0] || '',
+      ...optional('preferredName', textOrUndefined(identityRaw.preferredName)),
       ...optional('nickname', textOrUndefined(identityRaw.nickname)),
+      ...optional('nicknameOrigin', textOrUndefined(identityRaw.nicknameOrigin)),
       ...optional('birthDate', validIsoDate(identityRaw.birthDate)),
       ...optional('birthplace', locationOrUndefined(identityRaw.birthplace)),
       ...optional('grewUpIn', locationOrUndefined(identityRaw.grewUpIn)),
@@ -200,6 +235,7 @@ export function upgradePersona(input: unknown, fallbackIndex = 0): BotPersona {
       ...optional('education', textOrUndefined(identityRaw.education)),
       ...optional('relationshipStatus', textOrUndefined(identityRaw.relationshipStatus)),
     },
+    familyBackground: text(raw.familyBackground),
     family: validItems(raw.family, personaRelativeSchema),
     timeline: validItems(raw.timeline, personaLifeEventSchema),
     facts: validItems(raw.facts, personaFactSchema),
@@ -209,6 +245,7 @@ export function upgradePersona(input: unknown, fallbackIndex = 0): BotPersona {
     interests: mergeInterests(raw.interests, legacyInterests),
     speech: mergeSpeech(raw.speech, raw, seed),
     behavior: mergeBehavior(behaviorRaw, raw, seed),
+    disclosure: mergeDisclosure(raw.disclosure),
     streamerRelationship: mergeStreamerRelationship(raw.streamerRelationship),
     relationships: validItems(raw.relationships, personaRelationshipSchema),
   };
@@ -219,6 +256,11 @@ export function createBlankPersona(id: string, name = 'Новая личност
   return upgradePersona({
     id,
     name,
+    generationVersion: PERSONA_GENERATION_VERSION,
+    source: 'manual',
+    manuallyEdited: true,
+    manualOverrides: [],
+    legacyManualReviewRequired: false,
     description: 'Вымышленный постоянный зритель; заполните устойчивую биографию.',
     identity: { firstName: name.split(/\s+/)[0] ?? '', languages: [] },
   });
@@ -263,8 +305,29 @@ export function personaSummary(persona: BotPersona, now = new Date()): PersonaSu
     ...(age !== undefined ? { age } : {}),
     ...(persona.identity.currentLocation?.city ? { city: persona.identity.currentLocation.city } : {}),
     ...(persona.identity.occupation ? { occupation: persona.identity.occupation } : {}),
+    quickSummary: buildQuickPersonaSummary(persona, now),
     completeness: personaCompleteness(persona),
+    uniqueness: 100,
+    consistency: 100,
+    similarityReasons: [],
+    qualityWarnings: [],
   };
+}
+
+export function buildQuickPersonaSummary(persona: BotPersona, now = new Date()): string {
+  const age = ageFromBirthDate(persona.identity.birthDate, now);
+  const identity = [
+    persona.identity.preferredName && persona.identity.preferredName !== persona.identity.firstName
+      ? `${persona.identity.firstName} «${persona.identity.preferredName}»`
+      : persona.identity.firstName,
+    age === undefined ? undefined : `${age}`,
+  ].filter(Boolean).join(', ');
+  const birth = persona.identity.birthplace?.city ? `Родился(ась) в ${persona.identity.birthplace.city}.` : '';
+  const current = persona.identity.currentLocation?.city
+    ? `Сейчас живёт в ${persona.identity.currentLocation.city}${persona.identity.occupation ? ` и работает: ${persona.identity.occupation}` : ''}.`
+    : persona.identity.occupation ? `Работает: ${persona.identity.occupation}.` : '';
+  return [identity, birth, current, persona.character.summary, persona.streamerRelationship.favoriteStreamTypes.length
+    ? `На Twitch чаще выбирает: ${persona.streamerRelationship.favoriteStreamTypes.join(', ')}.` : ''].filter(Boolean).join('\n');
 }
 
 function mergeKnowledge(value: unknown): BotPersona['knowledge'] {
@@ -305,16 +368,20 @@ function mergeSpeech(value: unknown, legacy: Record<string, unknown>, seed: numb
   const vocabulary = stringArray(raw.vocabulary);
   return {
     averageMessageWords: integer(raw.averageMessageWords, integer(record(legacy.verbosity).maxWords, 8, 1, 80), 1, 80),
+    openingPatterns: stringArray(raw.openingPatterns),
+    endingPatterns: stringArray(raw.endingPatterns),
     vocabulary,
     favoriteExpressions: stringArray(raw.favoriteExpressions),
     rareExpressions: stringArray(raw.rareExpressions),
     avoidedExpressions: stringArray(raw.avoidedExpressions),
     fillerWords: stringArray(raw.fillerWords),
+    abbreviations: stringArray(raw.abbreviations),
     typoStyle: stringArray(raw.typoStyle),
     punctuationStyle: text(raw.punctuationStyle) || (seed % 2 ? 'короткие фразы, точка редко' : 'обычная пунктуация без канцелярита'),
     capitalizationStyle: text(raw.capitalizationStyle) || (seed % 3 ? 'обычный регистр' : 'иногда капс на сильных эмоциях'),
     laughStyles: stringArray(raw.laughStyles),
     emojiPreferences: stringArray(raw.emojiPreferences),
+    twitchEmotes: stringArray(raw.twitchEmotes),
     profanityLevel: bounded(raw.profanityLevel, bounded(legacy.toxicityLimit, 0.05)),
     messageExamples: stringArray(raw.messageExamples),
   };
@@ -352,7 +419,27 @@ function mergeBehavior(value: Record<string, unknown>, legacy: Record<string, un
       directReplyLikelihood: bounded(activity.directReplyLikelihood, 0.65 + (seed % 30) / 100),
       eventSelectivity: bounded(activity.eventSelectivity, 0.45 + (seed % 45) / 100),
       preferredEventTypes: stringArray(activity.preferredEventTypes),
+      ignoredEventTypes: stringArray(activity.ignoredEventTypes),
       averageDelayMs: { min: minDelay, max: Math.max(minDelay, integer(delay.max, minDelay + 4_000, 0, 300_000)) },
+    },
+  };
+}
+
+function mergeDisclosure(value: unknown): BotPersona['disclosure'] {
+  const raw = record(value);
+  const topics = record(raw.topics);
+  const level = (candidate: unknown, fallback: BotPersona['disclosure']['defaultLevel']) =>
+    candidate === 'open' || candidate === 'moderate' || candidate === 'private' ? candidate : fallback;
+  const defaultLevel = level(raw.defaultLevel, 'moderate');
+  return {
+    defaultLevel,
+    privatePerson: typeof raw.privatePerson === 'boolean' ? raw.privatePerson : defaultLevel === 'private',
+    topics: {
+      family: level(topics.family, defaultLevel),
+      work: level(topics.work, defaultLevel),
+      relationships: level(topics.relationships, 'private'),
+      money: level(topics.money, 'private'),
+      location: level(topics.location, defaultLevel),
     },
   };
 }
@@ -391,6 +478,10 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean)
     : [];
+}
+
+function isPersonaEditablePath(value: string): value is BotPersona['manualOverrides'][number] {
+  return (PERSONA_EDITABLE_PATHS as readonly string[]).includes(value);
 }
 
 function record(value: unknown): Record<string, unknown> {

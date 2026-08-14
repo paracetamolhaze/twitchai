@@ -2,7 +2,9 @@ import request from 'supertest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createApiServer, ApiServer } from '../src/api/server';
 import { Logger } from '../src/logger';
-import { DEFAULT_PERSONAS } from '../src/personas/defaults';
+import { generatePersonaV3 } from '../src/personas/generator-v3';
+import { auditPersonas } from '../src/personas/persona-quality';
+import { personaSummary } from '../src/personas/schema';
 import { StreamEvent } from '../src/stream-brain/types';
 
 const token = 'a-secure-test-token';
@@ -11,6 +13,10 @@ const event: StreamEvent = {
   importance: 0.8, confidence: 0.9, source: 'gemini-live', directMentions: [],
 };
 let servers: ApiServer[] = [];
+const testPersona = generatePersonaV3('karlbekner', { id: 'account-karlbekner' });
+const alternatePersona = generatePersonaV3('gigantiuz', { id: 'account-gigantiuz' });
+const testPersonas = [testPersona, alternatePersona];
+const testAudit = auditPersonas(testPersonas.map((persona) => ({ username: persona.generatedFromUsername, persona })));
 
 function server(twitchOAuth?: {
   status: () => Promise<{ configured: boolean; callbackUrl: string; accounts: never[] }>;
@@ -24,8 +30,8 @@ function server(twitchOAuth?: {
     health: () => ({ status: 'ok', twitch: true, streamBrain: true, gemini: true, database: true }),
     overview: () => ({ channel: 'channel', category: 'Dota 2', isLive: true, twitchConnected: true,
       streamBrain: { state: 'CONNECTED', mediaConnected: true, geminiConnected: true }, activeBots: 1, totalBots: 1, uptimeSeconds: 5 }),
-    bots: () => [{ username: 'bot', personaId: 'analyst', enabled: true, connectionState: 'CONNECTED', chatConnected: true, messagesSent: 2 }],
-    setBotEnabled: async () => true,
+    bots: () => [{ username: 'bot', personaId: testPersona.id, enabled: true, connectionState: 'CONNECTED', chatConnected: true, messagesSent: 2 }],
+    setBotEnabled: async () => 'updated',
     assignBotPersona: async () => 'updated',
     events: async () => [event],
     chat: () => [],
@@ -34,22 +40,25 @@ function server(twitchOAuth?: {
       preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0, guardRejections: 0,
       eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0 }),
     settings: async () => ({}), updateSettings: async () => ({ restartRequired: [] }),
-    personas: () => DEFAULT_PERSONAS,
-    personaSummaries: () => DEFAULT_PERSONAS.map((persona) => ({
-      id: persona.id,
-      name: persona.name,
-      firstName: persona.identity.firstName,
-      age: 25,
-      city: persona.identity.currentLocation?.city,
-      occupation: persona.identity.occupation,
-      completeness: 100,
-    })),
-    persona: (id) => DEFAULT_PERSONAS.find((persona) => persona.id === id),
+    personas: () => testPersonas,
+    personaSummaries: () => testPersonas.map((persona) => personaSummary(persona)),
+    personaAudit: () => testAudit,
+    persona: (id) => testPersonas.find((persona) => persona.id === id),
     createPersona: async (persona) => persona,
-    createBlankPersona: async () => DEFAULT_PERSONAS[0]!,
-    createPersonaTemplate: async () => DEFAULT_PERSONAS[0]!,
-    duplicatePersona: async () => DEFAULT_PERSONAS[0]!,
+    createBlankPersona: async () => testPersona,
+    createPersonaTemplate: async () => alternatePersona,
+    duplicatePersona: async () => alternatePersona,
     updatePersona: async (persona) => persona,
+    previewPersonaRegeneration: async () => ({
+      personaId: testPersona.id, username: 'karlbekner', current: testPersona, proposed: testPersona,
+      previewHash: 'a'.repeat(64), preservedManualOverrides: [], legacyManualReviewRequired: false,
+    }),
+    previewAllPersonaRegenerations: async () => [{
+      personaId: testPersona.id, username: 'karlbekner', current: testPersona, proposed: testPersona,
+      previewHash: 'a'.repeat(64), preservedManualOverrides: [], legacyManualReviewRequired: false,
+    }],
+    regeneratePersona: async () => testPersona,
+    regenerateAllPersonas: async () => [testPersona],
     deletePersona: async () => true,
     personaMemories: async () => [],
     deletePersonaMemory: async () => false,
@@ -95,11 +104,18 @@ describe('dashboard API', () => {
 
   it('exposes deep persona CRUD and blocks deletion while assigned', async () => {
     const api = server();
-    const persona = await request(api.app).get('/api/personas/analyst').set('Authorization', `Bearer ${token}`).expect(200);
-    expect(persona.body).toMatchObject({ schemaVersion: 2, fictionalPersona: true, id: 'analyst' });
+    const persona = await request(api.app).get(`/api/personas/${testPersona.id}`).set('Authorization', `Bearer ${token}`).expect(200);
+    expect(persona.body).toMatchObject({ schemaVersion: 2, generationVersion: 3, fictionalPersona: true, id: testPersona.id });
     expect(persona.body.identity).toHaveProperty('birthDate');
     const summaries = await request(api.app).get('/api/persona-summaries').set('Authorization', `Bearer ${token}`).expect(200);
-    expect(summaries.body[0]).toMatchObject({ completeness: 100, age: 25 });
+    expect(summaries.body[0]).toMatchObject({ completeness: expect.any(Number), uniqueness: 100, consistency: 100 });
+    const audit = await request(api.app).get('/api/persona-audit').set('Authorization', `Bearer ${token}`).expect(200);
+    expect(audit.body).toMatchObject({ personaCount: 2, uniquePersonaCount: 2 });
+    const preview = await request(api.app)
+      .post(`/api/personas/${testPersona.id}/regeneration-preview`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    expect(preview.body).toMatchObject({ username: 'karlbekner', previewHash: 'a'.repeat(64) });
     await request(api.app)
       .post('/api/personas')
       .set('Authorization', `Bearer ${token}`)
@@ -113,10 +129,10 @@ describe('dashboard API', () => {
     await request(api.app)
       .patch('/api/bots/bot')
       .set('Authorization', `Bearer ${token}`)
-      .send({ personaId: 'dry-joker' })
+      .send({ personaId: alternatePersona.id })
       .expect(200);
     const deletion = await request(api.app)
-      .delete('/api/personas/analyst')
+      .delete(`/api/personas/${testPersona.id}`)
       .set('Authorization', `Bearer ${token}`)
       .expect(409);
     expect(deletion.body.error).toContain('назначена');

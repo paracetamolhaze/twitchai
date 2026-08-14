@@ -198,7 +198,7 @@ describe('deep persistent personas', () => {
     expect(second.map(({ id }) => id)).toEqual(first.map(({ id }) => id));
   });
 
-  it('preserves saved legacy fields while completing a cloned account persona', async () => {
+  it('preserves an unassigned legacy persona instead of guessing a new biography', async () => {
     const repository = new MemoryRepository();
     await repository.upsertPersona({
       id: 'account-old-bot', name: 'Сохранённое имя', description: 'Сохранённое описание',
@@ -214,8 +214,9 @@ describe('deep persistent personas', () => {
     expect(upgraded.name).toBe('Сохранённое имя');
     expect(upgraded.description).toBe('Сохранённое описание');
     expect(upgraded.behavior.styleInstructions).toBe('мой сохранённый стиль');
-    expect(upgraded.identity.birthDate).toBeDefined();
-    await expect(store.delete('analyst')).rejects.toThrow('persona_builtin');
+    expect(upgraded.identity.birthDate).toBeUndefined();
+    expect(upgraded.source).toBe('manual');
+    expect(await store.delete('missing-persona')).toBe(false);
   });
 
   it('does not mutate runtime state when building a dashboard preview', async () => {

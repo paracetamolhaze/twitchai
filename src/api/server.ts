@@ -6,13 +6,16 @@ import { Server as SocketServer } from 'socket.io';
 import { z } from 'zod';
 import { Logger } from '../logger';
 import { PersonaReactionContext } from '../personas/persona-context-builder';
+import { auditPersonas } from '../personas/persona-quality';
+import { PersonaRegenerationPreview } from '../personas/persona-store';
 import { personaSchema } from '../personas/schema';
-import { BotPersona, PersonaMemoryItem, PersonaSummary } from '../personas/types';
+import { BotPersona, PersonaAuditReport, PersonaMemoryItem, PersonaSummary } from '../personas/types';
 import { BotAccountRecord } from '../persistence/repository';
 import { ReactionDecisionRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
+import type { BotEnabledResult, PersonaAssignmentResult } from '../twitch/bot-manager';
 import { createDashboardAuth } from './auth';
 
 export interface HealthPayload {
@@ -44,8 +47,8 @@ export interface ApiServerDependencies {
   health: () => HealthPayload;
   overview: () => OverviewPayload;
   bots: () => BotAccountRecord[];
-  setBotEnabled: (username: string, enabled: boolean) => Promise<boolean>;
-  assignBotPersona: (username: string, personaId: string) => Promise<'updated' | 'bot_not_found' | 'persona_not_found' | 'persona_in_use'>;
+  setBotEnabled: (username: string, enabled: boolean) => Promise<BotEnabledResult>;
+  assignBotPersona: (username: string, personaId: string) => Promise<PersonaAssignmentResult>;
   events: (limit: number) => Promise<StreamEvent[]>;
   chat: () => ChatMessage[];
   usage: () => UsageSnapshot;
@@ -54,12 +57,17 @@ export interface ApiServerDependencies {
   updateSettings: (settings: Record<string, unknown>) => Promise<{ restartRequired: string[] }>;
   personas: () => BotPersona[];
   personaSummaries: () => PersonaSummary[];
+  personaAudit: () => PersonaAuditReport;
   persona: (id: string) => BotPersona | undefined;
   createPersona: (persona: BotPersona) => Promise<BotPersona>;
   createBlankPersona: (id: string, name: string) => Promise<BotPersona>;
   createPersonaTemplate: (username: string, id?: string) => Promise<BotPersona>;
   duplicatePersona: (sourceId: string, id: string, name: string) => Promise<BotPersona>;
   updatePersona: (persona: BotPersona) => Promise<BotPersona>;
+  previewPersonaRegeneration: (id: string) => Promise<PersonaRegenerationPreview>;
+  previewAllPersonaRegenerations: () => Promise<PersonaRegenerationPreview[]>;
+  regeneratePersona: (id: string, previewHash: string) => Promise<BotPersona>;
+  regenerateAllPersonas: (previews: Array<{ personaId: string; previewHash: string }>) => Promise<BotPersona[]>;
   deletePersona: (id: string) => Promise<boolean>;
   personaMemories: (personaId: string, limit: number) => Promise<PersonaMemoryItem[]>;
   deletePersonaMemory: (personaId: string, memoryId: string) => Promise<boolean>;
@@ -238,10 +246,14 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
         if (assignment === 'bot_not_found') return response.status(404).json({ error: 'Бот не найден' });
         if (assignment === 'persona_not_found') return response.status(400).json({ error: 'Личность не найдена' });
         if (assignment === 'persona_in_use') return response.status(409).json({ error: 'Эта личность уже назначена другому Twitch-аккаунту' });
+        if (assignment === 'persona_username_mismatch') return response.status(409).json({ error: 'Эта личность создана для другого Twitch-аккаунта' });
+        if (assignment === 'persona_incomplete') return response.status(409).json({ error: 'Сначала заполните и проверьте ручную личность' });
       }
       if (body.enabled !== undefined) {
         const updated = await dependencies.setBotEnabled(request.params.username, body.enabled);
-        if (!updated) return response.status(404).json({ error: 'Бот не найден' });
+        if (updated === 'bot_not_found') return response.status(404).json({ error: 'Бот не найден' });
+        if (updated === 'persona_username_mismatch') return response.status(409).json({ error: 'Текущая личность создана для другого Twitch-аккаунта' });
+        if (updated === 'persona_incomplete') return response.status(409).json({ error: 'Сначала заполните и проверьте ручную личность' });
       }
       return response.json({ ok: true });
     } catch (error) { return next(error); }
@@ -266,6 +278,26 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
   });
   app.get('/api/personas', (_request, response) => response.json(dependencies.personas()));
   app.get('/api/persona-summaries', (_request, response) => response.json(dependencies.personaSummaries()));
+  app.get('/api/persona-audit', (_request, response) => response.json(dependencies.personaAudit()));
+  app.post('/api/persona-regeneration/preview', async (_request, response, next) => {
+    try {
+      const items = await dependencies.previewAllPersonaRegenerations();
+      return response.json({
+        items,
+        audit: auditPersonas(items.map((item) => ({ username: item.username, persona: item.proposed }))),
+      });
+    }
+    catch (error) { return next(error); }
+  });
+  app.post('/api/persona-regeneration/apply', async (request, response, next) => {
+    try {
+      const body = z.object({ previews: z.array(z.object({ personaId: z.string().trim().min(1).max(80), previewHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(100) }).strict().parse(request.body);
+      return response.json({ personas: await dependencies.regenerateAllPersonas(body.previews), audit: dependencies.personaAudit() });
+    } catch (error) {
+      if (error instanceof Error && error.message === 'persona_regeneration_preview_stale') return response.status(409).json({ error: 'Предпросмотр устарел. Обновите его перед сохранением.' });
+      return next(error);
+    }
+  });
   app.get('/api/personas/:id', (request, response) => {
     const persona = dependencies.persona(request.params.id);
     return persona ? response.json(persona) : response.status(404).json({ error: 'Личность не найдена' });
@@ -282,6 +314,7 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
       return response.status(201).json(await dependencies.createPersona(persona));
     } catch (error) {
       if (error instanceof Error && error.message === 'persona_already_exists') return response.status(409).json({ error: 'Личность с таким ID уже существует' });
+      if (error instanceof Error && error.message === 'persona_blueprint_not_found') return response.status(422).json({ error: 'Для этого username ещё нет проверенной личности v3. Создайте её вручную.' });
       if (error instanceof Error && error.message.includes('not found')) return response.status(404).json({ error: 'Исходная личность не найдена' });
       if (error instanceof Error && error.message.startsWith('persona_relationship_')) return response.status(400).json({ error: 'Некорректная связь между личностями' });
       return next(error);
@@ -297,6 +330,25 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     } catch (error) {
       if (error instanceof Error && error.message === 'persona_not_found') return response.status(404).json({ error: 'Личность не найдена' });
       if (error instanceof Error && error.message.startsWith('persona_relationship_')) return response.status(400).json({ error: 'Некорректная связь между личностями' });
+      return next(error);
+    }
+  });
+  app.post('/api/personas/:id/regeneration-preview', async (request, response, next) => {
+    try { return response.json(await dependencies.previewPersonaRegeneration(request.params.id)); }
+    catch (error) {
+      if (error instanceof Error && error.message === 'persona_manual_regeneration_forbidden') return response.status(409).json({ error: 'Личность создана вручную и не может быть автоматически пересоздана' });
+      if (error instanceof Error && error.message.includes('not found')) return response.status(404).json({ error: 'Личность не найдена' });
+      return next(error);
+    }
+  });
+  app.post('/api/personas/:id/regenerate', async (request, response, next) => {
+    try {
+      const body = z.object({ previewHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(request.body);
+      return response.json(await dependencies.regeneratePersona(request.params.id, body.previewHash));
+    } catch (error) {
+      if (error instanceof Error && error.message === 'persona_regeneration_preview_stale') return response.status(409).json({ error: 'Предпросмотр устарел. Обновите его перед сохранением.' });
+      if (error instanceof Error && error.message === 'persona_manual_regeneration_forbidden') return response.status(409).json({ error: 'Личность создана вручную и не может быть автоматически пересоздана' });
+      if (error instanceof Error && error.message.includes('not found')) return response.status(404).json({ error: 'Личность не найдена' });
       return next(error);
     }
   });

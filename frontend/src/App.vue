@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { io, Socket } from 'socket.io-client'
 
 type Page = 'overview' | 'bots' | 'brain' | 'chat' | 'settings'
-type PersonaTab = 'main' | 'character' | 'family' | 'biography' | 'interests' | 'opinions' | 'speech' | 'twitch' | 'memory'
+type PersonaTab = 'main' | 'character' | 'family' | 'biography' | 'interests' | 'opinions' | 'speech' | 'twitch' | 'memory' | 'quality'
 type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'DISABLED'
 
 interface BrainStatus {
@@ -92,17 +92,24 @@ interface Usage {
 }
 interface Persona {
   schemaVersion: 2
+  generationVersion: number
+  source: 'generated' | 'manual'
+  generatedFromUsername?: string
+  manuallyEdited: boolean
+  manualOverrides: string[]
+  legacyManualReviewRequired: boolean
   fictionalPersona: true
   id: string
   name: string
   description: string
   identity: {
-    firstName: string; nickname?: string; birthDate?: string
+    firstName: string; preferredName?: string; nickname?: string; nicknameOrigin?: string; birthDate?: string
     birthplace?: { country: string; city: string }; grewUpIn?: { country: string; city: string }
     currentLocation?: { country: string; city: string }
     languages: Array<{ language: string; level: string }>
     occupation?: string; education?: string; relationshipStatus?: string
   }
+  familyBackground: string
   family: Array<{ id: string; relation: string; name: string; birthDate?: string; occupation?: string; city?: string; relationshipDescription?: string; facts: string[] }>
   timeline: Array<{ id: string; year?: number; title: string; description: string; emotionalWeight: number; tags: string[] }>
   facts: Array<{ id: string; category: string; fact: string; importance: number; privateByDefault?: boolean; tags: string[] }>
@@ -111,17 +118,19 @@ interface Persona {
   character: { summary: string; traits: string[]; strengths: string[]; flaws: string[]; humor: string; conflictStyle: string }
   interests: { games: string[]; music: string[]; food: string[]; other: string[] }
   speech: {
-    averageMessageWords: number; vocabulary: string[]; favoriteExpressions: string[]; rareExpressions: string[]
-    avoidedExpressions: string[]; fillerWords: string[]; typoStyle: string[]; punctuationStyle: string
-    capitalizationStyle: string; laughStyles: string[]; emojiPreferences: string[]; profanityLevel: number; messageExamples: string[]
+    averageMessageWords: number; openingPatterns: string[]; endingPatterns: string[]; vocabulary: string[]
+    favoriteExpressions: string[]; rareExpressions: string[]; avoidedExpressions: string[]; fillerWords: string[]
+    abbreviations: string[]; typoStyle: string[]; punctuationStyle: string; capitalizationStyle: string
+    laughStyles: string[]; emojiPreferences: string[]; twitchEmotes: string[]; profanityLevel: number; messageExamples: string[]
   }
   behavior: {
     styleInstructions: string; verbosity: { minWords: number; maxWords: number }; reactionProbability: number
     uppercaseProbability: number; questionProbability: number; emojiProbability: number; slangLevel: number
     sarcasmLevel: number; toxicityLimit: number; temperature: number; minimumIntervalMs: number
     imperfections: { typingMistakes: string[]; hesitations: string[]; emotionalTriggers: string[]; blindSpots: string[] }
-    activity: { chatFrequency: 'very-low' | 'low' | 'medium' | 'high'; directReplyLikelihood: number; eventSelectivity: number; preferredEventTypes: string[]; averageDelayMs: { min: number; max: number } }
+    activity: { chatFrequency: 'very-low' | 'low' | 'medium' | 'high'; directReplyLikelihood: number; eventSelectivity: number; preferredEventTypes: string[]; ignoredEventTypes: string[]; averageDelayMs: { min: number; max: number } }
   }
+  disclosure: { defaultLevel: 'open' | 'moderate' | 'private'; privatePerson: boolean; topics: { family: 'open' | 'moderate' | 'private'; work: 'open' | 'moderate' | 'private'; relationships: 'open' | 'moderate' | 'private'; money: 'open' | 'moderate' | 'private'; location: 'open' | 'moderate' | 'private' } }
   streamerRelationship: { firstSeen?: string; familiarity: number; supportiveness: number; teasingLevel: number; favoriteStreamTypes: string[]; recurringReferences: string[]; rememberedStreamerMoments: string[] }
   relationships: Array<{ targetPersonaId: string; familiarity: number; sentiment: number; notes: string[] }>
 }
@@ -129,7 +138,29 @@ interface PersonaMemoryItem {
   id: string; personaId: string; createdAt: number; type: string; summary: string; importance: number; tags: string[]
 }
 interface PersonaSummary {
-  id: string; name: string; firstName: string; age?: number; city?: string; occupation?: string; completeness: number
+  id: string; name: string; firstName: string; age?: number; city?: string; occupation?: string; quickSummary: string
+  completeness: number; uniqueness: number; consistency: number; mostSimilarPersonaId?: string; mostSimilarUsername?: string
+  similarityReasons: string[]; qualityWarnings: string[]
+}
+interface PersonaSimilarityPair {
+  leftPersonaId: string; rightPersonaId: string; leftUsername?: string; rightUsername?: string
+  similarity: number; reasons: string[]
+}
+interface PersonaAuditReport {
+  accountCount: number; personaCount: number; uniquePersonaCount: number; uniqueSpeechFingerprintCount: number
+  countryOfBirthDistribution: Record<string, number>; currentCountryDistribution: Record<string, number>
+  currentCityDistribution: Record<string, number>; occupationDistribution: Record<string, number>
+  behaviorRanges: Record<string, { min: number; max: number }>; maximumSimilarity: number; averageSimilarity: number
+  structureRanges?: Record<string, { min: number; max: number }>
+  mostSimilarPairs: PersonaSimilarityPair[]; coherenceErrors: Array<{ message: string }>; coherenceWarnings: Array<{ message: string }>
+  duplicateNicknameOrigins: string[]; duplicateRelativeNames: string[]; duplicateFavoriteExpressions: string[]; duplicateBiographyEvents: string[]; duplicateSpeechExamples: string[]
+}
+interface PersonaRegenerationPreview {
+  personaId: string; username: string; current: Persona; proposed: Persona; previewHash: string; preservedManualOverrides: string[]; legacyManualReviewRequired: boolean
+}
+interface BulkRegenerationPreview {
+  items: PersonaRegenerationPreview[]
+  audit: PersonaAuditReport
 }
 type ReactionRejectionReason =
   | 'duplicate_username' | 'unknown_candidate' | 'not_connected' | 'too_many_reactions'
@@ -145,6 +176,7 @@ interface ReactionDecision {
 }
 
 const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3000').replace(/\/$/, '')
+const PERSONA_SIMILARITY_WARNING_THRESHOLD = 0.65
 const activePage = ref<Page>('overview')
 const draftToken = ref('')
 const authenticated = ref(false)
@@ -171,12 +203,15 @@ const events = ref<StreamEvent[]>([])
 const chat = ref<ChatMessage[]>([])
 const personas = ref<Persona[]>([])
 const personaSummaries = ref<PersonaSummary[]>([])
+const personaAudit = ref<PersonaAuditReport | null>(null)
 const selectedPersonaId = ref('')
 const personaTab = ref<PersonaTab>('main')
 const personaMemories = ref<PersonaMemoryItem[]>([])
 const personaContextQuery = ref('как тебя зовут и где ты вырос?')
 const personaContextPreview = ref<Record<string, unknown> | null>(null)
 const personaBusy = ref(false)
+const regenerationPreview = ref<PersonaRegenerationPreview | null>(null)
+const bulkRegenerationPreview = ref<BulkRegenerationPreview | null>(null)
 const decisions = ref<ReactionDecision[]>([])
 const twitchOAuth = reactive<TwitchOAuthStatus>({ configured: false, accounts: [] })
 const settings = reactive({ channel: '', streamContext: '', visionFps: 1 })
@@ -195,10 +230,14 @@ const personaTabs: Array<{ id: PersonaTab; label: string }> = [
   { id: 'main', label: 'Основное' }, { id: 'character', label: 'Характер' }, { id: 'family', label: 'Семья' },
   { id: 'biography', label: 'Биография' }, { id: 'interests', label: 'Интересы' }, { id: 'opinions', label: 'Мнения' },
   { id: 'speech', label: 'Речь' }, { id: 'twitch', label: 'Twitch' }, { id: 'memory', label: 'Память' },
+  { id: 'quality', label: 'Качество' },
 ]
 const selectedPersona = computed(() => personas.value.find((persona) => persona.id === selectedPersonaId.value))
 const personaById = computed(() => new Map(personas.value.map((persona) => [persona.id, persona])))
 const personaSummaryById = computed(() => new Map(personaSummaries.value.map((summary) => [summary.id, summary])))
+const selectedPersonaSummary = computed(() => selectedPersona.value ? personaSummaryById.value.get(selectedPersona.value.id) : undefined)
+const selectedPersonaTooSimilar = computed(() => (selectedPersonaSummary.value?.uniqueness ?? 100)
+  <= Math.round((1 - PERSONA_SIMILARITY_WARNING_THRESHOLD) * 100))
 
 const timeline = computed(() => [
   ...events.value.map((event) => ({
@@ -265,10 +304,10 @@ async function loadDashboard(): Promise<void> {
   if (!authenticated.value) return
   loading.value = true
   try {
-    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData, personaSummaryData, decisionData, oauthData] = await Promise.all([
+    const [overviewData, botData, eventData, chatData, usageData, settingsData, personaData, personaSummaryData, personaAuditData, decisionData, oauthData] = await Promise.all([
       api<Overview>('/api/overview'), api<Bot[]>('/api/bots'), api<StreamEvent[]>('/api/events?limit=100'),
       api<ChatMessage[]>('/api/chat'), api<Usage>('/api/usage'), api<Record<string, unknown>>('/api/settings'),
-      api<Persona[]>('/api/personas'), api<PersonaSummary[]>('/api/persona-summaries'),
+      api<Persona[]>('/api/personas'), api<PersonaSummary[]>('/api/persona-summaries'), api<PersonaAuditReport>('/api/persona-audit'),
       api<ReactionDecision[]>('/api/decisions'), api<TwitchOAuthStatus>('/api/twitch/oauth/status'),
     ])
     Object.assign(overview, overviewData)
@@ -278,6 +317,7 @@ async function loadDashboard(): Promise<void> {
     chat.value = chatData
     personas.value = personaData
     personaSummaries.value = personaSummaryData
+    personaAudit.value = personaAuditData
     if (!personas.value.some((persona) => persona.id === selectedPersonaId.value)) {
       selectedPersonaId.value = personas.value[0]?.id || ''
     }
@@ -478,7 +518,123 @@ async function loadPersonaMemories(): Promise<void> {
 }
 
 async function refreshPersonaSummaries(): Promise<void> {
-  personaSummaries.value = await api<PersonaSummary[]>('/api/persona-summaries')
+  const [summaries, audit] = await Promise.all([
+    api<PersonaSummary[]>('/api/persona-summaries'),
+    api<PersonaAuditReport>('/api/persona-audit'),
+  ])
+  personaSummaries.value = summaries
+  personaAudit.value = audit
+}
+
+async function previewSelectedRegeneration(): Promise<void> {
+  const persona = selectedPersona.value
+  if (!persona || persona.source !== 'generated') return
+  try {
+    personaBusy.value = true
+    bulkRegenerationPreview.value = null
+    regenerationPreview.value = await api<PersonaRegenerationPreview>(`/api/personas/${encodeURIComponent(persona.id)}/regeneration-preview`, { method: 'POST' })
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { personaBusy.value = false }
+}
+
+async function applySelectedRegeneration(): Promise<void> {
+  const preview = regenerationPreview.value
+  if (!preview) return
+  try {
+    personaBusy.value = true
+    const saved = await api<Persona>(`/api/personas/${encodeURIComponent(preview.personaId)}/regenerate`, {
+      method: 'POST', body: JSON.stringify({ previewHash: preview.previewHash }),
+    })
+    replacePersona(saved)
+    regenerationPreview.value = null
+    bulkRegenerationPreview.value = null
+    await refreshPersonaSummaries()
+    saveMessage.value = `Личность «${saved.name}» пересоздана; ручные поля сохранены`
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { personaBusy.value = false }
+}
+
+async function previewBulkRegeneration(): Promise<void> {
+  try {
+    personaBusy.value = true
+    regenerationPreview.value = null
+    bulkRegenerationPreview.value = await api<BulkRegenerationPreview>('/api/persona-regeneration/preview', { method: 'POST' })
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { personaBusy.value = false }
+}
+
+async function applyBulkRegeneration(): Promise<void> {
+  const preview = bulkRegenerationPreview.value
+  if (!preview) return
+  try {
+    personaBusy.value = true
+    const result = await api<{ personas: Persona[]; audit: PersonaAuditReport }>('/api/persona-regeneration/apply', {
+      method: 'POST',
+      body: JSON.stringify({ previews: preview.items.map((item) => ({ personaId: item.personaId, previewHash: item.previewHash })) }),
+    })
+    for (const persona of result.personas) replacePersona(persona)
+    personaAudit.value = result.audit
+    bulkRegenerationPreview.value = null
+    await refreshPersonaSummaries()
+    saveMessage.value = `Пересоздано ${result.personas.length} автогенерированных личностей; резервные копии сохранены`
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { personaBusy.value = false }
+}
+
+function personaPreviewText(persona: Persona): string {
+  const identity = persona.identity
+  const preferred = identity.preferredName && identity.preferredName !== identity.firstName ? ` (${identity.preferredName})` : ''
+  const birthplace = identity.birthplace ? `${identity.birthplace.city}, ${identity.birthplace.country}` : 'место рождения не указано'
+  const current = identity.currentLocation ? `${identity.currentLocation.city}, ${identity.currentLocation.country}` : 'текущее место не указано'
+  return `${identity.firstName}${preferred} · ${birthplace} → ${current} · ${identity.occupation || 'работа не указана'} · ${persona.character.summary}`
+}
+
+function personaFullPreview(persona: Persona): string {
+  const place = (value?: { country: string; city: string }) => value ? `${value.city}, ${value.country}` : 'не указано'
+  const list = (values: string[]) => values.join(', ') || 'не указано'
+  return [
+    `Имя: ${persona.identity.firstName}${persona.identity.preferredName ? `; обращаться: ${persona.identity.preferredName}` : ''}`,
+    `Ник Twitch: ${persona.identity.nickname || 'не указан'}`,
+    `История ника: ${persona.identity.nicknameOrigin || 'не указана'}`,
+    `Дата рождения: ${persona.identity.birthDate || 'не указана'}`,
+    `Родился: ${place(persona.identity.birthplace)}; вырос: ${place(persona.identity.grewUpIn)}; живёт: ${place(persona.identity.currentLocation)}`,
+    `Работа: ${persona.identity.occupation || 'не указана'}; образование: ${persona.identity.education || 'не указано'}; отношения: ${persona.identity.relationshipStatus || 'не указано'}`,
+    `Языки: ${list(persona.identity.languages.map((item) => `${item.language} (${item.level})`))}`,
+    `Описание: ${persona.description}`,
+    `Семейный фон: ${persona.familyBackground || 'не указан'}`,
+    `Семья:\n${persona.family.map((relative) => `• ${relativeKindLabel(relative.relation)}: ${relative.name}; ${relative.occupation || 'работа не указана'}; ${relative.city || 'город не указан'}; ${relative.relationshipDescription || ''}; ${list(relative.facts)}`).join('\n') || 'не указана'}`,
+    `Жизненные события:\n${persona.timeline.map((event) => `• ${event.year ?? 'год?'} — ${event.title}: ${event.description}`).join('\n') || 'не указаны'}`,
+    `Факты:\n${persona.facts.map((fact) => `• [${factCategoryLabel(fact.category)}] ${fact.fact}`).join('\n') || 'не указаны'}`,
+    `Мнения:\n${persona.opinions.map((opinion) => `• ${opinion.topic}: ${opinion.stance}`).join('\n') || 'не указаны'}`,
+    `Знает глубоко: ${list(persona.knowledge.expertise)}\nЗнакомые темы: ${list(persona.knowledge.familiarTopics)}\nСлабые темы: ${list(persona.knowledge.weakTopics)}\nНе знает: ${list(persona.knowledge.unknownTopics)}`,
+    `Характер: ${persona.character.summary}\nЧерты: ${list(persona.character.traits)}\nСильные стороны: ${list(persona.character.strengths)}\nНедостатки: ${list(persona.character.flaws)}\nЮмор: ${persona.character.humor}\nВ конфликте: ${persona.character.conflictStyle}`,
+    `Интересы — игры: ${list(persona.interests.games)}; музыка: ${list(persona.interests.music)}; еда: ${list(persona.interests.food)}; другое: ${list(persona.interests.other)}`,
+    `Речь — в среднем ${persona.speech.averageMessageWords} слов; начала: ${list(persona.speech.openingPatterns)}; окончания: ${list(persona.speech.endingPatterns)}; любимые выражения: ${list(persona.speech.favoriteExpressions)}; смех: ${list(persona.speech.laughStyles)}; пунктуация: ${persona.speech.punctuationStyle}; регистр: ${persona.speech.capitalizationStyle}; примеры: ${list(persona.speech.messageExamples)}`,
+    `Поведение — вероятность реакции ${persona.behavior.reactionProbability}; избирательность ${persona.behavior.activity.eventSelectivity}; прямой ответ ${persona.behavior.activity.directReplyLikelihood}; частота ${activityFrequencyLabel(persona.behavior.activity.chatFrequency)}; задержка ${persona.behavior.activity.averageDelayMs.min}–${persona.behavior.activity.averageDelayMs.max} мс; предпочитает: ${list(persona.behavior.activity.preferredEventTypes)}; игнорирует: ${list(persona.behavior.activity.ignoredEventTypes)}; инструкции: ${persona.behavior.styleInstructions}`,
+    `Границы личного — общая: ${disclosureLevelLabel(persona.disclosure.defaultLevel)}; семья: ${disclosureLevelLabel(persona.disclosure.topics.family)}; работа: ${disclosureLevelLabel(persona.disclosure.topics.work)}; отношения: ${disclosureLevelLabel(persona.disclosure.topics.relationships)}; деньги: ${disclosureLevelLabel(persona.disclosure.topics.money)}; местоположение: ${disclosureLevelLabel(persona.disclosure.topics.location)}`,
+    `Twitch — впервые: ${persona.streamerRelationship.firstSeen || 'не указано'}; знакомство ${persona.streamerRelationship.familiarity}; поддержка ${persona.streamerRelationship.supportiveness}; поддразнивание ${persona.streamerRelationship.teasingLevel}; любимые эфиры: ${list(persona.streamerRelationship.favoriteStreamTypes)}; повторяющиеся отсылки: ${list(persona.streamerRelationship.recurringReferences)}`,
+    `Точная техническая копия всех полей канона:\n${JSON.stringify(persona, null, 2)}`,
+  ].join('\n\n')
+}
+
+function openBulkPersonaPreview(item: PersonaRegenerationPreview): void {
+  regenerationPreview.value = item
+}
+
+function relativeKindLabel(value: string): string {
+  return ({ mother: 'мать', father: 'отец', brother: 'брат', sister: 'сестра', uncle: 'дядя', aunt: 'тётя', grandmother: 'бабушка', grandfather: 'дедушка', cousin: 'двоюродный родственник', daughter: 'дочь', son: 'сын', other: 'другой родственник' } as Record<string, string>)[value] || value
+}
+
+function disclosureLevelLabel(value: string): string {
+  return ({ open: 'открыто', moderate: 'умеренно', private: 'приватно' } as Record<string, string>)[value] || value
+}
+
+function activityFrequencyLabel(value: string): string {
+  return ({ 'very-low': 'очень редко', low: 'редко', medium: 'средне', high: 'активно' } as Record<string, string>)[value] || value
+}
+
+function sourceLabelForPersona(persona: Persona): string {
+  return persona.source === 'generated' ? `автогенерация v${persona.generationVersion}` : 'создана вручную'
 }
 
 async function previewPersonaContext(): Promise<void> {
@@ -529,6 +685,12 @@ function personaAssignedToOther(personaId: string, username: string): boolean {
   return bots.value.some((bot) => bot.username !== username && bot.personaId === personaId)
 }
 
+function personaMatchesAccount(persona: Persona, username: string): boolean {
+  const normalized = username.trim().toLowerCase()
+  if (persona.identity.nickname?.trim().toLowerCase() !== normalized) return false
+  return persona.source === 'manual' || persona.generatedFromUsername === normalized
+}
+
 function personaPayload(persona: Persona): Persona {
   const payload = JSON.parse(JSON.stringify(persona)) as Persona
   if (!payload.identity.birthDate) delete payload.identity.birthDate
@@ -568,7 +730,7 @@ function memoryTypeLabel(type: string): string {
   return ({ stream_event: 'событие стрима', conversation: 'разговор', viewer: 'зритель', streamer: 'стример', self: 'собственная реплика', relationship: 'отношения' } as Record<string, string>)[type] || type
 }
 function factCategoryLabel(category: string): string {
-  return ({ family: 'семья', childhood: 'детство', education: 'учёба', work: 'работа', gaming: 'игры', food: 'еда', music: 'музыка', travel: 'поездки', technology: 'техника', relationships: 'отношения', habit: 'привычка', preference: 'предпочтение', story: 'история', other: 'другое' } as Record<string, string>)[category] || category
+  return ({ family: 'семья', childhood: 'детство', education: 'учёба', work: 'работа', gaming: 'игры', food: 'еда', music: 'музыка', travel: 'поездки', technology: 'техника', automotive: 'автомобили', animals: 'животные', art: 'искусство', biology: 'биология', law: 'право', money: 'деньги', sport: 'спорт', imperfection: 'недостаток', relationships: 'отношения', habit: 'привычка', preference: 'предпочтение', story: 'история', other: 'другое' } as Record<string, string>)[category] || category
 }
 function rejectionLabel(reason: ReactionRejectionReason): string {
   const labels: Record<ReactionRejectionReason, string> = {
@@ -736,7 +898,7 @@ onBeforeUnmount(() => {
             <div v-for="bot in bots" :key="bot.username" class="bot-table table-row">
               <div class="account-cell"><span class="avatar">{{ bot.username.slice(0, 2).toUpperCase() }}</span><div><strong>{{ bot.username }}</strong><small>{{ refreshableUsernames.has(bot.username) ? 'авторизация с автообновлением' : bot.chatConnected ? 'вошёл в чат' : bot.lastError || 'нужно переподключить через Twitch' }}</small></div></div>
               <span :class="['state-badge', stateClass(bot.connectionState)]">{{ stateLabel(bot.connectionState) }}</span>
-              <div class="persona-assignment"><select :value="bot.personaId" @change="assignPersona(bot, ($event.target as HTMLSelectElement).value)"><option v-for="persona in personas" :key="persona.id" :value="persona.id" :disabled="personaAssignedToOther(persona.id, bot.username)">{{ persona.name }}{{ personaAssignedToOther(persona.id, bot.username) ? ' · занята' : '' }}</option></select><small v-if="personaSummaryById.get(bot.personaId)">{{ personaSummaryById.get(bot.personaId)?.firstName }} · {{ personaSummaryById.get(bot.personaId)?.age ?? 'возраст не указан' }} · {{ personaSummaryById.get(bot.personaId)?.city || 'город не указан' }} · {{ personaSummaryById.get(bot.personaId)?.occupation || 'работа не указана' }}</small></div>
+              <div class="persona-assignment"><select :value="bot.personaId" @change="assignPersona(bot, ($event.target as HTMLSelectElement).value)"><option v-for="persona in personas" :key="persona.id" :value="persona.id" :disabled="personaAssignedToOther(persona.id, bot.username) || !personaMatchesAccount(persona, bot.username)">{{ persona.name }}{{ personaAssignedToOther(persona.id, bot.username) ? ' · занята' : !personaMatchesAccount(persona, bot.username) ? ' · другой аккаунт' : '' }}</option></select><small v-if="personaSummaryById.get(bot.personaId)">{{ personaSummaryById.get(bot.personaId)?.firstName }} · {{ personaSummaryById.get(bot.personaId)?.age ?? 'возраст не указан' }} · {{ personaSummaryById.get(bot.personaId)?.city || 'город не указан' }} · {{ personaSummaryById.get(bot.personaId)?.occupation || 'работа не указана' }}</small></div>
               <span>{{ bot.messagesSent }}</span><span>{{ formatTime(bot.lastReactionAt) }}</span>
               <button :class="['toggle', bot.enabled ? 'on' : '']" :aria-label="`Переключить ${bot.username}`" @click="toggleBot(bot)"><i></i></button>
             </div>
@@ -791,21 +953,33 @@ onBeforeUnmount(() => {
           <div class="section-heading"><div><p class="eyebrow">УСТОЙЧИВЫЕ ВЫМЫШЛЕННЫЕ ЛЮДИ</p><h2>Редактор личностей</h2></div><p class="muted">Канон меняется только здесь. Память стрима не может переписать имя, семью или биографию.</p></div>
           <section class="panel persona-toolbar">
             <label>Выбранная личность<select :value="selectedPersonaId" @change="selectPersona(($event.target as HTMLSelectElement).value)"><option v-for="persona in personas" :key="persona.id" :value="persona.id">{{ persona.name }} · {{ persona.id }}</option></select></label>
-            <div class="persona-toolbar-actions"><button class="primary" type="button" :disabled="personaBusy" @click="createManualPersona">Создать вручную</button><button class="secondary" type="button" :disabled="personaBusy" @click="createTemplatePersona">Создать шаблон</button><button class="secondary" type="button" :disabled="!selectedPersona || personaBusy" @click="duplicateSelectedPersona">Дублировать основу</button><button class="danger-button" type="button" :disabled="!selectedPersona || personaBusy" @click="deleteSelectedPersona">Удалить</button></div>
-            <div v-if="selectedPersona" class="completeness"><span>Заполненность личности</span><meter min="0" max="100" :value="personaSummaryById.get(selectedPersona.id)?.completeness ?? 0"></meter><strong>{{ personaSummaryById.get(selectedPersona.id)?.completeness ?? 0 }}%</strong></div>
+            <div class="persona-toolbar-actions"><button class="primary" type="button" :disabled="personaBusy" @click="createManualPersona">Создать вручную</button><button class="secondary" type="button" :disabled="personaBusy" @click="createTemplatePersona">Создать из ника</button><button class="secondary" type="button" :disabled="!selectedPersona || selectedPersona.source !== 'generated' || personaBusy" @click="previewSelectedRegeneration">Пересоздать с учётом ника</button><button class="secondary" type="button" :disabled="personaBusy" @click="previewBulkRegeneration">Проверить все автогенерированные</button><button class="secondary" type="button" :disabled="!selectedPersona || personaBusy" @click="duplicateSelectedPersona">Дублировать основу</button><button class="danger-button" type="button" :disabled="!selectedPersona || personaBusy" @click="deleteSelectedPersona">Удалить</button></div>
+            <div v-if="selectedPersonaSummary" class="quality-scores"><div><span>Заполненность</span><meter min="0" max="100" :value="selectedPersonaSummary.completeness"></meter><strong>{{ selectedPersonaSummary.completeness }}%</strong></div><div><span>Уникальность</span><meter min="0" max="100" :value="selectedPersonaSummary.uniqueness"></meter><strong>{{ selectedPersonaSummary.uniqueness }}%</strong></div><div><span>Связность</span><meter min="0" max="100" :value="selectedPersonaSummary.consistency"></meter><strong>{{ selectedPersonaSummary.consistency }}%</strong></div></div>
           </section>
 
           <form v-if="selectedPersona" class="panel persona-editor" @submit.prevent="savePersona(selectedPersona)">
-            <div class="persona-editor-heading"><div><span class="persona-id">{{ selectedPersona.id }}</span><h3>{{ selectedPersona.name }}</h3><small>Вымышленная личность · возраст вычисляется сервером из даты рождения: {{ personaSummaryById.get(selectedPersona.id)?.age ?? 'не указан' }}</small></div><span class="subtle-chip">схема v{{ selectedPersona.schemaVersion }}</span></div>
+            <div class="persona-editor-heading"><div><span class="persona-id">{{ selectedPersona.id }}</span><h3>{{ selectedPersona.name }}</h3><small>{{ selectedPersonaSummary?.quickSummary }} · {{ sourceLabelForPersona(selectedPersona) }}<template v-if="selectedPersona.manuallyEdited"> · ручных разделов: {{ selectedPersona.manualOverrides.length }}</template></small></div><div class="heading-chips"><span class="subtle-chip">схема v{{ selectedPersona.schemaVersion }}</span><span class="subtle-chip">генератор v{{ selectedPersona.generationVersion }}</span></div></div>
             <nav class="persona-tabs" aria-label="Разделы личности"><button v-for="tab in personaTabs" :key="tab.id" type="button" :class="{ active: personaTab === tab.id }" @click="setPersonaTab(tab.id)">{{ tab.label }}</button></nav>
 
             <section v-if="personaTab === 'main'" class="persona-section">
-              <div class="three-fields"><label>Название в панели<input v-model="selectedPersona.name" /></label><label>Имя человека<input v-model="selectedPersona.identity.firstName" /></label><label>Никнейм<input v-model="selectedPersona.identity.nickname" /></label></div>
+              <div class="four-columns"><label>Название в панели<input v-model="selectedPersona.name" /></label><label>Имя человека<input v-model="selectedPersona.identity.firstName" /></label><label>Как называть<input v-model="selectedPersona.identity.preferredName" /></label><label>Никнейм Twitch<input v-model="selectedPersona.identity.nickname" /></label></div>
+              <label>История никнейма<textarea v-model="selectedPersona.identity.nicknameOrigin" rows="3"></textarea></label>
               <label>Краткое описание<textarea v-model="selectedPersona.description" rows="3"></textarea></label>
+              <label>Семейный фон<textarea v-model="selectedPersona.familyBackground" rows="3"></textarea></label>
               <div class="three-fields"><label>Дата рождения<input v-model="selectedPersona.identity.birthDate" type="date" /></label><label>Работа<input v-model="selectedPersona.identity.occupation" /></label><label>Статус отношений<input v-model="selectedPersona.identity.relationshipStatus" /></label></div>
               <label>Образование<input v-model="selectedPersona.identity.education" /></label>
               <h4>Места</h4><div class="location-grid"><div><strong>Родился</strong><input v-model="selectedPersona.identity.birthplace!.city" placeholder="Город" /><input v-model="selectedPersona.identity.birthplace!.country" placeholder="Страна" /></div><div><strong>Вырос</strong><input v-model="selectedPersona.identity.grewUpIn!.city" placeholder="Город" /><input v-model="selectedPersona.identity.grewUpIn!.country" placeholder="Страна" /></div><div><strong>Живёт сейчас</strong><input v-model="selectedPersona.identity.currentLocation!.city" placeholder="Город" /><input v-model="selectedPersona.identity.currentLocation!.country" placeholder="Страна" /></div></div>
               <div class="subsection-heading"><h4>Языки</h4><button class="text-button" type="button" @click="selectedPersona.identity.languages.push({ language: 'русский', level: 'разговорный' })">+ Добавить язык</button></div><div class="repeat-list"><div v-for="(language, index) in selectedPersona.identity.languages" :key="index" class="inline-edit"><input v-model="language.language" placeholder="Язык" /><input v-model="language.level" placeholder="Уровень" /><button type="button" class="icon-button" @click="selectedPersona.identity.languages.splice(index, 1)">×</button></div></div>
+              <h4>Границы личного</h4>
+              <div class="three-fields">
+                <label>Общая открытость<select v-model="selectedPersona.disclosure.defaultLevel"><option value="open">открытая</option><option value="moderate">умеренная</option><option value="private">закрытая</option></select></label>
+                <label class="check-line"><input v-model="selectedPersona.disclosure.privatePerson" type="checkbox" /> Не любит раскрывать личное</label>
+                <label>Семья<select v-model="selectedPersona.disclosure.topics.family"><option value="open">открыто</option><option value="moderate">умеренно</option><option value="private">приватно</option></select></label>
+                <label>Работа<select v-model="selectedPersona.disclosure.topics.work"><option value="open">открыто</option><option value="moderate">умеренно</option><option value="private">приватно</option></select></label>
+                <label>Отношения<select v-model="selectedPersona.disclosure.topics.relationships"><option value="open">открыто</option><option value="moderate">умеренно</option><option value="private">приватно</option></select></label>
+                <label>Деньги<select v-model="selectedPersona.disclosure.topics.money"><option value="open">открыто</option><option value="moderate">умеренно</option><option value="private">приватно</option></select></label>
+                <label>Местоположение<select v-model="selectedPersona.disclosure.topics.location"><option value="open">открыто</option><option value="moderate">умеренно</option><option value="private">приватно</option></select></label>
+              </div>
             </section>
 
             <section v-else-if="personaTab === 'character'" class="persona-section">
@@ -813,7 +987,8 @@ onBeforeUnmount(() => {
               <div class="four-columns"><div><div class="subsection-heading"><h4>Черты</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.character.traits, 'новая черта')">+</button></div><div v-for="(_, index) in selectedPersona.character.traits" :key="index" class="inline-edit"><input v-model="selectedPersona.character.traits[index]" /><button type="button" @click="selectedPersona.character.traits.splice(index, 1)">×</button></div></div><div><div class="subsection-heading"><h4>Сильные стороны</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.character.strengths, 'новая сильная сторона')">+</button></div><div v-for="(_, index) in selectedPersona.character.strengths" :key="index" class="inline-edit"><input v-model="selectedPersona.character.strengths[index]" /><button type="button" @click="selectedPersona.character.strengths.splice(index, 1)">×</button></div></div><div><div class="subsection-heading"><h4>Недостатки</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.character.flaws, 'новый недостаток')">+</button></div><div v-for="(_, index) in selectedPersona.character.flaws" :key="index" class="inline-edit"><input v-model="selectedPersona.character.flaws[index]" /><button type="button" @click="selectedPersona.character.flaws.splice(index, 1)">×</button></div></div><div><div class="subsection-heading"><h4>Слепые зоны</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.behavior.imperfections.blindSpots, 'новая слепая зона')">+</button></div><div v-for="(_, index) in selectedPersona.behavior.imperfections.blindSpots" :key="index" class="inline-edit"><input v-model="selectedPersona.behavior.imperfections.blindSpots[index]" /><button type="button" @click="selectedPersona.behavior.imperfections.blindSpots.splice(index, 1)">×</button></div></div></div>
               <label>Инструкции поведения<textarea v-model="selectedPersona.behavior.styleInstructions" rows="3"></textarea></label><div class="three-fields"><label>Минимум слов<input v-model.number="selectedPersona.behavior.verbosity.minWords" type="number" min="1" max="50" /></label><label>Максимум слов<input v-model.number="selectedPersona.behavior.verbosity.maxWords" type="number" min="1" max="100" /></label><label>Минимальная пауза, мс<input v-model.number="selectedPersona.behavior.minimumIntervalMs" type="number" min="1000" /></label></div>
               <div class="slider-grid"><label>Склонность реагировать <b>{{ selectedPersona.behavior.reactionProbability.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.reactionProbability" type="range" min="0" max="1" step="0.05" /></label><label>Избирательность событий <b>{{ selectedPersona.behavior.activity.eventSelectivity.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.activity.eventSelectivity" type="range" min="0" max="1" step="0.05" /></label><label>Ответ на прямое обращение <b>{{ selectedPersona.behavior.activity.directReplyLikelihood.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.activity.directReplyLikelihood" type="range" min="0" max="1" step="0.05" /></label><label>Сарказм <b>{{ selectedPersona.behavior.sarcasmLevel.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.sarcasmLevel" type="range" min="0" max="1" step="0.05" /></label></div>
-              <label>Частота активности<select v-model="selectedPersona.behavior.activity.chatFrequency"><option value="very-low">очень редко</option><option value="low">редко</option><option value="medium">средне</option><option value="high">активно</option></select></label>
+              <div class="three-fields"><label>Частота активности<select v-model="selectedPersona.behavior.activity.chatFrequency"><option value="very-low">очень редко</option><option value="low">редко</option><option value="medium">средне</option><option value="high">активно</option></select></label><label>Задержка от, мс<input v-model.number="selectedPersona.behavior.activity.averageDelayMs.min" type="number" min="0" /></label><label>Задержка до, мс<input v-model.number="selectedPersona.behavior.activity.averageDelayMs.max" type="number" min="0" /></label></div>
+              <div class="two-fields"><label>Любимые типы событий<input :value="selectedPersona.behavior.activity.preferredEventTypes.join(', ')" @change="selectedPersona.behavior.activity.preferredEventTypes = ($event.target as HTMLInputElement).value.split(',').map(value => value.trim()).filter(Boolean)" /></label><label>Игнорируемые типы событий<input :value="selectedPersona.behavior.activity.ignoredEventTypes.join(', ')" @change="selectedPersona.behavior.activity.ignoredEventTypes = ($event.target as HTMLInputElement).value.split(',').map(value => value.trim()).filter(Boolean)" /></label></div>
             </section>
 
             <section v-else-if="personaTab === 'family'" class="persona-section">
@@ -826,7 +1001,7 @@ onBeforeUnmount(() => {
               <div class="subsection-heading"><div><h4>Жизненная хронология</h4><p class="muted">Устойчивые события, а не случайные истории Gemini.</p></div><button class="secondary" type="button" @click="addTimelineEvent(selectedPersona)">+ Событие</button></div>
               <article v-for="(lifeEvent, index) in selectedPersona.timeline" :key="lifeEvent.id" class="nested-card"><div class="two-fields"><label>Год<input v-model.number="lifeEvent.year" type="number" min="1900" max="2200" /></label><label>Название<input v-model="lifeEvent.title" /></label></div><label>Описание<textarea v-model="lifeEvent.description" rows="2"></textarea></label><label>Эмоциональный вес <b>{{ lifeEvent.emotionalWeight.toFixed(2) }}</b><input v-model.number="lifeEvent.emotionalWeight" type="range" min="0" max="1" step="0.05" /></label><button class="danger-button compact" type="button" @click="selectedPersona.timeline.splice(index, 1)">Удалить событие</button></article>
               <div class="subsection-heading"><div><h4>Канонические факты</h4><p class="muted">До шести релевантных фактов выбираются сервером по теме.</p></div><button class="secondary" type="button" @click="addFact(selectedPersona)">+ Факт</button></div>
-              <article v-for="(fact, index) in selectedPersona.facts" :key="fact.id" class="nested-card"><div class="two-fields"><label>Категория<select v-model="fact.category"><option v-for="value in ['family','childhood','education','work','gaming','food','music','travel','technology','relationships','habit','preference','story','other']" :key="value" :value="value">{{ factCategoryLabel(value) }}</option></select></label><label>Важность <b>{{ fact.importance.toFixed(2) }}</b><input v-model.number="fact.importance" type="range" min="0" max="1" step="0.05" /></label></div><label>Факт<textarea v-model="fact.fact" rows="2"></textarea></label><label class="check-line"><input v-model="fact.privateByDefault" type="checkbox" /> Не передавать без явной необходимости</label><button class="danger-button compact" type="button" @click="selectedPersona.facts.splice(index, 1)">Удалить факт</button></article>
+              <article v-for="(fact, index) in selectedPersona.facts" :key="fact.id" class="nested-card"><div class="two-fields"><label>Категория<select v-model="fact.category"><option v-for="value in ['family','childhood','education','work','gaming','food','music','travel','technology','automotive','animals','art','biology','law','money','sport','imperfection','relationships','habit','preference','story','other']" :key="value" :value="value">{{ factCategoryLabel(value) }}</option></select></label><label>Важность <b>{{ fact.importance.toFixed(2) }}</b><input v-model.number="fact.importance" type="range" min="0" max="1" step="0.05" /></label></div><label>Факт<textarea v-model="fact.fact" rows="2"></textarea></label><label class="check-line"><input v-model="fact.privateByDefault" type="checkbox" /> Не передавать без явной необходимости</label><button class="danger-button compact" type="button" @click="selectedPersona.facts.splice(index, 1)">Удалить факт</button></article>
             </section>
 
             <section v-else-if="personaTab === 'interests'" class="persona-section">
@@ -842,6 +1017,7 @@ onBeforeUnmount(() => {
               <div class="three-fields"><label>Средняя длина, слов<input v-model.number="selectedPersona.speech.averageMessageWords" type="number" min="1" max="80" /></label><label>Пунктуация<input v-model="selectedPersona.speech.punctuationStyle" /></label><label>Регистр<input v-model="selectedPersona.speech.capitalizationStyle" /></label></div>
               <div class="slider-grid"><label>Сленг <b>{{ selectedPersona.behavior.slangLevel.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.slangLevel" type="range" min="0" max="1" step="0.05" /></label><label>Капс <b>{{ selectedPersona.behavior.uppercaseProbability.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.uppercaseProbability" type="range" min="0" max="1" step="0.05" /></label><label>Эмодзи <b>{{ selectedPersona.behavior.emojiProbability.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.emojiProbability" type="range" min="0" max="1" step="0.05" /></label><label>Ненормативная лексика <b>{{ selectedPersona.speech.profanityLevel.toFixed(2) }}</b><input v-model.number="selectedPersona.speech.profanityLevel" type="range" min="0" max="1" step="0.05" /></label></div>
               <div class="four-columns"><div v-for="group in [{ key: 'favoriteExpressions', label: 'Любимые выражения' }, { key: 'fillerWords', label: 'Слова-паразиты' }, { key: 'laughStyles', label: 'Смех' }, { key: 'avoidedExpressions', label: 'Не использует' }]" :key="group.key"><div class="subsection-heading"><h4>{{ group.label }}</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.speech[group.key as 'favoriteExpressions'|'fillerWords'|'laughStyles'|'avoidedExpressions'], 'новое выражение')">+</button></div><div v-for="(_, index) in selectedPersona.speech[group.key as 'favoriteExpressions'|'fillerWords'|'laughStyles'|'avoidedExpressions']" :key="index" class="inline-edit"><input v-model="selectedPersona.speech[group.key as 'favoriteExpressions'|'fillerWords'|'laughStyles'|'avoidedExpressions'][index]" /><button type="button" @click="selectedPersona.speech[group.key as 'favoriteExpressions'|'fillerWords'|'laughStyles'|'avoidedExpressions'].splice(index, 1)">×</button></div></div></div>
+              <div class="four-columns"><div v-for="group in [{ key: 'openingPatterns', label: 'Начала фраз' }, { key: 'endingPatterns', label: 'Концы фраз' }, { key: 'abbreviations', label: 'Сокращения' }, { key: 'twitchEmotes', label: 'Эмоуты Twitch' }]" :key="group.key"><div class="subsection-heading"><h4>{{ group.label }}</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.speech[group.key as 'openingPatterns'|'endingPatterns'|'abbreviations'|'twitchEmotes'], 'новый вариант')">+</button></div><div v-for="(_, index) in selectedPersona.speech[group.key as 'openingPatterns'|'endingPatterns'|'abbreviations'|'twitchEmotes']" :key="index" class="inline-edit"><input v-model="selectedPersona.speech[group.key as 'openingPatterns'|'endingPatterns'|'abbreviations'|'twitchEmotes'][index]" /><button type="button" @click="selectedPersona.speech[group.key as 'openingPatterns'|'endingPatterns'|'abbreviations'|'twitchEmotes'].splice(index, 1)">×</button></div></div></div>
               <div class="subsection-heading"><h4>Примеры сообщений</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.speech.messageExamples, 'новый пример')">+</button></div><div v-for="(_, index) in selectedPersona.speech.messageExamples" :key="index" class="inline-edit"><input v-model="selectedPersona.speech.messageExamples[index]" /><button type="button" @click="selectedPersona.speech.messageExamples.splice(index, 1)">×</button></div>
             </section>
 
@@ -852,9 +1028,18 @@ onBeforeUnmount(() => {
               <div class="subsection-heading"><div><h4>Знакомства с другими личностями</h4><p class="muted">Не создают принудительный разговор; используются только при естественном поводе.</p></div><button class="secondary" type="button" @click="addPersonaRelationship(selectedPersona)">+ Знакомство</button></div><article v-for="(relationship, index) in selectedPersona.relationships" :key="relationship.targetPersonaId" class="nested-card"><label>Другая личность<select v-model="relationship.targetPersonaId"><option v-for="candidate in personas.filter(candidate => candidate.id !== selectedPersona!.id)" :key="candidate.id" :value="candidate.id">{{ candidate.name }}</option></select></label><div class="two-fields"><label>Знакомство <b>{{ relationship.familiarity.toFixed(2) }}</b><input v-model.number="relationship.familiarity" type="range" min="0" max="1" step="0.05" /></label><label>Отношение <b>{{ relationship.sentiment.toFixed(2) }}</b><input v-model.number="relationship.sentiment" type="range" min="-1" max="1" step="0.05" /></label></div><div class="subsection-heading"><h4>Заметки</h4><button type="button" class="text-button" @click="addTextItem(relationship.notes, 'новая заметка')">+</button></div><div v-for="(_, noteIndex) in relationship.notes" :key="noteIndex" class="inline-edit"><input v-model="relationship.notes[noteIndex]" /><button type="button" @click="relationship.notes.splice(noteIndex, 1)">×</button></div><button class="danger-button compact" type="button" @click="selectedPersona.relationships.splice(index, 1)">Удалить знакомство</button></article>
             </section>
 
-            <section v-else class="persona-section">
+            <section v-else-if="personaTab === 'memory'" class="persona-section">
               <div class="debug-context"><div><h4>Что получила бы Gemini</h4><p class="muted">Без ключей и токенов. Показывает только контекст одной выбранной личности.</p><div class="inline-edit"><input v-model="personaContextQuery" placeholder="Например: как дядю зовут?" /><button class="secondary" type="button" :disabled="personaBusy" @click="previewPersonaContext">Собрать контекст</button></div></div><pre v-if="personaContextPreview">{{ JSON.stringify(personaContextPreview, null, 2) }}</pre></div>
               <div class="subsection-heading"><div><h4>Долгосрочная память</h4><p class="muted">Канон выше памяти. Записи ниже не меняют биографию.</p></div><button class="text-button" type="button" @click="loadPersonaMemories">Обновить</button></div><div class="memory-list"><article v-for="memory in personaMemories" :key="memory.id"><div><strong>{{ memory.summary }}</strong><small>{{ formatDate(memory.createdAt) }} · {{ memoryTypeLabel(memory.type) }} · важность {{ memory.importance.toFixed(2) }}</small></div><span class="subtle-chip">{{ memory.tags.join(', ') || 'без тегов' }}</span></article><div v-if="!personaMemories.length" class="empty-state">У этой личности ещё нет сохранённых воспоминаний.</div></div>
+            </section>
+
+            <section v-else class="persona-section quality-section">
+              <div v-if="selectedPersonaSummary" class="quality-overview"><article><span>Заполненность</span><strong>{{ selectedPersonaSummary.completeness }}%</strong><small>наличие канонических полей</small></article><article><span>Уникальность</span><strong>{{ selectedPersonaSummary.uniqueness }}%</strong><small>детерминированное сравнение с ближайшей личностью</small></article><article><span>Связность</span><strong>{{ selectedPersonaSummary.consistency }}%</strong><small>проверка дат, семьи и диапазонов</small></article></div>
+              <p v-if="selectedPersonaTooSimilar" class="notice error">⚠ Эта личность слишком похожа на ближайшую: сходство достигло порога {{ PERSONA_SIMILARITY_WARNING_THRESHOLD.toFixed(2) }}. Перед сохранением измените речь, знания или поведение.</p>
+              <div v-if="selectedPersonaSummary?.mostSimilarPersonaId" class="nested-card"><h4>Наиболее похожая личность</h4><p>{{ selectedPersonaSummary.mostSimilarUsername || selectedPersonaSummary.mostSimilarPersonaId }}</p><p class="muted">{{ selectedPersonaSummary.similarityReasons.join(' · ') || 'Сильного общего измерения не обнаружено' }}</p></div>
+              <div class="nested-card"><h4>Проверка связности</h4><p v-if="!selectedPersonaSummary?.qualityWarnings.length" class="quality-ok">Ошибок и предупреждений нет.</p><ul v-else class="quality-warnings"><li v-for="warning in selectedPersonaSummary.qualityWarnings" :key="warning">{{ warning }}</li></ul></div>
+              <p v-if="personaAudit && personaAudit.maximumSimilarity >= PERSONA_SIMILARITY_WARNING_THRESHOLD" class="notice error">⚠ В наборе есть слишком похожие личности: максимальное сходство {{ personaAudit.maximumSimilarity.toFixed(3) }}.</p>
+              <div v-if="personaAudit" class="audit-grid"><article><span>Аккаунтов / уникальных личностей</span><strong>{{ personaAudit.accountCount }} / {{ personaAudit.uniquePersonaCount }}</strong></article><article><span>Уникальных стилей речи</span><strong>{{ personaAudit.uniqueSpeechFingerprintCount }}</strong></article><article><span>Максимальное сходство</span><strong>{{ personaAudit.maximumSimilarity.toFixed(3) }}</strong></article><article><span>Среднее сходство</span><strong>{{ personaAudit.averageSimilarity.toFixed(3) }}</strong></article><article><span>Ошибок связности</span><strong>{{ personaAudit.coherenceErrors.length }}</strong></article><article><span>Предупреждений</span><strong>{{ personaAudit.coherenceWarnings.length }}</strong></article><article><span>Родственников на личность</span><strong>{{ personaAudit.structureRanges?.relatives?.min ?? '—' }}–{{ personaAudit.structureRanges?.relatives?.max ?? '—' }}</strong></article><article><span>Фактов на личность</span><strong>{{ personaAudit.structureRanges?.facts?.min ?? '—' }}–{{ personaAudit.structureRanges?.facts?.max ?? '—' }}</strong></article></div>
             </section>
 
             <div class="persona-editor-footer"><p class="muted">Сохранение изменяет канон. Обычный чат и Gemini не имеют доступа к этой операции.</p><button class="primary" type="submit" :disabled="personaBusy">{{ personaBusy ? 'Сохраняем…' : 'Сохранить личность' }}</button></div>
@@ -862,6 +1047,27 @@ onBeforeUnmount(() => {
           <div v-else class="empty-state panel">Создайте первую личность вручную или из уникального шаблона.</div>
         </template>
       </main>
+    </div>
+    <div v-if="regenerationPreview || bulkRegenerationPreview" class="modal-backdrop" @click.self="regenerationPreview = null; bulkRegenerationPreview = null">
+      <section class="modal-card" role="dialog" aria-modal="true" aria-label="Предпросмотр пересоздания личности">
+        <template v-if="regenerationPreview">
+          <div class="panel-heading"><div><p class="eyebrow">ПРЕДПРОСМОТР</p><h3>Пересоздать {{ regenerationPreview.username }}</h3></div><button class="icon-button" type="button" @click="regenerationPreview = null">×</button></div>
+          <p class="muted">Имя аккаунта и идентификатор личности останутся прежними. Перед записью сервер сохранит полный предыдущий канон; ручные разделы имеют приоритет.</p>
+          <p v-if="regenerationPreview.legacyManualReviewRequired" class="notice error">Этот профиль создан до появления точного учёта ручных полей. Он не менялся автоматически: внимательно сравните канон. Полная старая версия уже сохранена в PostgreSQL.</p>
+          <div class="preview-comparison"><article><span>Сейчас</span><h4>{{ regenerationPreview.current.name }}</h4><p>{{ personaPreviewText(regenerationPreview.current) }}</p><details open><summary>Полный текущий канон</summary><pre>{{ personaFullPreview(regenerationPreview.current) }}</pre></details></article><article><span>Новая личность</span><h4>{{ regenerationPreview.proposed.name }}</h4><p>{{ personaPreviewText(regenerationPreview.proposed) }}</p><details open><summary>Полный предлагаемый канон</summary><pre>{{ personaFullPreview(regenerationPreview.proposed) }}</pre></details></article></div>
+          <div class="preview-notice"><strong>Сохранятся ручные разделы: {{ regenerationPreview.preservedManualOverrides.length }}</strong><small>{{ regenerationPreview.preservedManualOverrides.join(', ') || 'Ручных изменений пока нет' }}</small></div>
+          <div class="modal-actions"><button class="secondary" type="button" @click="regenerationPreview = null">Отмена</button><button class="primary" type="button" :disabled="personaBusy" @click="applySelectedRegeneration">Создать резервную копию и применить</button></div>
+        </template>
+        <template v-else-if="bulkRegenerationPreview">
+          <div class="panel-heading"><div><p class="eyebrow">МАССОВЫЙ ПРЕДПРОСМОТР</p><h3>Проверено личностей: {{ bulkRegenerationPreview.items.length }}</h3></div><button class="icon-button" type="button" @click="bulkRegenerationPreview = null">×</button></div>
+          <p class="muted">Ручные личности пропущены. Для каждой автоматически созданной записи будет сделана отдельная резервная копия; имя аккаунта, идентификатор личности и отслеживаемые ручные правки сохраняются.</p>
+          <p v-if="bulkRegenerationPreview.items.some(item => item.legacyManualReviewRequired)" class="notice error">Есть {{ bulkRegenerationPreview.items.filter(item => item.legacyManualReviewRequired).length }} профилей старой версии без прежней карты изменённых полей. Сервер не менял их автоматически; применение этого окна является явным подтверждением после сравнения.</p>
+          <p v-if="bulkRegenerationPreview.audit.maximumSimilarity >= PERSONA_SIMILARITY_WARNING_THRESHOLD" class="notice error">⚠ Предложенные личности слишком похожи: максимальное сходство {{ bulkRegenerationPreview.audit.maximumSimilarity.toFixed(3) }}.</p>
+          <div class="audit-grid compact-audit"><article><span>Уникальных личностей</span><strong>{{ bulkRegenerationPreview.audit.uniquePersonaCount }}</strong></article><article><span>Уникальных стилей речи</span><strong>{{ bulkRegenerationPreview.audit.uniqueSpeechFingerprintCount }}</strong></article><article><span>Максимальное сходство</span><strong>{{ bulkRegenerationPreview.audit.maximumSimilarity.toFixed(3) }}</strong></article><article><span>Ошибок связности</span><strong>{{ bulkRegenerationPreview.audit.coherenceErrors.length }}</strong></article></div>
+          <div class="bulk-preview-list"><article v-for="item in bulkRegenerationPreview.items" :key="item.personaId"><strong>{{ item.username }}</strong><span>{{ item.current.identity.firstName }} → {{ item.proposed.identity.firstName }}<template v-if="item.proposed.identity.preferredName"> / {{ item.proposed.identity.preferredName }}</template></span><small>ручных разделов: {{ item.preservedManualOverrides.length }}</small><button class="text-button" type="button" @click="openBulkPersonaPreview(item)">Открыть полное сравнение</button></article></div>
+          <div class="modal-actions"><button class="secondary" type="button" @click="bulkRegenerationPreview = null">Отмена</button><button class="primary" type="button" :disabled="personaBusy || !bulkRegenerationPreview.items.length" @click="applyBulkRegeneration">Сделать резервные копии и применить всё</button></div>
+        </template>
+      </section>
     </div>
   </div>
 </template>

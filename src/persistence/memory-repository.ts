@@ -12,6 +12,7 @@ import {
   AppRepository,
   BotAccountRecord,
   EncryptedTwitchCredentialRecord,
+  PersonaCanonBackupRecord,
   TwitchCredentialRefreshFailure,
   TwitchOAuthNonceRecord,
 } from './repository';
@@ -21,6 +22,7 @@ export class MemoryRepository implements AppRepository {
   private personaMemories: PersonaMemoryItem[] = [];
   private personaConversationMessages: PersonaConversationMessage[] = [];
   private personaRelationships = new Map<string, PersonaRelationship>();
+  private personaCanonBackups: PersonaCanonBackupRecord[] = [];
   private bots = new Map<string, BotAccountRecord>();
   private twitchCredentials = new Map<string, EncryptedTwitchCredentialRecord>();
   private twitchOAuthNonces = new Map<string, TwitchOAuthNonceRecord>();
@@ -51,6 +53,15 @@ export class MemoryRepository implements AppRepository {
     for (const key of this.personaRelationships.keys()) {
       if (key.startsWith(`${id}:`) || key.endsWith(`:${id}`)) this.personaRelationships.delete(key);
     }
+  }
+  async savePersonaCanonBackup(backup: PersonaCanonBackupRecord): Promise<void> {
+    this.personaCanonBackups.push(clone(backup));
+  }
+  async listPersonaCanonBackups(personaId: string, limit: number): Promise<PersonaCanonBackupRecord[]> {
+    return this.personaCanonBackups.filter((backup) => backup.personaId === personaId)
+      .sort((left, right) => right.createdAt - left.createdAt)
+      .slice(0, limit)
+      .map(clone);
   }
   async savePersonaMemory(memory: PersonaMemoryItem): Promise<void> {
     const index = this.personaMemories.findIndex((item) => item.id === memory.id);

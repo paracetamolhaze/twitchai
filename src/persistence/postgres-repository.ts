@@ -13,6 +13,7 @@ import {
   AppRepository,
   BotAccountRecord,
   EncryptedTwitchCredentialRecord,
+  PersonaCanonBackupRecord,
   TwitchCredentialRefreshFailure,
   TwitchOAuthNonceRecord,
 } from './repository';
@@ -76,6 +77,33 @@ export class PostgresRepository implements AppRepository {
 
   async deletePersona(id: string): Promise<void> {
     await this.pool.query('DELETE FROM personas WHERE id=$1', [id]);
+  }
+
+  async savePersonaCanonBackup(backup: PersonaCanonBackupRecord): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO persona_canon_backups
+       (persona_id, username, reason, generation_version, canon, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [backup.personaId, backup.username ?? null, backup.reason, backup.generationVersion, backup.canon, new Date(backup.createdAt)],
+    );
+  }
+
+  async listPersonaCanonBackups(personaId: string, limit: number): Promise<PersonaCanonBackupRecord[]> {
+    const result = await this.pool.query<{
+      persona_id: string; username: string | null; reason: string; generation_version: number; canon: BotPersona; created_at: Date;
+    }>(
+      `SELECT persona_id, username, reason, generation_version, canon, created_at
+       FROM persona_canon_backups WHERE persona_id=$1 ORDER BY created_at DESC, id DESC LIMIT $2`,
+      [personaId, limit],
+    );
+    return result.rows.map((row) => ({
+      personaId: row.persona_id,
+      ...(row.username ? { username: row.username } : {}),
+      reason: row.reason,
+      generationVersion: row.generation_version,
+      canon: row.canon,
+      createdAt: row.created_at.getTime(),
+    }));
   }
 
   async savePersonaMemory(memory: PersonaMemoryItem): Promise<void> {

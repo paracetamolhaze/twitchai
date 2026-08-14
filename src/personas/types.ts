@@ -1,4 +1,16 @@
 export const PERSONA_SCHEMA_VERSION = 2 as const;
+export const PERSONA_GENERATION_VERSION = 3 as const;
+
+export const PERSONA_EDITABLE_PATHS = [
+  'name', 'description', 'identity.firstName', 'identity.preferredName', 'identity.nickname', 'identity.nicknameOrigin',
+  'identity.birthDate', 'identity.birthplace', 'identity.grewUpIn', 'identity.currentLocation', 'identity.languages',
+  'identity.occupation', 'identity.education', 'identity.relationshipStatus', 'familyBackground', 'family', 'timeline',
+  'facts', 'opinions', 'knowledge', 'character', 'interests', 'speech', 'behavior', 'disclosure',
+  'streamerRelationship', 'relationships',
+] as const;
+export type PersonaEditablePath = typeof PERSONA_EDITABLE_PATHS[number];
+
+export type PersonaSource = 'generated' | 'manual';
 
 export interface PersonaLocation {
   country: string;
@@ -12,7 +24,9 @@ export interface PersonaLanguage {
 
 export interface PersonaIdentity {
   firstName: string;
+  preferredName?: string;
   nickname?: string;
+  nicknameOrigin?: string;
   /** ISO YYYY-MM-DD. Age is derived at read time and is never persisted separately. */
   birthDate?: string;
   birthplace?: PersonaLocation;
@@ -68,6 +82,14 @@ export type PersonaFactCategory =
   | 'music'
   | 'travel'
   | 'technology'
+  | 'automotive'
+  | 'animals'
+  | 'art'
+  | 'biology'
+  | 'law'
+  | 'money'
+  | 'sport'
+  | 'imperfection'
   | 'relationships'
   | 'habit'
   | 'preference'
@@ -102,16 +124,20 @@ export interface PersonaKnowledgeBoundaries {
 
 export interface SpeechFingerprint {
   averageMessageWords: number;
+  openingPatterns: string[];
+  endingPatterns: string[];
   vocabulary: string[];
   favoriteExpressions: string[];
   rareExpressions: string[];
   avoidedExpressions: string[];
   fillerWords: string[];
+  abbreviations: string[];
   typoStyle: string[];
   punctuationStyle: string;
   capitalizationStyle: string;
   laughStyles: string[];
   emojiPreferences: string[];
+  twitchEmotes: string[];
   profanityLevel: number;
   messageExamples: string[];
 }
@@ -137,6 +163,7 @@ export interface PersonaActivityPattern {
   directReplyLikelihood: number;
   eventSelectivity: number;
   preferredEventTypes: string[];
+  ignoredEventTypes: string[];
   averageDelayMs: { min: number; max: number };
 }
 
@@ -180,14 +207,36 @@ export interface PersonaRelationship {
   notes: string[];
 }
 
+export type PersonaDisclosureLevel = 'open' | 'moderate' | 'private';
+
+export interface PersonaDisclosure {
+  defaultLevel: PersonaDisclosureLevel;
+  privatePerson: boolean;
+  topics: {
+    family: PersonaDisclosureLevel;
+    work: PersonaDisclosureLevel;
+    relationships: PersonaDisclosureLevel;
+    money: PersonaDisclosureLevel;
+    location: PersonaDisclosureLevel;
+  };
+}
+
 export interface BotPersona {
   schemaVersion: typeof PERSONA_SCHEMA_VERSION;
+  generationVersion: number;
+  source: PersonaSource;
+  generatedFromUsername?: string;
+  manuallyEdited: boolean;
+  manualOverrides: PersonaEditablePath[];
+  /** True when v2 predates override metadata and needs explicit operator review before v3 replacement. */
+  legacyManualReviewRequired: boolean;
   /** Marks the biography as operator-authored fiction, never real personal data. */
   fictionalPersona: true;
   id: string;
   name: string;
   description: string;
   identity: PersonaIdentity;
+  familyBackground: string;
   family: PersonaRelative[];
   timeline: PersonaLifeEvent[];
   facts: PersonaFact[];
@@ -197,6 +246,7 @@ export interface BotPersona {
   interests: PersonaInterests;
   speech: SpeechFingerprint;
   behavior: PersonaBehavior;
+  disclosure: PersonaDisclosure;
   streamerRelationship: StreamerRelationship;
   relationships: PersonaRelationship[];
 }
@@ -250,5 +300,51 @@ export interface PersonaSummary {
   age?: number;
   city?: string;
   occupation?: string;
+  quickSummary: string;
   completeness: number;
+  uniqueness: number;
+  consistency: number;
+  mostSimilarPersonaId?: string;
+  mostSimilarUsername?: string;
+  similarityReasons: string[];
+  qualityWarnings: string[];
+}
+
+export interface PersonaValidationIssue {
+  code: string;
+  severity: 'error' | 'warning';
+  path: string;
+  message: string;
+}
+
+export interface PersonaSimilarityPair {
+  leftPersonaId: string;
+  rightPersonaId: string;
+  leftUsername?: string;
+  rightUsername?: string;
+  similarity: number;
+  reasons: string[];
+}
+
+export interface PersonaAuditReport {
+  accountCount: number;
+  personaCount: number;
+  uniquePersonaCount: number;
+  uniqueSpeechFingerprintCount: number;
+  countryOfBirthDistribution: Record<string, number>;
+  currentCountryDistribution: Record<string, number>;
+  currentCityDistribution: Record<string, number>;
+  occupationDistribution: Record<string, number>;
+  behaviorRanges: Record<string, { min: number; max: number }>;
+  structureRanges: Record<string, { min: number; max: number }>;
+  maximumSimilarity: number;
+  averageSimilarity: number;
+  mostSimilarPairs: PersonaSimilarityPair[];
+  coherenceErrors: PersonaValidationIssue[];
+  coherenceWarnings: PersonaValidationIssue[];
+  duplicateNicknameOrigins: string[];
+  duplicateRelativeNames: string[];
+  duplicateFavoriteExpressions: string[];
+  duplicateBiographyEvents: string[];
+  duplicateSpeechExamples: string[];
 }

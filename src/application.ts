@@ -236,12 +236,29 @@ export class Application {
       updateSettings: (settings) => this.updateSettings(settings),
       personas: () => this.personas.list(),
       personaSummaries: () => this.personas.summaries(),
+      personaAudit: () => this.personas.audit(),
       persona: (id) => this.personas.getOptional(id),
       createPersona: (persona) => this.personas.create(persona),
       createBlankPersona: (id, name) => this.personas.createBlank(id, name),
       createPersonaTemplate: (username, id) => this.personas.createTemplate(username, id),
       duplicatePersona: (sourceId, id, name) => this.personas.duplicate(sourceId, id, name),
-      updatePersona: (persona) => this.personas.update(persona),
+      updatePersona: async (persona) => {
+        const updated = await this.personas.update(persona);
+        await this.botManager.revalidatePersona(updated.id);
+        return updated;
+      },
+      previewPersonaRegeneration: (id) => this.personas.previewRegeneration(id),
+      previewAllPersonaRegenerations: () => this.personas.previewAllRegenerations(),
+      regeneratePersona: async (id, previewHash) => {
+        const updated = await this.personas.regenerate(id, previewHash);
+        await this.botManager.revalidatePersona(updated.id);
+        return updated;
+      },
+      regenerateAllPersonas: async (previews) => {
+        const updated = await this.personas.regenerateAll(previews);
+        await Promise.all(updated.map((persona) => this.botManager.revalidatePersona(persona.id)));
+        return updated;
+      },
       deletePersona: (id) => this.personas.delete(id),
       personaMemories: (personaId, limit) => this.personaMemory.list(personaId, limit),
       deletePersonaMemory: (personaId, memoryId) => this.personaMemory.delete(personaId, memoryId),

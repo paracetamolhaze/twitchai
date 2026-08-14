@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { PersonaStore } from '../src/personas/persona-store';
+import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { Logger } from '../src/logger';
 import { TwitchBotManager, TwitchChatClient } from '../src/twitch/bot-manager';
 import { TwitchTokenValidator } from '../src/twitch/oauth-validator';
@@ -59,38 +60,38 @@ describe('TwitchBotManager isolation', () => {
 
   it('keeps healthy accounts connected when one token fails', async () => {
     const { manager } = await setup([
-      { username: 'good', oauthToken: 'good', enabled: true },
-      { username: 'broken', oauthToken: 'bad', enabled: true },
+      { username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true },
+      { username: 'supercser2', oauthToken: 'bad', enabled: true },
     ], 'persona-that-no-longer-exists');
-    expect(manager.listStatuses().find((bot) => bot.username === 'good')?.connectionState).toBe('CONNECTED');
-    expect(manager.listStatuses().find((bot) => bot.username === 'good')?.personaId).not.toBe('persona-that-no-longer-exists');
+    expect(manager.listStatuses().find((bot) => bot.username === 'gigantiuz')?.connectionState).toBe('CONNECTED');
+    expect(manager.listStatuses().find((bot) => bot.username === 'gigantiuz')?.personaId).not.toBe('persona-that-no-longer-exists');
     expect(new Set(manager.listStatuses().map((bot) => bot.personaId)).size).toBe(2);
-    expect(manager.listStatuses().find((bot) => bot.username === 'broken')?.connectionState).toBe('ERROR');
+    expect(manager.listStatuses().find((bot) => bot.username === 'supercser2')?.connectionState).toBe('ERROR');
     await manager.stop();
   });
 
   it('tracks reconnect state and recovery', async () => {
-    const { manager, clients } = await setup([{ username: 'good', oauthToken: 'good', enabled: true }]);
-    clients.get('good')?.emit('reconnect');
+    const { manager, clients } = await setup([{ username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true }]);
+    clients.get('gigantiuz')?.emit('reconnect');
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(manager.listStatuses()[0]?.connectionState).toBe('CONNECTING');
-    clients.get('good')?.emit('connected', 'localhost', 443);
-    clients.get('good')?.emit('join', '#channel', 'good', true);
+    clients.get('gigantiuz')?.emit('connected', 'localhost', 443);
+    clients.get('gigantiuz')?.emit('join', '#channel', 'gigantiuz', true);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(manager.listStatuses()[0]?.connectionState).toBe('CONNECTED');
     await manager.stop();
   });
 
   it('never sends through a disabled account', async () => {
-    const { manager } = await setup([{ username: 'disabled', oauthToken: 'disabled', enabled: false }]);
+    const { manager } = await setup([{ username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: false }]);
     expect(manager.listStatuses()[0]?.connectionState).toBe('DISABLED');
-    expect(await manager.send('disabled', 'hello')).toBe(false);
+    expect(await manager.send('gigantiuz', 'hello')).toBe(false);
     await manager.stop();
   });
 
   it('does not let stale persisted state re-enable a config-disabled account', async () => {
     const { manager } = await setup(
-      [{ username: 'legacy', oauthToken: 'legacy', enabled: false }],
+      [{ username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: false }],
       'analyst',
       true,
     );
@@ -104,16 +105,45 @@ describe('TwitchBotManager isolation', () => {
 
   it('validates one-to-one persona assignment without a restart', async () => {
     const { manager, personas } = await setup([
-      { username: 'one', oauthToken: 'one', enabled: true },
-      { username: 'two', oauthToken: 'two', enabled: true },
+      { username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true },
+      { username: 'supercser2', oauthToken: 'supercser2', enabled: true },
     ]);
     const [one, two] = manager.listStatuses();
     expect(one?.personaId).not.toBe(two?.personaId);
-    expect(await manager.assignPersona('two', one!.personaId)).toBe('persona_in_use');
-    expect(await manager.assignPersona('two', 'missing-persona')).toBe('persona_not_found');
-    const free = personas.list().find((persona) => !manager.listStatuses().some((bot) => bot.personaId === persona.id))!;
-    expect(await manager.assignPersona('two', free.id)).toBe('updated');
-    expect(manager.listStatuses().find((bot) => bot.username === 'two')?.personaId).toBe(free.id);
+    expect(await manager.assignPersona('supercser2', one!.personaId)).toBe('persona_username_mismatch');
+    expect(await manager.assignPersona('supercser2', 'missing-persona')).toBe('persona_not_found');
+    const manualSource = generatePersonaV3('supercser2', { id: 'operator-authored-free-persona' });
+    const free = await personas.create({
+      ...manualSource,
+      source: 'manual',
+      generatedFromUsername: undefined,
+      manuallyEdited: true,
+      manualOverrides: [],
+    });
+    expect(await manager.assignPersona('supercser2', free.id)).toBe('updated');
+    expect(manager.listStatuses().find((bot) => bot.username === 'supercser2')?.personaId).toBe(free.id);
+    await manager.stop();
+  });
+
+  it('keeps an unknown username disabled until its manual persona is complete', async () => {
+    const { manager } = await setup([{ username: 'unreviewed_account', oauthToken: 'unreviewed_account', enabled: true }]);
+    expect(manager.listStatuses()[0]).toMatchObject({ enabled: false, connectionState: 'DISABLED', chatConnected: false });
+    expect(manager.listStatuses()[0]?.lastError).toMatch(/Заполните и проверьте/);
+    expect(await manager.setEnabled('unreviewed_account', true)).toBe('persona_incomplete');
+    await manager.stop();
+  });
+
+  it('disconnects an active account when an operator edit breaks its persona mapping', async () => {
+    const { manager, personas } = await setup([{ username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true }]);
+    const status = manager.listStatuses()[0]!;
+    const edited = personas.get(status.personaId);
+    edited.identity.nickname = 'another_account';
+    await personas.update(edited);
+
+    await manager.revalidatePersona(status.personaId);
+
+    expect(manager.listStatuses()[0]).toMatchObject({ enabled: false, connectionState: 'DISABLED', chatConnected: false });
+    expect(manager.listStatuses()[0]?.lastError).toMatch(/другого Twitch-аккаунта/);
     await manager.stop();
   });
 });

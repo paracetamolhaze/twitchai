@@ -96,7 +96,7 @@ export class ReactionPolicyGuard {
       if (await input.isDuplicate(username, message)) { reject('recent_duplicate'); continue; }
 
       const reservationId = randomUUID();
-      const delayMs = this.delayFor(accepted.length, Math.min(input.reactions.length, this.options.maxReactionsPerEvent));
+      const delayMs = this.delayFor(candidate, accepted.length, Math.min(input.reactions.length, this.options.maxReactionsPerEvent));
       this.reservations.set(reservationId, { username, scheduledAt: now + delayMs });
       accepted.push({
         reservationId,
@@ -122,9 +122,12 @@ export class ReactionPolicyGuard {
     return Math.max(0, this.options.globalMessagesPer30Seconds - this.recentGlobalSends.length - this.reservations.size);
   }
 
-  private delayFor(index: number, count: number): number {
-    const minimum = Math.max(0, this.options.minimumDelayMs);
-    const maximum = Math.max(minimum, this.options.maximumDelayMs);
+  private delayFor(candidate: ReactionBotCandidate, index: number, count: number): number {
+    const configuredMinimum = Math.max(0, this.options.minimumDelayMs);
+    const configuredMaximum = Math.max(configuredMinimum, this.options.maximumDelayMs);
+    const personaDelay = candidate.persona.behavior.activity.averageDelayMs;
+    const minimum = Math.max(configuredMinimum, personaDelay.min);
+    const maximum = Math.max(minimum, Math.min(configuredMaximum, personaDelay.max));
     const span = maximum - minimum;
     return Math.round(minimum + ((index + this.random()) / Math.max(1, count)) * span);
   }

@@ -5,7 +5,7 @@ import { BotHistory } from '../src/personas/bot-history';
 import { PersonaContextBuilder } from '../src/personas/persona-context-builder';
 import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
-import { DEFAULT_PERSONAS } from '../src/personas/defaults';
+import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
@@ -19,13 +19,15 @@ const event: StreamEvent = {
   summary: 'стример промахнулся решающим ультимейтом', importance: 0.92,
   confidence: 0.96, source: 'gemini-live', directMentions: [],
 };
+const CANDIDATE_PERSONAS = ['gigantiuz', 'supercser2', '404notf0und404', 'novostro1ka']
+  .map((username) => generatePersonaV3(username));
 
 function bot(username: string, index: number): ReactionBotCandidate {
   return {
     username,
     persona: {
-      ...DEFAULT_PERSONAS[index]!,
-      behavior: { ...DEFAULT_PERSONAS[index]!.behavior, minimumIntervalMs: 30_000 },
+      ...CANDIDATE_PERSONAS[index]!,
+      behavior: { ...CANDIDATE_PERSONAS[index]!.behavior, minimumIntervalMs: 30_000 },
     },
     enabled: true,
     connectionState: 'CONNECTED',
@@ -111,7 +113,7 @@ describe('single-session reaction protocol', () => {
       reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
     });
 
-    expect(result.accepted).toEqual([{ username: 'bot-three', delayMs: 100 }]);
+    expect(result.accepted).toEqual([{ username: 'bot-three', delayMs: 8_000 }]);
     expect(sent).toEqual([]);
     await vi.runAllTimersAsync();
     expect(sent).toEqual([{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }]);
