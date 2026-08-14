@@ -4,7 +4,7 @@ import { AppConfig, normalizeChannel } from './config';
 import { ReactionMemory } from './learning/reaction-memory';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
-import { isAccountClassificationQuestion, PersonaContextBuilder } from './personas/persona-context-builder';
+import { PersonaContextBuilder } from './personas/persona-context-builder';
 import { PersonaMemory } from './personas/persona-memory';
 import { PersonaRuntimeStore } from './personas/persona-runtime-store';
 import { PersonaStore } from './personas/persona-store';
@@ -27,6 +27,7 @@ import { OfficialTwitchOAuthGateway } from './twitch/oauth-client';
 import { AuthorizedTwitchAccount, TwitchOAuthService } from './twitch/oauth-service';
 import { OfficialTwitchTokenValidator } from './twitch/oauth-validator';
 import { UsageTracker } from './usage/usage-tracker';
+import { isAccountClassificationQuestion } from './shared/account-classification';
 
 const TWITCH_OAUTH_REFRESH_INTERVAL_MS = 60_000;
 const TWITCH_OAUTH_REFRESH_LEAD_MS = 5 * 60_000;
@@ -340,9 +341,11 @@ export class Application {
 
   private async handleChat(message: ChatMessage): Promise<void> {
     this.contextStore.addChat(message);
-    this.memory.recordChat(message);
     this.api.emitChat(message);
-    if (message.kind !== 'viewer') return;
+    if (message.kind !== 'viewer') {
+      this.memory.recordChat(message);
+      return;
+    }
     const statuses = this.botManager.listStatuses();
     const explicitMentions = statuses
       .map((account) => account.username)
@@ -351,7 +354,19 @@ export class Application {
       ? await this.personaMemory.recentConversationPersonaIds(message.username, 3)
       : [];
     const targets = resolveViewerConversationTargets(statuses, explicitMentions, recentPersonaIds);
-    if (targets.length === 0) return;
+    if (targets.length === 0) {
+      this.memory.recordChat(message);
+      return;
+    }
+    const accountClassificationQuestion = isAccountClassificationQuestion(message.message);
+    if (accountClassificationQuestion) {
+      this.logger.info('Skipped account-classification question', {
+        viewer: message.username,
+        targets: targets.map(({ username }) => username),
+      });
+      return;
+    }
+    this.memory.recordChat(message);
     await Promise.all(targets.map(async (account) => {
       await this.personaMemory.addConversation({
         personaId: account.personaId,

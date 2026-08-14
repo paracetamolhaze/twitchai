@@ -80,6 +80,39 @@ async function setup() {
 afterEach(() => vi.useRealTimers());
 
 describe('single-session reaction protocol', () => {
+  it('deterministically skips all generated replies to a direct account-classification question', async () => {
+    vi.useFakeTimers();
+    const { coordinator, sent } = await setup();
+    const classificationEvent: StreamEvent = {
+      ...event,
+      id: 'account-classification-event',
+      type: 'conversation',
+      summary: 'viewer directly addressed @bot-one: @bot-one ты бот?',
+      speech: '@bot-one ты бот?',
+      directMentions: ['bot-one'],
+      viewerUsername: 'viewer',
+    };
+
+    for (const [index, message] of ['палево', 'да', 'нет, я человек', 'я Gemini'].entries()) {
+      const classifiedEvent = { ...classificationEvent, id: `${classificationEvent.id}-${index}` };
+      const prepared = await coordinator.prepare(classifiedEvent);
+      expect(prepared.candidates).toHaveLength(1);
+      expect(prepared.candidates[0]?.accountClassificationQuestion).toBe(true);
+      const result = await coordinator.submitBatch({
+        eventId: classifiedEvent.id,
+        reactions: [{ username: 'bot-one', message }],
+      });
+
+      expect(result.accepted).toEqual([]);
+      expect(result.rejected).toEqual([
+        { username: 'bot-one', reason: 'account_classification' },
+      ]);
+    }
+    await vi.runAllTimersAsync();
+    expect(sent).toEqual([]);
+    await coordinator.stop();
+  });
+
   it('rejects internal implementation leaks without blocking an ordinary external AI topic', async () => {
     vi.useFakeTimers();
     const { coordinator, sent } = await setup();
@@ -101,8 +134,10 @@ describe('single-session reaction protocol', () => {
       ...event,
       id: 'external-ai-topic-event',
       type: 'conversation',
-      summary: 'стример обсуждает Gemini и нейросети как обычную тему',
-      speech: 'как Gemini помогает с кодом?',
+      summary: 'viewer directly addressed @bot-one: ты пробовал Gemini для кода?',
+      speech: '@bot-one ты пробовал Gemini для кода?',
+      directMentions: ['bot-one'],
+      viewerUsername: 'viewer',
     };
     await coordinator.prepare(externalAiEvent);
     const externalTopic = await coordinator.submitBatch({
@@ -119,7 +154,11 @@ describe('single-session reaction protocol', () => {
 
   it('rejects self-disclosure as an artificial viewer, including close forms', async () => {
     const { coordinator, sent } = await setup();
-    const disclosures = ['я искусственный зритель', 'я являюсь синтетическим зрителем', 'я точно человек'];
+    const disclosures = [
+      'я искусственный зритель', 'я являюсь синтетическим зрителем', 'я ИИ', 'я Gemini',
+      'я программа', 'я алгоритм', 'я человек', 'я настоящий человек', 'я реальный человек',
+      'какая модель меня генерирует',
+    ];
 
     for (const [index, message] of disclosures.entries()) {
       const disclosureEvent = { ...event, id: `artificial-viewer-${index}` };

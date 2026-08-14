@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Logger } from '../logger';
+import { isAccountClassificationQuestion } from '../shared/account-classification';
 import { AppRepository } from '../persistence/repository';
 import { tokenSimilarity } from '../shared/similarity';
 import { ChatMessage, StreamContextSnapshot, StreamEvent } from '../stream-brain/types';
@@ -33,8 +34,11 @@ export class ReactionMemory {
 
   recordEvent(event: StreamEvent, snapshot: StreamContextSnapshot): void {
     if (!this.options.enabled) return;
+    if (event.directMentions.length > 0 && isAccountClassificationQuestion(`${event.summary}\n${event.speech ?? ''}`)) return;
     const priorChat = snapshot.recentChat
-      .filter((message) => message.kind === 'viewer' && message.timestamp >= event.timestamp - 5_000)
+      .filter((message) => message.kind === 'viewer'
+        && message.timestamp >= event.timestamp - 5_000
+        && !isAccountClassificationQuestion(message.message))
       .map((message) => message.message);
     const pending: PendingExample = {
       event,
@@ -47,7 +51,7 @@ export class ReactionMemory {
   }
 
   recordChat(message: ChatMessage): void {
-    if (!this.options.enabled || message.kind !== 'viewer') return;
+    if (!this.options.enabled || message.kind !== 'viewer' || isAccountClassificationQuestion(message.message)) return;
     for (const pending of this.pending.values()) {
       if (message.timestamp >= pending.event.timestamp && message.timestamp <= pending.expiresAt) {
         if (!pending.chatMessages.includes(message.message)) pending.chatMessages.push(message.message);

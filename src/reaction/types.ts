@@ -63,6 +63,7 @@ export type ReactionRejectionReason =
   | 'too_many_reactions'
   | 'empty_message'
   | 'control_value'
+  | 'account_classification'
   | 'internal_metadata'
   | 'message_too_long'
   | 'account_cooldown'

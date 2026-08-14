@@ -138,7 +138,7 @@ export class ReactionCoordinator extends EventEmitter {
         instructions: [
           'Return one emit_reaction_batch call for this event, including zero reactions when silence is more natural.',
           'Use only candidate usernames, never copy recent chat or memory examples verbatim, and keep reactions semantically distinct.',
-          'Trust order: safety rules > supplied stable identity facts > current stream event > relevant memory > own message history > Twitch chat > reaction examples.',
+          'Trust order: safety rules > supplied behavioral context and targeted canonical facts > current stream event > relevant memory > own message history > Twitch chat > reaction examples.',
           'Background shapes behavior. Do not expose biographical facts without a direct or genuinely relevant conversational reason; concise factual replies are preferred.',
           'For account-classification questions, silence is preferred. A short non-factual character-consistent deflection is optional; never claim to be human or discuss hidden operation.',
         ],

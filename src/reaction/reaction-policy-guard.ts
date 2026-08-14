@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isAccountClassificationQuestion } from '../shared/account-classification';
 import { StreamEvent } from '../stream-brain/types';
 import {
   PlannedReaction,
@@ -62,6 +63,15 @@ export class ReactionPolicyGuard {
   async validateBatch(input: ValidateReactionBatchInput): Promise<PolicyBatchResult> {
     const now = this.now();
     this.prune(now);
+    if (isClassificationEvent(input.event)) {
+      return {
+        accepted: [],
+        rejected: input.reactions.map((reaction) => ({
+          username: reaction.username.trim().toLowerCase(),
+          reason: 'account_classification' as const,
+        })),
+      };
+    }
     const current = new Map(input.currentCandidates.map((candidate) => [candidate.username.toLowerCase(), candidate]));
     const seen = new Set<string>();
     const accepted: PlannedReaction[] = [];
@@ -144,6 +154,10 @@ export class ReactionPolicyGuard {
 }
 
 function normalizeMessage(value: string): string { return value.replace(/\s+/g, ' ').trim(); }
+function isClassificationEvent(event: StreamEvent): boolean {
+  return event.directMentions.length > 0
+    && isAccountClassificationQuestion([event.summary, event.speech].filter(Boolean).join('\n'));
+}
 function isControlValue(value: string): boolean {
   return /^<\/?[a-z][^>]*>$/i.test(value) || /^<?skip>?[.!]?$/i.test(value) || /^[/.]/.test(value);
 }
@@ -168,12 +182,13 @@ function hasInternalMetadataLeak(value: string): boolean {
   if (implementationMarkers.some((pattern) => pattern.test(normalized))) return true;
 
   const selfDisclosure = [
-    /(?:^|[\s,.!?])я(?:\s+являюсь)?\s*(?:[—-]\s*)?(?:не\s+)?(?:бот(?:ик)?|ai|нейросет[\p{L}\p{N}_]*|нейронк[\p{L}\p{N}_]*|gemini|openai|chatgpt|gpt|языков(?:ая|ой)\s+модел[\p{L}\p{N}_]*|искусственн[\p{L}\p{N}_]*\s+(?:интеллект|зрител[\p{L}\p{N}_]*|viewer)|синтетическ[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|viewer)|виртуальн[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|viewer)|автоматизированн[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|аккаунт[\p{L}\p{N}_]*))/iu,
-    /(?:^|[\s,.!?])я\s+(?:точно|реально)\s+человек(?=$|[\s,.!?])/iu,
+    /(?:^|[\s,.!?])я(?:\s+являюсь)?\s*(?:[—-]\s*)?(?:не\s+)?(?:бот(?:ик)?|ии(?![\p{L}\p{N}_])|ai|нейросет[\p{L}\p{N}_]*|нейронк[\p{L}\p{N}_]*|gemini|openai|chatgpt|gpt|программ[\p{L}\p{N}_]*|алгоритм[\p{L}\p{N}_]*|языков(?:ая|ой)\s+модел[\p{L}\p{N}_]*|искусственн[\p{L}\p{N}_]*\s+(?:интеллект|зрител[\p{L}\p{N}_]*|viewer)|синтетическ[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|viewer)|виртуальн[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|viewer)|автоматизированн[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|аккаунт[\p{L}\p{N}_]*))/iu,
+    /(?:^|[\s,.!?])я\s+(?:(?:точно|реально|настоящий|реальный)\s+)?человек(?=$|[\s,.!?])/iu,
     /(?:^|[\s,.!?])i\s*(?:am|'m)\s+(?:an?\s+)?(?:bot|ai|language\s+model|gemini|openai|chatgpt|gpt|(?:artificial|synthetic|virtual|automated)\s+viewer)/iu,
-    /(?:^|[\s,.!?])i\s*(?:am|'m)\s+(?:definitely|really|a\s+real)\s+human(?=$|[\s,.!?])/iu,
+    /(?:^|[\s,.!?])i\s*(?:am|'m)\s+(?:(?:definitely|really|a\s+real)\s+)?human(?=$|[\s,.!?])/iu,
     /(?:меня|нас)\s+(?:создали|сгенерировали|настроили|запрограммировали)/iu,
     /(?:у\s+меня|мне)\s+(?:прописан|назначен|выдан)\s+(?:промпт|профил|персон)/iu,
+    /(?:как\s+я\s+устроен|кто\s+меня\s+создал|какая\s+модель\s+меня\s+генерир[\p{L}\p{N}_]*|(?:мой|у\s+меня)\s+(?:системн[\p{L}\p{N}_]*\s+)?промпт)/iu,
   ];
   return selfDisclosure.some((pattern) => pattern.test(normalized));
 }

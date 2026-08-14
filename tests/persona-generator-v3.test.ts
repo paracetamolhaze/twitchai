@@ -152,7 +152,7 @@ describe('Deep Persona Generator v3', () => {
       recentMessages: [], directMention: false, observeRuntime: false,
     })));
     const fingerprints = new Set(contexts.map((context) => JSON.stringify({
-      identity: context.identity.firstName,
+      character: context.character,
       speech: context.speech,
       behavior: context.behavior,
       knowledge: context.knowledge,

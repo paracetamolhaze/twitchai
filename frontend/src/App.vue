@@ -174,7 +174,7 @@ interface BulkRegenerationPreview {
 }
 type ReactionRejectionReason =
   | 'duplicate_username' | 'unknown_candidate' | 'not_connected' | 'too_many_reactions'
-  | 'empty_message' | 'control_value' | 'internal_metadata' | 'message_too_long' | 'account_cooldown'
+  | 'empty_message' | 'control_value' | 'account_classification' | 'internal_metadata' | 'message_too_long' | 'account_cooldown'
   | 'account_busy' | 'global_rate_limit' | 'recent_duplicate' | 'invalid_item'
 interface ReactionDecision {
   eventId: string
@@ -762,7 +762,7 @@ function rejectionLabel(reason: ReactionRejectionReason): string {
   const labels: Record<ReactionRejectionReason, string> = {
     duplicate_username: 'аккаунт указан дважды', unknown_candidate: 'неизвестный аккаунт',
     not_connected: 'нет соединения', too_many_reactions: 'слишком много реакций',
-    empty_message: 'пустое сообщение', control_value: 'служебное значение', internal_metadata: 'внутренние служебные данные',
+    empty_message: 'пустое сообщение', control_value: 'служебное значение', account_classification: 'вопрос о природе аккаунта', internal_metadata: 'внутренние служебные данные',
     message_too_long: 'сообщение слишком длинное', account_cooldown: 'пауза аккаунта',
     account_busy: 'аккаунт уже занят', global_rate_limit: 'общий лимит сообщений',
     recent_duplicate: 'похожее сообщение уже было', invalid_item: 'некорректная реакция',

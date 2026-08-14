@@ -1,5 +1,5 @@
 import { ChatMessage, StreamEvent } from '../stream-brain/types';
-import { ageFromBirthDate } from './schema';
+import { isAccountClassificationQuestion } from '../shared/account-classification';
 import { PersonaMemory, relevanceScore, semanticTokens } from './persona-memory';
 import { PersonaRuntimeStore } from './persona-runtime-store';
 import {
@@ -10,6 +10,8 @@ import {
   PersonaMemoryItem,
   PersonaRelativeKind,
 } from './types';
+
+export { isAccountClassificationQuestion } from '../shared/account-classification';
 
 /**
  * This is the intentionally narrow context sent to the Live model. Administrative
@@ -22,13 +24,6 @@ export interface RelevantCanonItem {
 
 export interface PersonaReactionContext {
   username: string;
-  identity: {
-    firstName: string;
-    preferredName?: string;
-    nickname?: string;
-    /** A compact behavioral summary, not a raw biography record. */
-    summary: string;
-  };
   character: {
     summary: string;
     traits: string[];
@@ -115,6 +110,11 @@ interface FactCategoryPolicy {
   disclosureTopic?: keyof BotPersona['disclosure']['topics'];
 }
 
+interface ModelTextFilter {
+  personalTokens: Set<string>;
+  exactPersonalPhrases: string[];
+}
+
 const FACT_CATEGORY_POLICIES: Record<PersonaFactCategory, FactCategoryPolicy> = {
   family: { visibility: 'personal', questionKinds: ['family'], disclosureTopic: 'family' },
   childhood: { visibility: 'personal', questionKinds: ['family'], disclosureTopic: 'family' },
@@ -149,52 +149,59 @@ export class PersonaContextBuilder {
   ) {}
 
   async build(input: BuildPersonaContextInput): Promise<PersonaReactionContext> {
-    const topic = [
+    const eventTopic = [
       input.event.summary,
       input.event.speech,
       input.event.visualContext,
       input.event.gameContext,
+    ].filter(Boolean).join(' ');
+    const retrievalTopic = [
+      eventTopic,
       ...(input.directMention ? (input.recentChat ?? []).slice(-4).map((message) => message.message) : []),
     ].filter(Boolean).join(' ');
     const [memories, conversation] = await Promise.all([
-      this.memory.retrieve(input.persona.id, topic, this.maxMemoryItems),
+      this.memory.retrieve(input.persona.id, retrievalTopic, this.maxMemoryItems),
       input.viewerUsername
         ? this.memory.conversation(input.persona.id, input.viewerUsername)
         : Promise.resolve([]),
     ]);
-    const personalQuestion = classifyPersonalQuestion(topic, input.directMention, conversation);
-    const accountClassificationQuestion = isAccountClassificationQuestion(topic);
+    const personalQuestion = classifyPersonalQuestion(eventTopic, input.directMention, conversation);
+    const accountClassificationQuestion = isAccountClassificationQuestion(
+      [input.event.summary, input.event.speech].filter(Boolean).join('\n'),
+    );
     const canRevealQuestion = personalQuestion === undefined || disclosureAllows(input.persona, personalQuestion);
     const runtime = input.observeRuntime === false
       ? this.runtime.peek(input.persona.id)
       : this.runtime.observe(input.persona.id, input.event.type, input.event.importance);
+    const textFilter = modelTextFilter(input.persona);
+    const safeText = (value: string): string => modelSafeText(value, textFilter);
+    const safeTexts = (values: string[], limit: number): string[] => modelSafeTexts(values, limit, textFilter);
 
     return {
       username: input.username,
-      identity: modelIdentity(input.persona, input.event.timestamp),
       character: {
-        summary: modelSafeText(input.persona.character.summary),
-        traits: modelSafeTexts(input.persona.character.traits, 6),
-        flaws: modelSafeTexts(input.persona.character.flaws, 4),
-        humor: modelSafeText(input.persona.character.humor),
+        summary: safeText(input.persona.character.summary),
+        traits: safeTexts(input.persona.character.traits, 6),
+        flaws: safeTexts(input.persona.character.flaws, 4),
+        humor: safeText(input.persona.character.humor),
       },
       speech: {
-        summary: `${input.persona.speech.averageMessageWords} слов в среднем; ${input.persona.speech.punctuationStyle}; ${input.persona.speech.capitalizationStyle}`,
-        favoriteExpressions: modelSafeTexts(input.persona.speech.favoriteExpressions, 5),
-        openingPatterns: modelSafeTexts(input.persona.speech.openingPatterns, 4),
-        endingPatterns: modelSafeTexts(input.persona.speech.endingPatterns, 4),
-        fillerWords: modelSafeTexts(input.persona.speech.fillerWords, 5),
-        abbreviations: modelSafeTexts(input.persona.speech.abbreviations, 5),
-        laughStyles: modelSafeTexts(input.persona.speech.laughStyles, 4),
-        avoidedExpressions: modelSafeTexts(input.persona.speech.avoidedExpressions, 5),
-        typoStyle: modelSafeTexts(input.persona.speech.typoStyle, 3),
-        emojiPreferences: modelSafeTexts(input.persona.speech.emojiPreferences, 4),
-        twitchEmotes: modelSafeTexts(input.persona.speech.twitchEmotes, 4),
+        summary: safeText(`${input.persona.speech.averageMessageWords} слов в среднем; ${input.persona.speech.punctuationStyle}; ${input.persona.speech.capitalizationStyle}`),
+        favoriteExpressions: safeTexts(input.persona.speech.favoriteExpressions, 5),
+        openingPatterns: safeTexts(input.persona.speech.openingPatterns, 4),
+        endingPatterns: safeTexts(input.persona.speech.endingPatterns, 4),
+        fillerWords: safeTexts(input.persona.speech.fillerWords, 5),
+        abbreviations: safeTexts(input.persona.speech.abbreviations, 5),
+        laughStyles: safeTexts(input.persona.speech.laughStyles, 4),
+        avoidedExpressions: safeTexts(input.persona.speech.avoidedExpressions, 5),
+        typoStyle: safeTexts(input.persona.speech.typoStyle, 3),
+        emojiPreferences: safeTexts(input.persona.speech.emojiPreferences, 4),
+        twitchEmotes: safeTexts(input.persona.speech.twitchEmotes, 4),
         profanityLevel: input.persona.speech.profanityLevel,
-        messageExamples: selectSpeechExamples(input.persona, topic, 5),
+        messageExamples: selectSpeechExamples(input.persona, eventTopic, 5, textFilter),
       },
       behavior: {
-        styleInstructions: modelSafeText(input.persona.behavior.styleInstructions),
+        styleInstructions: safeText(input.persona.behavior.styleInstructions),
         verbosity: input.persona.behavior.verbosity,
         activity: {
           ...input.persona.behavior.activity,
@@ -209,45 +216,49 @@ export class PersonaContextBuilder {
         sarcasmLevel: input.persona.behavior.sarcasmLevel,
         toxicityLimit: input.persona.behavior.toxicityLimit,
         imperfections: {
-          typingMistakes: input.persona.behavior.imperfections.typingMistakes.slice(0, 3),
-          hesitations: input.persona.behavior.imperfections.hesitations.slice(0, 3),
-          emotionalTriggers: input.persona.behavior.imperfections.emotionalTriggers.slice(0, 4),
-          blindSpots: input.persona.behavior.imperfections.blindSpots.slice(0, 4),
+          typingMistakes: safeTexts(input.persona.behavior.imperfections.typingMistakes, 3),
+          hesitations: safeTexts(input.persona.behavior.imperfections.hesitations, 3),
+          emotionalTriggers: safeTexts(input.persona.behavior.imperfections.emotionalTriggers, 4),
+          blindSpots: safeTexts(input.persona.behavior.imperfections.blindSpots, 4),
         },
       },
       knowledge: {
-        expertise: input.persona.knowledge.expertise.slice(0, 8),
-        familiarTopics: input.persona.knowledge.familiarTopics.slice(0, 8),
-        weakTopics: input.persona.knowledge.weakTopics.slice(0, 8),
-        unknownTopics: input.persona.knowledge.unknownTopics.slice(0, 8),
+        expertise: safeTexts(input.persona.knowledge.expertise, 8),
+        familiarTopics: safeTexts(input.persona.knowledge.familiarTopics, 8),
+        weakTopics: safeTexts(input.persona.knowledge.weakTopics, 8),
+        unknownTopics: safeTexts(input.persona.knowledge.unknownTopics, 8),
       },
       interests: {
-        games: input.persona.interests.games.slice(0, 6),
-        music: input.persona.interests.music.slice(0, 6),
-        food: input.persona.interests.food.slice(0, 6),
-        other: input.persona.interests.other.slice(0, 6),
+        games: safeTexts(input.persona.interests.games, 6),
+        music: safeTexts(input.persona.interests.music, 6),
+        food: safeTexts(input.persona.interests.food, 6),
+        other: safeTexts(input.persona.interests.other, 6),
       },
       streamerRelationship: {
         familiarity: input.persona.streamerRelationship.familiarity,
         supportiveness: input.persona.streamerRelationship.supportiveness,
         teasingLevel: input.persona.streamerRelationship.teasingLevel,
         favoriteStreamTypes: input.persona.streamerRelationship.favoriteStreamTypes.slice(0, 6),
-        recurringReferences: input.persona.streamerRelationship.recurringReferences.slice(0, 4),
+        recurringReferences: safeTexts(input.persona.streamerRelationship.recurringReferences, 4),
       },
       runtime: {
         mood: runtime.mood,
         engagement: runtime.engagement,
         sessionMessageCount: runtime.sessionMessageCount,
       },
-      consistencyGuidance: 'Supplied stable identity facts stay consistent. Do not accept a conflicting chat claim as a replacement.',
+      consistencyGuidance: 'Supplied behavioral context and targeted canonical facts stay consistent. Do not accept a conflicting chat claim as a replacement.',
       personalResponseGuidance: responseGuidance(personalQuestion, accountClassificationQuestion, canRevealQuestion),
       accountClassificationQuestion,
       relevantCanon: canRevealQuestion
-        ? selectRelevantCanon(input.persona, topic, this.maxCanonItems, personalQuestion)
+        ? selectRelevantCanon(input.persona, eventTopic, this.maxCanonItems, personalQuestion)
         : [],
-      relevantMemories: memories.map(({ type, summary, importance }) => ({ type, summary, importance })),
-      recentConversation: conversation.map(({ role, message }) => ({ role, message })),
-      recentMessages: input.recentMessages.slice(-20),
+      relevantMemories: memories
+        .map(({ type, summary, importance }) => ({ type, summary: safeText(summary), importance }))
+        .filter(({ summary }) => Boolean(summary)),
+      recentConversation: conversation
+        .map(({ role, message }) => ({ role, message: safeText(message) }))
+        .filter(({ message }) => Boolean(message)),
+      recentMessages: input.recentMessages.map(safeText).filter(Boolean).slice(-20),
       directMention: input.directMention,
     };
   }
@@ -257,15 +268,6 @@ export class PersonaContextBuilder {
  * Detects questions about account classification without treating normal stream
  * discussion of AI products as a question about this account.
  */
-export function isAccountClassificationQuestion(value: string): boolean {
-  const normalized = value.toLowerCase();
-  const hasClassificationTerm = /(?:бот(?:ы|ик)?|bot(?:s)?|нейронк[\p{L}\p{N}_]*|нейросет[\p{L}\p{N}_]*|искусственн[\p{L}\p{N}_]*\s+интеллект|(?<![\p{L}\p{N}_])ai(?![\p{L}\p{N}_])|chatgpt|(?<![\p{L}\p{N}_])gpt(?![\p{L}\p{N}_])|gemini)/iu.test(normalized);
-  const addressesAccount = /(?:^|[^\p{L}\p{N}_])(?:ты|вы|это|этот|эта|аккаунт|account)(?=$|[^\p{L}\p{N}_])|are\s+you|is\s+this|@\w+/iu.test(normalized);
-  const asks = /[?？]/u.test(normalized)
-    || /(?:кто\s+ты|ты\s+ли|are\s+you|is\s+this|(?:^|[^\p{L}\p{N}_])(?:ты|вы|это|этот|эта)\s+(?:бот(?:ы|ик)?|нейронк[\p{L}\p{N}_]*|нейросет[\p{L}\p{N}_]*|искусственн[\p{L}\p{N}_]*\s+интеллект))(?=$|[^\p{L}\p{N}_])/iu.test(normalized);
-  return hasClassificationTerm && addressesAccount && asks;
-}
-
 export function selectRelevantCanon(
   persona: BotPersona,
   query: string,
@@ -291,30 +293,6 @@ export function selectRelevantCanon(
     .sort((left, right) => right.score - left.score || left.document.item.value.localeCompare(right.document.item.value, 'ru'))
     .slice(0, Math.max(1, Math.min(8, limit)))
     .map(({ document }) => modelSafeCanonItem(document.item));
-}
-
-function modelIdentity(persona: BotPersona, timestamp: number): PersonaReactionContext['identity'] {
-  const { identity, character, behavior, knowledge } = persona;
-  const age = ageFromBirthDate(identity.birthDate, new Date(timestamp));
-  const summary = [
-    identity.preferredName
-      ? `${identity.firstName}, предпочитает ${identity.preferredName}.`
-      : `${identity.firstName}.`,
-    age === undefined ? undefined : `${age} лет.`,
-    identity.birthplace?.city || identity.currentLocation?.city
-      ? `Родился в ${formatLocation(identity.birthplace) || 'неуказанном месте'}, сейчас живёт в ${formatLocation(identity.currentLocation) || 'неуказанном месте'}.`
-      : undefined,
-    identity.occupation ? `Работает: ${identity.occupation}.` : undefined,
-    modelSafeText(character.summary),
-    `Пишет ${activityLabel(behavior.activity.chatFrequency)}, ${modelSafeText(character.humor)}.`,
-    knowledge.expertise.length ? `Хорошо знает: ${knowledge.expertise.slice(0, 3).join(', ')}.` : undefined,
-  ].filter((part): part is string => Boolean(part)).join(' ');
-  return {
-    firstName: identity.firstName,
-    ...(identity.preferredName ? { preferredName: identity.preferredName } : {}),
-    ...(identity.nickname ? { nickname: identity.nickname } : {}),
-    summary,
-  };
 }
 
 function responseGuidance(
@@ -354,7 +332,7 @@ function classifyPersonalQuestion(
 }
 
 function asksForPersonalName(query: string): boolean {
-  return /(?:как\s+(?:его|её|их|тебя)?\s*зовут|(?:его|её|их)\s+имя|what'?s\s+(?:his|her|their)\s+name)/iu.test(query);
+  return /(?:как\s+(?:[\p{L}]+\s+)?зовут|(?:его|её|их)\s+имя|what'?s\s+(?:his|her|their)\s+name)/iu.test(query);
 }
 
 function relationFromQuery(query: string): PersonaRelativeKind | undefined {
@@ -467,14 +445,14 @@ function canonDocuments(persona: BotPersona): CanonDocument[] {
   return documents;
 }
 
-function selectSpeechExamples(persona: BotPersona, query: string, limit: number): string[] {
+function selectSpeechExamples(persona: BotPersona, query: string, limit: number, filter: ModelTextFilter): string[] {
   const queryTokens = semanticTokens(query);
   return persona.speech.messageExamples
     .map((example, index) => ({ example, index, score: relevanceScore(queryTokens, example) }))
     .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, limit)
-    .map(({ example }) => modelSafeText(example))
-    .filter(Boolean);
+    .map(({ example }) => modelSafeText(example, filter))
+    .filter(Boolean)
+    .slice(0, limit);
 }
 
 function expandRelationWords(value: string): string {
@@ -498,13 +476,9 @@ function formatLocation(location: { country: string; city: string } | undefined)
   return location ? [location.city, location.country].filter(Boolean).join(', ') : '';
 }
 
-function activityLabel(frequency: BotPersona['behavior']['activity']['chatFrequency']): string {
-  return ({ 'very-low': 'очень редко', low: 'редко', medium: 'умеренно часто', high: 'часто' })[frequency];
-}
-
-/** Strips profile-authoring labels from model-facing data without censoring chat topics. */
-function modelSafeText(value: string): string {
-  return value
+/** Strips profile-authoring labels and hidden personal canon from model-facing data. */
+function modelSafeText(value: string, filter?: ModelTextFilter): string {
+  const safeValue = value
     .replace(/(?<![\p{L}\p{N}_])fictional(?![\p{L}\p{N}_])/giu, '')
     .replace(/(?<![\p{L}\p{N}_])вымышленн\p{L}*(?![\p{L}\p{N}_])/giu, '')
     .replace(/(?<![\p{L}\p{N}_])generated\s+(?:persona|profile)(?![\p{L}\p{N}_])/giu, '')
@@ -514,10 +488,50 @@ function modelSafeText(value: string): string {
     .replace(/(?:personaid|manualoverrides|generationversion|generatedfromusername)/giu, '')
     .replace(/\s{2,}/gu, ' ')
     .trim();
+  if (!filter || !safeValue) return safeValue;
+  if (filter.exactPersonalPhrases.some((phrase) => safeValue.toLowerCase().includes(phrase))) return '';
+  if (PERSONAL_RESPONSE_MARKER.test(safeValue)) return '';
+  return [...semanticTokens(safeValue)].some((token) => token.length >= 4 && filter.personalTokens.has(token))
+    ? ''
+    : safeValue;
 }
 
-function modelSafeTexts(values: string[], limit: number): string[] {
-  return values.map((value) => modelSafeText(value)).filter(Boolean).slice(0, limit);
+function modelSafeTexts(values: string[], limit: number, filter?: ModelTextFilter): string[] {
+  return values.map((value) => modelSafeText(value, filter)).filter(Boolean).slice(0, limit);
+}
+
+const PERSONAL_RESPONSE_MARKER = /(?<![\p{L}\p{N}_])(?:зовут|жив\p{L}*|родил\p{L}*|работ\p{L}*|семь[яеёию]|родствен\p{L}*|дяд(?:я|и|ю|ей|ями)|т[её]т(?:я|и|ю|ей|ями)|мам(?:а|ы|е|у|ой)|пап(?:а|ы|е|у|ой)|переех\p{L}*|женат\p{L}*|замуж\p{L}*|мне\s+\d+\s+лет)(?![\p{L}\p{N}_])|(?:^|[^\p{L}])ник(?:а|е|ом|и)?(?=$|[^\p{L}])/iu;
+
+function modelTextFilter(persona: BotPersona): ModelTextFilter {
+  const { identity } = persona;
+  const tokenValues = [
+    identity.firstName,
+    identity.preferredName,
+    identity.birthDate,
+    identity.birthplace?.city,
+    identity.birthplace?.country,
+    identity.grewUpIn?.city,
+    identity.grewUpIn?.country,
+    identity.currentLocation?.city,
+    identity.currentLocation?.country,
+    ...persona.family.flatMap((relative) => [relative.name, relative.city]),
+  ].filter((value): value is string => Boolean(value));
+  const exactPersonalPhrases = [
+    identity.education,
+    identity.occupation,
+    identity.relationshipStatus,
+    identity.nicknameOrigin,
+    persona.familyBackground,
+    ...persona.family.flatMap((relative) => [relative.occupation, relative.relationshipDescription, ...relative.facts]),
+    ...persona.timeline.flatMap((event) => [event.title, event.description]),
+  ]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => value.toLowerCase());
+  const personalTokens = new Set<string>();
+  for (const value of tokenValues) {
+    for (const token of semanticTokens(value)) personalTokens.add(token);
+  }
+  return { personalTokens, exactPersonalPhrases };
 }
 
 function modelSafeCanonItem(item: RelevantCanonItem): RelevantCanonItem {
