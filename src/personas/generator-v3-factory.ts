@@ -115,7 +115,7 @@ export function definePersona(input: CompactBlueprint): PersonaBlueprint {
       vocabulary: [...new Set([...input.voice.favorite, ...input.voice.fillers, ...input.voice.abbreviations])],
       favoriteExpressions: input.voice.favorite,
       rareExpressions: input.voice.rare,
-      avoidedExpressions: [...new Set([...input.voice.avoided, 'как искусственный интеллект'])],
+      avoidedExpressions: [...new Set(input.voice.avoided)],
       fillerWords: input.voice.fillers,
       abbreviations: input.voice.abbreviations,
       typoStyle: input.voice.typos,

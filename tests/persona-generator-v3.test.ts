@@ -16,6 +16,10 @@ describe('Deep Persona Generator v3', () => {
     expect(persona.identity.firstName).toBe('Константин');
     expect(persona.identity.preferredName).toBe('Костя');
     expect(persona.identity.nickname).toBe('karlbekner');
+    expect(persona.identity.birthDate).toBe('1995-10-18');
+    expect(persona.identity.birthplace).toMatchObject({ country: 'Казахстан', city: 'Кокшетау' });
+    expect(persona.identity.currentLocation).toMatchObject({ country: 'Чехия', city: 'Прага' });
+    expect(persona.identity.occupation).toContain('системный администратор');
     expect(persona.identity.nicknameOrigin).toMatch(/karl|бекнер|ник/iu);
     expect(persona.generationVersion).toBe(3);
     expect(persona.generatedFromUsername).toBe('karlbekner');
@@ -78,6 +82,26 @@ describe('Deep Persona Generator v3', () => {
     });
     expect(report.structureRanges.speechExamples!.min).toBeGreaterThanOrEqual(15);
     expect(report.countryOfBirthDistribution).toMatchObject({ Казахстан: 3, Беларусь: 3, Таджикистан: 1 });
+    expect(report.genderDistribution).toEqual({
+      male: 26,
+      female: 4,
+      malePercentage: 86.7,
+      femalePercentage: 13.3,
+      femaleUsernames: ['mavinoko', 'anggel_111', 'kitekate05', 'lulik_pulik'],
+    });
+    expect(report.identityChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        username: '404notf0und404',
+        canonicalName: 'Никита «Ник» Левицкий',
+        status: 'matched',
+        observed: { firstName: 'Никита', preferredName: 'Ник' },
+      }),
+      expect.objectContaining({
+        username: 'arimoki_ta',
+        canonicalName: 'Арман «Ари» Мкртчян',
+        status: 'matched',
+      }),
+    ]));
     expect(validatePersonaCoherence(impossible).some((issue) => issue.code === 'timeline_before_birth')).toBe(true);
 
     const summaries = auditedPersonaSummaries(entries, (persona) => personaSummary(persona));

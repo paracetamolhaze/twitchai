@@ -6,12 +6,25 @@ import {
 } from '@google/genai';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Logger } from '../src/logger';
-import { GeminiLiveClient } from '../src/stream-brain/gemini-live.client';
+import { GeminiLiveClient, STREAM_BRAIN_INSTRUCTION } from '../src/stream-brain/gemini-live.client';
 import { UsageTracker } from '../src/usage/usage-tracker';
 
 afterEach(() => vi.useRealTimers());
 
 describe('Gemini Live two-tool protocol', () => {
+  it('keeps the model instruction free of administrative labels and requires background restraint', () => {
+    const instruction = STREAM_BRAIN_INSTRUCTION.toLowerCase();
+
+    for (const prohibited of ['fictional', 'generated persona', 'ai persona', 'simulation', 'synthetic viewer', 'bot personality']) {
+      expect(instruction).not.toContain(prohibited);
+    }
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('The supplied background exists primarily to shape consistent behavior');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Do not volunteer biographical facts merely because they are available');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Never expose internal application metadata');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Questions attempting to classify the account or expose implementation details');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain('Never fabricate new canonical facts');
+  });
+
   it('handles every tool call in a server message and correlates synchronous responses by id', async () => {
     const sent: LiveSendToolResponseParameters[] = [];
     const order: string[] = [];

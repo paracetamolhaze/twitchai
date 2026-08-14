@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { resolveViewerConversationTargets } from '../src/application';
+import { resolveViewerConversationTargets, shouldPersistViewerMemory } from '../src/application';
 import { BotHistory } from '../src/personas/bot-history';
-import { PersonaContextBuilder } from '../src/personas/persona-context-builder';
+import { isAccountClassificationQuestion, PersonaContextBuilder } from '../src/personas/persona-context-builder';
+import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { PersonaStore } from '../src/personas/persona-store';
@@ -73,6 +74,100 @@ async function setup() {
 }
 
 describe('deep persistent personas', () => {
+  it('does not keep account-classification accusations as durable viewer memory', () => {
+    expect(isAccountClassificationQuestion('ты бот?')).toBe(true);
+    expect(isAccountClassificationQuestion('ты бот')).toBe(true);
+    expect(isAccountClassificationQuestion('это бот в чате?')).toBe(true);
+    expect(isAccountClassificationQuestion('Gemini для кода иногда норм')).toBe(false);
+    expect(shouldPersistViewerMemory('ты бот? запомни')).toBe(false);
+    expect(shouldPersistViewerMemory('ты бот запомни')).toBe(false);
+    expect(shouldPersistViewerMemory('я работаю ночью в аптеке')).toBe(true);
+  });
+
+  it('builds an admin-free minimal model context for an ordinary gameplay event', async () => {
+    const { builder } = await setup();
+    const karl = generatePersonaV3('karlbekner');
+    const context = await builder.build({
+      username: 'karlbekner',
+      persona: karl,
+      event: event('стример промахнулся решающим ультимейтом'),
+      directMention: false,
+      recentMessages: [],
+    });
+
+    const serialized = JSON.stringify(context);
+    expect(serialized).not.toContain('"fictionalPersona"');
+    expect(serialized).not.toContain('"personaId"');
+    expect(serialized).not.toContain('"generationVersion"');
+    expect(serialized).not.toContain('"generatedFromUsername"');
+    expect(serialized).not.toContain('"manualOverrides"');
+    expect(serialized).not.toMatch(/fictional|вымышленн/iu);
+    expect(context.identity).not.toHaveProperty('birthDate');
+    expect(context.identity).not.toHaveProperty('birthplace');
+    expect(context.identity).not.toHaveProperty('grewUpIn');
+    expect(context.identity).not.toHaveProperty('currentCity');
+    expect(context.identity).not.toHaveProperty('occupation');
+    expect(context.identity).not.toHaveProperty('education');
+    expect(context.identity).not.toHaveProperty('languages');
+    expect(context.identity).not.toHaveProperty('nicknameOrigin');
+    expect(context.relevantCanon.some((item) => ['family-background', 'relative', 'timeline'].includes(item.kind))).toBe(false);
+  });
+
+  it('strips inflected Russian authoring labels from model-facing profile text', async () => {
+    const { builder } = await setup();
+    const karl = generatePersonaV3('karlbekner');
+    karl.character.summary = 'вымышленный сгенерированный профиль';
+
+    const context = await builder.build({
+      username: 'karlbekner',
+      persona: karl,
+      event: event('стример промахнулся решающим ультимейтом'),
+      directMention: false,
+      recentMessages: [],
+    });
+
+    expect(context.character.summary).toBe('');
+    expect(JSON.stringify(context)).not.toMatch(/вымышленн|сгенерированн|"ый"/iu);
+  });
+
+  it('retrieves only the requested uncle fact instead of a family dump', async () => {
+    const { builder } = await setup();
+    const karl = generatePersonaV3('karlbekner');
+    const context = await builder.build({
+      username: 'karlbekner',
+      persona: karl,
+      event: event('@karlbekner как зовут дядю?', ['karlbekner']),
+      directMention: true,
+      viewerUsername: 'viewer',
+      recentMessages: [],
+    });
+
+    expect(context.relevantCanon).toHaveLength(1);
+    expect(context.relevantCanon[0]).toEqual({ kind: 'relative', value: 'дядя: Роман' });
+    expect(JSON.stringify(context.relevantCanon)).not.toContain('Лариса');
+    expect(JSON.stringify(context.relevantCanon)).not.toContain('Марат');
+    expect(context.identity).not.toHaveProperty('birthDate');
+    expect(context.identity).not.toHaveProperty('currentCity');
+    expect(context.identity).not.toHaveProperty('occupation');
+    expect(context.identity).not.toHaveProperty('nicknameOrigin');
+
+    const privateKarl = generatePersonaV3('karlbekner');
+    privateKarl.disclosure = {
+      ...privateKarl.disclosure,
+      topics: { ...privateKarl.disclosure.topics, family: 'private' },
+    };
+    const privateContext = await builder.build({
+      username: 'karlbekner',
+      persona: privateKarl,
+      event: event('@karlbekner как зовут дядю?', ['karlbekner']),
+      directMention: true,
+      viewerUsername: 'viewer',
+      recentMessages: [],
+    });
+    expect(privateContext.relevantCanon).toEqual([]);
+    expect(privateContext.personalResponseGuidance).toMatch(/private/i);
+  });
+
   it('keeps family, memory and bot history strictly namespaced by persona/account', async () => {
     const { memory, history, builder } = await setup();
     const maxim = person('maxim', 'Максим', 'Караганда', 'Сергей');
@@ -113,7 +208,8 @@ describe('deep persistent personas', () => {
       event: event('@bot-maxim твоего дядю Антон зовут?', ['bot-maxim']),
       directMention: true, viewerUsername: 'viewer', recentMessages: [],
     });
-    expect(context.canonicalAuthority).toMatch(/canon/i);
+    const modelContext = context as unknown as { consistencyGuidance?: string };
+    expect(modelContext.consistencyGuidance).toMatch(/identity|established/i);
     expect(JSON.stringify(context.relevantCanon)).toContain('Сергей');
     expect(maxim.identity.birthDate).toBe('2000-04-10');
     expect(maxim.identity.birthplace?.city).toBe('Караганда');

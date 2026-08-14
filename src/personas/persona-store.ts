@@ -11,6 +11,7 @@ import {
   PersonaAuditReport,
   PersonaEditablePath,
   PersonaSummary,
+  SENSITIVE_PERSONA_REGENERATION_OVERRIDE_PATHS,
 } from './types';
 
 export interface PersonaRegenerationPreview {
@@ -21,6 +22,12 @@ export interface PersonaRegenerationPreview {
   previewHash: string;
   preservedManualOverrides: PersonaEditablePath[];
   legacyManualReviewRequired: boolean;
+  /** Always present in backend responses; optional keeps existing API clients source-compatible. */
+  changed?: boolean;
+  /** Human-readable Russian explanation for the dashboard operator. */
+  reason?: string;
+  /** Sensitive canon changes must be reviewed and applied through the individual flow. */
+  requiresIndividualConfirmation?: boolean;
 }
 
 export type PersonaAssignmentProblem = 'persona_username_mismatch' | 'persona_incomplete';
@@ -198,6 +205,13 @@ export class PersonaStore {
     const username = this.accountByPersonaId.get(id) ?? current.generatedFromUsername;
     if (!username) throw new Error('persona_username_not_found');
     const proposed = this.generatedWithManualOverrides(current, username);
+    const changed = !samePersona(current, proposed);
+    const sensitiveManualOverrides = current.manualOverrides.filter((path) =>
+      SENSITIVE_PERSONA_REGENERATION_OVERRIDE_PATHS_SET.has(path));
+    const hasUntrackedManualEdits = current.manuallyEdited && current.manualOverrides.length === 0;
+    const requiresIndividualConfirmation = changed && (
+      current.legacyManualReviewRequired || sensitiveManualOverrides.length > 0 || hasUntrackedManualEdits
+    );
     return {
       personaId: id,
       username,
@@ -206,6 +220,15 @@ export class PersonaStore {
       previewHash: regenerationHash(current, proposed),
       preservedManualOverrides: [...current.manualOverrides],
       legacyManualReviewRequired: current.legacyManualReviewRequired,
+      changed,
+      reason: regenerationReason({
+        changed,
+        legacyManualReviewRequired: current.legacyManualReviewRequired,
+        sensitiveManualOverrides,
+        hasUntrackedManualEdits,
+        manualOverrides: current.manualOverrides,
+      }),
+      requiresIndividualConfirmation,
     };
   }
 
@@ -222,6 +245,7 @@ export class PersonaStore {
   async regenerate(id: string, previewHash: string): Promise<BotPersona> {
     const preview = await this.previewRegeneration(id);
     if (!safeEqual(preview.previewHash, previewHash)) throw new Error('persona_regeneration_preview_stale');
+    if (!preview.changed) return structuredClone(preview.current);
     await this.backup(preview.current, preview.username, 'operator-approved-generation-v3-regeneration');
     await this.persist(preview.proposed);
     this.personas.set(id, structuredClone(preview.proposed));
@@ -235,16 +259,18 @@ export class PersonaStore {
     for (const submitted of previews) {
       const current = await this.previewRegeneration(submitted.personaId);
       if (!safeEqual(current.previewHash, submitted.previewHash)) throw new Error('persona_regeneration_preview_stale');
+      if (current.requiresIndividualConfirmation) {
+        throw new Error('persona_regeneration_requires_individual_confirmation');
+      }
+      if (!current.changed) continue;
       verified.push(current);
     }
-    const results: BotPersona[] = [];
-    for (const preview of verified) {
-      await this.backup(preview.current, preview.username, 'operator-approved-generation-v3-bulk-regeneration');
-      await this.persist(preview.proposed);
-      this.personas.set(preview.personaId, structuredClone(preview.proposed));
-      results.push(structuredClone(preview.proposed));
-    }
-    return results;
+    await this.repository.replacePersonasWithBackups(verified.map((preview) => ({
+      backup: this.backupRecord(preview.current, preview.username, 'operator-approved-generation-v3-bulk-regeneration'),
+      persona: preview.proposed,
+    })));
+    for (const preview of verified) this.personas.set(preview.personaId, structuredClone(preview.proposed));
+    return verified.map((preview) => structuredClone(preview.proposed));
   }
 
   async delete(id: string): Promise<boolean> {
@@ -269,6 +295,7 @@ export class PersonaStore {
     generated.manuallyEdited = current.manualOverrides.length > 0;
     generated.manualOverrides = [...current.manualOverrides];
     generated.relationships = structuredClone(current.relationships);
+    preserveObsoleteAvoidedExpression(generated, current);
     return personaSchema.parse(generated);
   }
 
@@ -311,14 +338,18 @@ export class PersonaStore {
   }
 
   private async backup(persona: BotPersona, username: string, reason: string): Promise<void> {
-    await this.repository.savePersonaCanonBackup({
+    await this.repository.savePersonaCanonBackup(this.backupRecord(persona, username, reason));
+  }
+
+  private backupRecord(persona: BotPersona, username: string, reason: string) {
+    return {
       personaId: persona.id,
       username,
       reason,
       generationVersion: persona.generationVersion,
       canon: structuredClone(persona),
       createdAt: this.now(),
-    });
+    };
   }
 
   private async persist(persona: BotPersona): Promise<void> { await this.repository.upsertPersona(persona); }
@@ -337,6 +368,8 @@ export class PersonaStore {
 function shouldAutoMigrateGeneratedPersona(raw: unknown, persona: BotPersona): boolean {
   return record(raw).source === 'generated'
     && !persona.legacyManualReviewRequired
+    && !persona.manuallyEdited
+    && persona.manualOverrides.length === 0
     && persona.generationVersion < PERSONA_GENERATION_VERSION;
 }
 
@@ -379,6 +412,86 @@ function readPath(value: BotPersona, path: PersonaEditablePath): unknown {
     cursor = (cursor as Record<string, unknown>)[key];
   }
   return cursor;
+}
+
+const SENSITIVE_PERSONA_REGENERATION_OVERRIDE_PATHS_SET = new Set<PersonaEditablePath>(
+  SENSITIVE_PERSONA_REGENERATION_OVERRIDE_PATHS,
+);
+
+function samePersona(left: BotPersona, right: BotPersona): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/**
+ * This phrase was an obsolete factory-wide avoided expression. It is stripped
+ * from model context and removed from new blueprints. Preserve it only in a
+ * legacy record's regeneration preview so an otherwise unchanged profile is
+ * not rewritten solely for historical cleanup.
+ */
+function preserveObsoleteAvoidedExpression(target: BotPersona, current: BotPersona): void {
+  const obsolete = 'как искусственный интеллект';
+  if (current.speech.avoidedExpressions.some((value) => value.trim().toLowerCase() === obsolete)
+    && !target.speech.avoidedExpressions.some((value) => value.trim().toLowerCase() === obsolete)) {
+    target.speech.avoidedExpressions.push(obsolete);
+  }
+}
+
+function regenerationReason(input: {
+  changed: boolean;
+  legacyManualReviewRequired: boolean;
+  sensitiveManualOverrides: PersonaEditablePath[];
+  hasUntrackedManualEdits: boolean;
+  manualOverrides: PersonaEditablePath[];
+}): string {
+  if (!input.changed) {
+    return 'Текущий канон уже совпадает с предложенной генерацией; запись будет пропущена.';
+  }
+  if (input.legacyManualReviewRequired) {
+    return 'Профиль старой версии без полной карты ручных изменений: массовое применение запрещено, требуется индивидуальное сравнение и подтверждение.';
+  }
+  if (input.hasUntrackedManualEdits) {
+    return 'В профиле отмечены ручные изменения без списка полей: массовое применение запрещено, требуется индивидуальное подтверждение.';
+  }
+  if (input.sensitiveManualOverrides.length) {
+    const labels = input.sensitiveManualOverrides.map(personaEditablePathLabel).join(', ');
+    return `Сохранены ручные изменения чувствительных разделов (${labels}); требуется индивидуальное сравнение и подтверждение.`;
+  }
+  if (input.manualOverrides.length) {
+    return `Будет обновлён автогенерированный канон; ручные разделы сохранятся: ${input.manualOverrides.map(personaEditablePathLabel).join(', ')}.`;
+  }
+  return 'Будет обновлён автогенерированный канон для текущего Twitch-ника.';
+}
+
+function personaEditablePathLabel(path: PersonaEditablePath): string {
+  return ({
+    name: 'отображаемое имя',
+    description: 'описание',
+    'identity.firstName': 'имя',
+    'identity.preferredName': 'предпочтительное имя',
+    'identity.nickname': 'ник',
+    'identity.nicknameOrigin': 'история ника',
+    'identity.birthDate': 'дата рождения',
+    'identity.birthplace': 'место рождения',
+    'identity.grewUpIn': 'место взросления',
+    'identity.currentLocation': 'текущее место',
+    'identity.languages': 'языки',
+    'identity.occupation': 'работа',
+    'identity.education': 'образование',
+    'identity.relationshipStatus': 'семейное положение',
+    familyBackground: 'семейный фон',
+    family: 'семья',
+    timeline: 'жизненная хронология',
+    facts: 'факты',
+    opinions: 'мнения',
+    knowledge: 'границы знаний',
+    character: 'характер',
+    interests: 'интересы',
+    speech: 'речь',
+    behavior: 'поведение',
+    disclosure: 'границы раскрытия',
+    streamerRelationship: 'отношения со стримером',
+    relationships: 'связи с другими личностями',
+  } satisfies Record<PersonaEditablePath, string>)[path];
 }
 
 function regenerationHash(current: BotPersona, proposed: BotPersona): string {

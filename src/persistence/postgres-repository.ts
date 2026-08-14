@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { ReactionExample } from '../learning/types';
 import {
   BotMessageRecord,
@@ -14,6 +14,7 @@ import {
   BotAccountRecord,
   EncryptedTwitchCredentialRecord,
   PersonaCanonBackupRecord,
+  PersonaReplacementWithBackup,
   TwitchCredentialRefreshFailure,
   TwitchOAuthNonceRecord,
 } from './repository';
@@ -53,19 +54,7 @@ export class PostgresRepository implements AppRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(
-        `INSERT INTO personas (id, config, updated_at) VALUES ($1, $2, NOW())
-         ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()`,
-        [persona.id, persona],
-      );
-      await client.query('DELETE FROM persona_relationships WHERE persona_id=$1', [persona.id]);
-      for (const relationship of persona.relationships) {
-        await client.query(
-          `INSERT INTO persona_relationships (persona_id, target_persona_id, familiarity, sentiment, notes, updated_at)
-           VALUES ($1,$2,$3,$4,$5,NOW())`,
-          [persona.id, relationship.targetPersonaId, relationship.familiarity, relationship.sentiment, relationship.notes],
-        );
-      }
+      await this.upsertPersonaWithClient(client, persona);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
@@ -86,6 +75,24 @@ export class PostgresRepository implements AppRepository {
        VALUES ($1,$2,$3,$4,$5,$6)`,
       [backup.personaId, backup.username ?? null, backup.reason, backup.generationVersion, backup.canon, new Date(backup.createdAt)],
     );
+  }
+
+  async replacePersonasWithBackups(replacements: PersonaReplacementWithBackup[]): Promise<void> {
+    if (!replacements.length) return;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const replacement of replacements) {
+        await this.savePersonaCanonBackupWithClient(client, replacement.backup);
+        await this.upsertPersonaWithClient(client, replacement.persona);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async listPersonaCanonBackups(personaId: string, limit: number): Promise<PersonaCanonBackupRecord[]> {
@@ -408,6 +415,31 @@ export class PostgresRepository implements AppRepository {
 
   async saveUsageSnapshot(snapshot: UsageSnapshot): Promise<void> {
     await this.pool.query('INSERT INTO usage_snapshots (metrics) VALUES ($1)', [snapshot]);
+  }
+
+  private async upsertPersonaWithClient(client: PoolClient, persona: BotPersona): Promise<void> {
+    await client.query(
+      `INSERT INTO personas (id, config, updated_at) VALUES ($1, $2, NOW())
+       ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()`,
+      [persona.id, persona],
+    );
+    await client.query('DELETE FROM persona_relationships WHERE persona_id=$1', [persona.id]);
+    for (const relationship of persona.relationships) {
+      await client.query(
+        `INSERT INTO persona_relationships (persona_id, target_persona_id, familiarity, sentiment, notes, updated_at)
+         VALUES ($1,$2,$3,$4,$5,NOW())`,
+        [persona.id, relationship.targetPersonaId, relationship.familiarity, relationship.sentiment, relationship.notes],
+      );
+    }
+  }
+
+  private async savePersonaCanonBackupWithClient(client: PoolClient, backup: PersonaCanonBackupRecord): Promise<void> {
+    await client.query(
+      `INSERT INTO persona_canon_backups
+       (persona_id, username, reason, generation_version, canon, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [backup.personaId, backup.username ?? null, backup.reason, backup.generationVersion, backup.canon, new Date(backup.createdAt)],
+    );
   }
 }
 

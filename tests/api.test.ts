@@ -110,7 +110,20 @@ describe('dashboard API', () => {
     const summaries = await request(api.app).get('/api/persona-summaries').set('Authorization', `Bearer ${token}`).expect(200);
     expect(summaries.body[0]).toMatchObject({ completeness: expect.any(Number), uniqueness: 100, consistency: 100 });
     const audit = await request(api.app).get('/api/persona-audit').set('Authorization', `Bearer ${token}`).expect(200);
-    expect(audit.body).toMatchObject({ personaCount: 2, uniquePersonaCount: 2 });
+    expect(audit.body).toMatchObject({
+      personaCount: 2,
+      uniquePersonaCount: 2,
+      genderDistribution: {
+        male: 2,
+        female: 0,
+        malePercentage: 100,
+        femalePercentage: 0,
+        femaleUsernames: [],
+      },
+      identityChanges: expect.arrayContaining([
+        expect.objectContaining({ username: '404notf0und404', status: 'missing' }),
+      ]),
+    });
     const preview = await request(api.app)
       .post(`/api/personas/${testPersona.id}/regeneration-preview`)
       .set('Authorization', `Bearer ${token}`)

@@ -13,6 +13,7 @@ import {
   BotAccountRecord,
   EncryptedTwitchCredentialRecord,
   PersonaCanonBackupRecord,
+  PersonaReplacementWithBackup,
   TwitchCredentialRefreshFailure,
   TwitchOAuthNonceRecord,
 } from './repository';
@@ -56,6 +57,26 @@ export class MemoryRepository implements AppRepository {
   }
   async savePersonaCanonBackup(backup: PersonaCanonBackupRecord): Promise<void> {
     this.personaCanonBackups.push(clone(backup));
+  }
+  async replacePersonasWithBackups(replacements: PersonaReplacementWithBackup[]): Promise<void> {
+    if (!replacements.length) return;
+    const personas = new Map(this.personas);
+    const relationships = new Map(this.personaRelationships);
+    const backups = [...this.personaCanonBackups];
+    for (const replacement of replacements) {
+      const persona = clone(replacement.persona);
+      backups.push(clone(replacement.backup));
+      personas.set(persona.id, persona);
+      for (const key of relationships.keys()) {
+        if (key.startsWith(`${persona.id}:`)) relationships.delete(key);
+      }
+      for (const relationship of persona.relationships) {
+        relationships.set(`${persona.id}:${relationship.targetPersonaId}`, clone(relationship));
+      }
+    }
+    this.personas = personas;
+    this.personaRelationships = relationships;
+    this.personaCanonBackups = backups;
   }
   async listPersonaCanonBackups(personaId: string, limit: number): Promise<PersonaCanonBackupRecord[]> {
     return this.personaCanonBackups.filter((backup) => backup.personaId === personaId)

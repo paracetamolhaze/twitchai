@@ -4,7 +4,7 @@ import { AppConfig, normalizeChannel } from './config';
 import { ReactionMemory } from './learning/reaction-memory';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
-import { PersonaContextBuilder } from './personas/persona-context-builder';
+import { isAccountClassificationQuestion, PersonaContextBuilder } from './personas/persona-context-builder';
 import { PersonaMemory } from './personas/persona-memory';
 import { PersonaRuntimeStore } from './personas/persona-runtime-store';
 import { PersonaStore } from './personas/persona-store';
@@ -361,7 +361,7 @@ export class Application {
         createdAt: message.timestamp,
       });
       const importance = viewerMemoryImportance(message.message);
-      if (importance >= 0.4) {
+      if (shouldPersistViewerMemory(message.message, importance)) {
         await this.personaMemory.remember({
           personaId: account.personaId,
           type: 'viewer',
@@ -604,12 +604,17 @@ export function resolveViewerConversationTargets<T extends { username: string; p
   return [];
 }
 
-function viewerMemoryImportance(message: string): number {
+export function viewerMemoryImportance(message: string): number {
   const normalized = message.toLowerCase();
   if (/(запомни|обещаю|напомни)/u.test(normalized)) return 0.9;
   if (/(я\s+(живу|работаю|учусь|еду|лечу|собираюсь|люблю|ненавижу)|у\s+меня)/u.test(normalized)) return 0.75;
   if (normalized.length >= 80) return 0.45;
   return 0.2;
+}
+
+/** Account-classification accusations stay in the short follow-up thread only. */
+export function shouldPersistViewerMemory(message: string, importance = viewerMemoryImportance(message)): boolean {
+  return !isAccountClassificationQuestion(message) && importance >= 0.4;
 }
 function stringSetting(value: unknown, fallback: string): string { return typeof value === 'string' ? value : fallback; }
 function boundedNumberSetting(value: unknown, fallback: number, minimum: number, maximum: number): number {

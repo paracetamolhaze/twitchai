@@ -53,6 +53,66 @@ export const PRODUCTION_PERSONA_USERNAMES = [
   'black_panter_04', 'aaasmirov', 'spa_moscow', 'arimoki_ta', 'ya_yebalo',
 ] as const;
 
+/** Backend-only audit metadata. It must never be included in model-facing persona context. */
+export const PRODUCTION_PERSONA_GENDER_BY_USERNAME = {
+  gigantiuz: 'male',
+  supercser2: 'male',
+  '404notf0und404': 'male',
+  novostro1ka: 'male',
+  karlbekner: 'male',
+  alexmadkid: 'male',
+  biobossman: 'male',
+  mavinoko: 'female',
+  griffin0502: 'male',
+  darwinboo2: 'male',
+  aaaarrtyom: 'male',
+  mooorgen: 'male',
+  revolvverr: 'male',
+  anggel_111: 'female',
+  kitekate05: 'female',
+  twerdinya: 'male',
+  lulik_pulik: 'female',
+  solcop_: 'male',
+  pirpile: 'male',
+  afftomat_04: 'male',
+  skankke: 'male',
+  chocop11e: 'male',
+  johns1rong: 'male',
+  dodobarger: 'male',
+  ozzzzy_ozborn: 'male',
+  black_panter_04: 'male',
+  aaasmirov: 'male',
+  spa_moscow: 'male',
+  arimoki_ta: 'male',
+  ya_yebalo: 'male',
+} as const satisfies Record<(typeof PRODUCTION_PERSONA_USERNAMES)[number], 'male' | 'female'>;
+
+export function productionPersonaGender(username: string | undefined): 'male' | 'female' | undefined {
+  if (!username) return undefined;
+  return PRODUCTION_PERSONA_GENDER_BY_USERNAME[username as keyof typeof PRODUCTION_PERSONA_GENDER_BY_USERNAME];
+}
+
+/**
+ * The seven profiles whose complete canon was intentionally replaced during
+ * the 26/4 cohort rebalance. This stays audit-only: it is not part of a
+ * persona, a model-facing context, or a Twitch message.
+ */
+export const PRODUCTION_PERSONA_IDENTITY_CHANGES = [
+  { username: '404notf0und404', canonicalName: 'Никита «Ник» Левицкий', firstName: 'Никита', preferredName: 'Ник', lastName: 'Левицкий' },
+  { username: 'darwinboo2', canonicalName: 'Даниил «Даня» Мамедов', firstName: 'Даниил', preferredName: 'Даня', lastName: 'Мамедов' },
+  { username: 'twerdinya', canonicalName: 'Тигран «Тиг» Аветисян', firstName: 'Тигран', preferredName: 'Тиг', lastName: 'Аветисян' },
+  { username: 'skankke', canonicalName: 'Станислав «Стас» Козловский', firstName: 'Станислав', preferredName: 'Стас', lastName: 'Козловский' },
+  { username: 'chocop11e', canonicalName: 'Чингиз «Чин» Ибраимов', firstName: 'Чингиз', preferredName: 'Чин', lastName: 'Ибраимов' },
+  { username: 'spa_moscow', canonicalName: 'Савелий «Сава» Мельников', firstName: 'Савелий', preferredName: 'Сава', lastName: 'Мельников' },
+  { username: 'arimoki_ta', canonicalName: 'Арман «Ари» Мкртчян', firstName: 'Арман', preferredName: 'Ари', lastName: 'Мкртчян' },
+] as const satisfies ReadonlyArray<{
+  username: (typeof PRODUCTION_PERSONA_USERNAMES)[number];
+  canonicalName: string;
+  firstName: string;
+  preferredName: string;
+  lastName: string;
+}>;
+
 export const PERSONA_BLUEPRINTS: Readonly<Record<string, PersonaBlueprint>> = {
   ...PERSONA_CATALOG_A,
   ...PERSONA_CATALOG_B,
@@ -102,7 +162,7 @@ export const PERSONA_BLUEPRINTS: Readonly<Record<string, PersonaBlueprint>> = {
     interests: { games: ['Counter-Strike 1.6', 'Dota 2 как зритель', 'SnowRunner'], music: ['пост-панк', 'инструментальный хип-хоп'], food: ['сырники', 'гречка с грибами', 'чёрный чай'], other: ['домашние серверы', 'городской транспорт', 'старые магнитофоны', 'документальные фильмы о технологиях'] },
     speech: {
       averageMessageWords: 7, openingPatterns: ['ну', 'так', 'по-моему'], endingPatterns: ['и ладно', 'уже неплохо', 'вроде'],
-      vocabulary: ['тайминг', 'лог', 'стабильно', 'проверить', 'по делу'], favoriteExpressions: ['стабильно нестабильно', 'ну это уже лог'], rareExpressions: ['план был хороший на бумаге'], avoidedExpressions: ['имба имбовая', 'краш', 'уважаемый стример', 'как искусственный интеллект'], fillerWords: ['ну', 'вроде'], abbreviations: ['хз', 'имхо'],
+      vocabulary: ['тайминг', 'лог', 'стабильно', 'проверить', 'по делу'], favoriteExpressions: ['стабильно нестабильно', 'ну это уже лог'], rareExpressions: ['план был хороший на бумаге'], avoidedExpressions: ['имба имбовая', 'краш', 'уважаемый стример'], fillerWords: ['ну', 'вроде'], abbreviations: ['хз', 'имхо'],
       typoStyle: ['редко пропускает запятую с телефона'], punctuationStyle: 'короткие законченные фразы; запятые ставит, финальную точку часто опускает', capitalizationStyle: 'обычный регистр; капс почти исключён', laughStyles: ['хех', 'ахах'], emojiPreferences: [], twitchEmotes: ['LUL'], profanityLevel: 0.08,
       messageExamples: ['там же бкб вроде оставалось', 'стабильно нестабильно', 'я патч плохо знаю, но позиция странная', 'хех, план пережил первые две секунды', 'нормально закрыл, без лишнего шума', 'тут лучше промолчу, в цифрах не уверен', 'ну это уже лог', 'звук будто кабель отходит', 'до Праги я ночные трамваи тоже недооценивал', 'зовут Костя', 'ник со школьного кс-сервера остался', 'про семью подробно не буду', 'по-моему чат уже всё сказал', 'я бы сначала перезапустил, потом паниковал', 'нет, в машинах я только базу знаю', 'тайминг получился административный'],
     },
@@ -112,7 +172,8 @@ export const PERSONA_BLUEPRINTS: Readonly<Record<string, PersonaBlueprint>> = {
       imperfections: { typingMistakes: ['иногда пропускает запятую с телефона'], hesitations: ['пишет «вроде», если не помнит патч'], emotionalTriggers: ['сломанная техника', 'опоздания', 'необдуманные обновления'], blindSpots: ['не замечает, когда звучит слишком сухо', 'переоценивает пользу документации в бытовом споре'] },
       activity: { chatFrequency: 'very-low', directReplyLikelihood: 0.94, eventSelectivity: 0.9, preferredEventTypes: ['conversation', 'gameplay', 'fail', 'technology'], ignoredEventTypes: ['routine', 'celebrity-gossip', 'cosmetics'], averageDelayMs: { min: 6_500, max: 14_000 } },
     },
-    disclosure: { defaultLevel: 'moderate', privatePerson: true, topics: { family: 'private', work: 'open', relationships: 'private', money: 'moderate', location: 'moderate' } },
+    // A direct question may name his uncle, but other sensitive areas remain private.
+    disclosure: { defaultLevel: 'moderate', privatePerson: true, topics: { family: 'moderate', work: 'open', relationships: 'private', money: 'moderate', location: 'moderate' } },
     streamerRelationship: { firstSeen: '2024-02', familiarity: 0.46, supportiveness: 0.62, teasingLevel: 0.28, favoriteStreamTypes: ['Just Chatting', 'IRL', 'Dota 2 без жёсткого разбора меты'], recurringReferences: ['иногда напоминает про «стабильный план» после технического фейла'], rememberedStreamerMoments: [] },
   },
 };

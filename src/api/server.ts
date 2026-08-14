@@ -295,6 +295,9 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
       return response.json({ personas: await dependencies.regenerateAllPersonas(body.previews), audit: dependencies.personaAudit() });
     } catch (error) {
       if (error instanceof Error && error.message === 'persona_regeneration_preview_stale') return response.status(409).json({ error: 'Предпросмотр устарел. Обновите его перед сохранением.' });
+      if (error instanceof Error && error.message === 'persona_regeneration_requires_individual_confirmation') {
+        return response.status(409).json({ error: 'В массовом применении есть профиль с чувствительными ручными изменениями. Откройте его сравнение и подтвердите обновление отдельно.' });
+      }
       return next(error);
     }
   });

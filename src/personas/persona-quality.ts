@@ -1,5 +1,10 @@
 import { ageFromBirthDate, personaCompleteness } from './schema';
 import {
+  PERSONA_BLUEPRINTS,
+  PRODUCTION_PERSONA_IDENTITY_CHANGES,
+  productionPersonaGender,
+} from './generator-v3-data';
+import {
   BotPersona,
   PersonaAuditReport,
   PersonaSimilarityPair,
@@ -108,11 +113,26 @@ export function auditPersonas(entries: AuditedPersona[]): PersonaAuditReport {
   const pairs = buildSimilarityPairs(entries);
   const issues = entries.flatMap(({ persona }) => validatePersonaCoherence(persona));
   const similarities = pairs.map((pair) => pair.similarity);
+  const genderCounts = entries.reduce((distribution, entry) => {
+    const gender = productionPersonaGender(entry.username);
+    if (gender) distribution[gender] += 1;
+    return distribution;
+  }, { male: 0, female: 0 });
+  const classifiedGenderCount = genderCounts.male + genderCounts.female;
+  const genderDistribution = {
+    ...genderCounts,
+    malePercentage: percentage(genderCounts.male, classifiedGenderCount),
+    femalePercentage: percentage(genderCounts.female, classifiedGenderCount),
+    femaleUsernames: [...new Set(entries.flatMap((entry) =>
+      productionPersonaGender(entry.username) === 'female' && entry.username ? [entry.username] : []))],
+  };
   return {
     accountCount: entries.filter((entry) => entry.username).length,
     personaCount: entries.length,
     uniquePersonaCount: new Set(entries.map((entry) => entry.persona.id)).size,
     uniqueSpeechFingerprintCount: new Set(entries.map(({ persona }) => speechFingerprint(persona))).size,
+    genderDistribution,
+    identityChanges: auditIdentityChanges(entries),
     countryOfBirthDistribution: distribution(entries, ({ persona }) => persona.identity.birthplace?.country),
     currentCountryDistribution: distribution(entries, ({ persona }) => persona.identity.currentLocation?.country),
     currentCityDistribution: distribution(entries, ({ persona }) => persona.identity.currentLocation?.city),
@@ -147,6 +167,32 @@ export function auditPersonas(entries: AuditedPersona[]): PersonaAuditReport {
     duplicateBiographyEvents: duplicates(entries.flatMap(({ persona }) => persona.timeline.map((event) => event.description))),
     duplicateSpeechExamples: duplicates(entries.flatMap(({ persona }) => persona.speech.messageExamples)),
   };
+}
+
+function auditIdentityChanges(entries: AuditedPersona[]): PersonaAuditReport['identityChanges'] {
+  const personaByUsername = new Map(entries.flatMap((entry) => entry.username ? [[entry.username, entry.persona] as const] : []));
+  return PRODUCTION_PERSONA_IDENTITY_CHANGES.map((expected) => {
+    const observed = personaByUsername.get(expected.username);
+    const blueprint = PERSONA_BLUEPRINTS[expected.username];
+    const blueprintMatches = blueprint?.firstName === expected.firstName
+      && blueprint.preferredName === expected.preferredName
+      && blueprint.lastName === expected.lastName;
+    if (!observed) return { username: expected.username, canonicalName: expected.canonicalName, status: 'missing' };
+    const observedIdentity = {
+      firstName: observed.identity.firstName,
+      ...(observed.identity.preferredName ? { preferredName: observed.identity.preferredName } : {}),
+    };
+    return {
+      username: expected.username,
+      canonicalName: expected.canonicalName,
+      status: blueprintMatches
+        && observed.identity.firstName === expected.firstName
+        && observed.identity.preferredName === expected.preferredName
+        ? 'matched'
+        : 'diverged',
+      observed: observedIdentity,
+    };
+  });
 }
 
 export function auditedPersonaSummaries(entries: AuditedPersona[], base: (persona: BotPersona) => PersonaSummary): PersonaSummary[] {
@@ -244,6 +290,7 @@ function duplicates(values: string[]): string[] {
   return [...counts.entries()].filter(([, count]) => count > 1).map(([value]) => value).sort((left, right) => left.localeCompare(right, 'ru'));
 }
 function normalizeDuplicate(value: string): string { return value.toLowerCase().replace(/\s+/g, ' ').trim(); }
+function percentage(value: number, total: number): number { return total ? round((value / total) * 100, 1) : 0; }
 function round(value: number, digits: number): number { const scale = 10 ** digits; return Math.round(value * scale) / scale; }
 
 const STOP_WORDS = new Set(['это', 'как', 'что', 'для', 'или', 'без', 'при', 'его', 'она', 'они', 'свою', 'свои', 'только', 'когда', 'после', 'если', 'уже', 'чтобы', 'который', 'может', 'очень', 'пишет', 'редко', 'любит', 'знает', 'уровне', 'стрим', 'dota']);

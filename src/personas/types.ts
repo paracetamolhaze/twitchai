@@ -10,6 +10,35 @@ export const PERSONA_EDITABLE_PATHS = [
 ] as const;
 export type PersonaEditablePath = typeof PERSONA_EDITABLE_PATHS[number];
 
+/**
+ * Manual changes to these fields can make a newly generated surrounding canon
+ * inconsistent even when the exact overridden field is preserved. They are
+ * therefore never safe to apply as part of a bulk regeneration.
+ */
+export const SENSITIVE_PERSONA_REGENERATION_OVERRIDE_PATHS = [
+  'name',
+  'description',
+  'identity.firstName',
+  'identity.preferredName',
+  'identity.nickname',
+  'identity.nicknameOrigin',
+  'identity.birthDate',
+  'identity.birthplace',
+  'identity.grewUpIn',
+  'identity.currentLocation',
+  'identity.languages',
+  'identity.occupation',
+  'identity.education',
+  'identity.relationshipStatus',
+  'familyBackground',
+  'family',
+  'timeline',
+  'facts',
+  'opinions',
+  'disclosure',
+  'relationships',
+] as const satisfies readonly PersonaEditablePath[];
+
 export type PersonaSource = 'generated' | 'manual';
 
 export interface PersonaLocation {
@@ -326,11 +355,38 @@ export interface PersonaSimilarityPair {
   reasons: string[];
 }
 
+/** Backend-only statistics for the fixed production cohort. */
+export interface PersonaGenderDistribution {
+  male: number;
+  female: number;
+  malePercentage: number;
+  femalePercentage: number;
+  femaleUsernames: string[];
+}
+
+/**
+ * Verification record for an identity that was deliberately rebuilt as part
+ * of the production cohort rebalance. It never travels to Gemini.
+ */
+export interface PersonaIdentityChangeAudit {
+  username: string;
+  canonicalName: string;
+  status: 'matched' | 'diverged' | 'missing';
+  observed?: {
+    firstName: string;
+    preferredName?: string;
+  };
+}
+
 export interface PersonaAuditReport {
   accountCount: number;
   personaCount: number;
   uniquePersonaCount: number;
   uniqueSpeechFingerprintCount: number;
+  /** Backend-only cohort audit metadata; never included in model context. */
+  genderDistribution: PersonaGenderDistribution;
+  /** Backend-only verification of the seven intentionally rebuilt identities. */
+  identityChanges: PersonaIdentityChangeAudit[];
   countryOfBirthDistribution: Record<string, number>;
   currentCountryDistribution: Record<string, number>;
   currentCityDistribution: Record<string, number>;

@@ -4,6 +4,12 @@ import { BotPersona } from '../src/personas/types';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { generatePersonaV3, personaGenerationFingerprint } from '../src/personas/generator-v3';
 
+class FailingBulkRepository extends MemoryRepository {
+  override async replacePersonasWithBackups(): Promise<void> {
+    throw new Error('atomic_bulk_write_failed');
+  }
+}
+
 describe('persona regeneration', () => {
   it('backs up legacy generated canon and preserves operator overrides through preview/apply', async () => {
     const repository = new MemoryRepository();
@@ -49,7 +55,7 @@ describe('persona regeneration', () => {
     const applied = await store.regenerate(migrated.id, preview.previewHash);
     expect(applied.identity.preferredName).toBe('Костян');
     expect(applied.manualOverrides).toEqual(edited.manualOverrides);
-    expect(await repository.listPersonaCanonBackups(migrated.id, 10)).toHaveLength(3);
+    expect(await repository.listPersonaCanonBackups(migrated.id, 10)).toHaveLength(2);
   });
 
   it('validates every bulk preview before writing any persona', async () => {
@@ -75,5 +81,81 @@ describe('persona regeneration', () => {
 
     expect(personaGenerationFingerprint(store.get(first.id))).toBe(before);
     expect(await repository.listPersonaCanonBackups(first.id, 10)).toEqual([]);
+  });
+
+  it('keeps the full cohort unchanged when the atomic bulk write fails', async () => {
+    const repository = new FailingBulkRepository();
+    const first = generatePersonaV3('gigantiuz');
+    const second = generatePersonaV3('supercser2');
+    first.description = 'Устаревшая первая биография для проверки транзакции';
+    second.description = 'Устаревшая вторая биография для проверки транзакции';
+    await repository.upsertPersona(first);
+    await repository.upsertPersona(second);
+    await repository.upsertBot({ username: 'gigantiuz', personaId: first.id, enabled: true, connectionState: 'DISCONNECTED', chatConnected: false, messagesSent: 0 });
+    await repository.upsertBot({ username: 'supercser2', personaId: second.id, enabled: true, connectionState: 'DISCONNECTED', chatConnected: false, messagesSent: 0 });
+
+    const store = new PersonaStore(repository);
+    await store.initialize();
+    const previews = await store.previewAllRegenerations();
+    expect(previews.every((preview) => preview.changed)).toBe(true);
+    const beforeFirst = store.get(first.id);
+    const beforeSecond = store.get(second.id);
+
+    await expect(store.regenerateAll(previews.map((preview) => ({
+      personaId: preview.personaId,
+      previewHash: preview.previewHash,
+    })))).rejects.toThrow('atomic_bulk_write_failed');
+
+    expect(store.get(first.id)).toEqual(beforeFirst);
+    expect(store.get(second.id)).toEqual(beforeSecond);
+    expect(await repository.listPersonaCanonBackups(first.id, 10)).toEqual([]);
+    expect(await repository.listPersonaCanonBackups(second.id, 10)).toEqual([]);
+  });
+
+  it('does not auto-migrate a manually edited generated persona at startup', async () => {
+    const repository = new MemoryRepository();
+    const edited = generatePersonaV3('darwinboo2');
+    edited.generationVersion = 2;
+    edited.description = 'Ручной канон из предыдущей версии';
+    edited.identity.firstName = 'Ручное имя';
+    edited.manuallyEdited = true;
+    edited.manualOverrides = [];
+    await repository.upsertPersona(edited);
+    await repository.upsertBot({ username: 'darwinboo2', personaId: edited.id, enabled: true, connectionState: 'DISCONNECTED', chatConnected: false, messagesSent: 0 });
+
+    const store = new PersonaStore(repository);
+    await store.initialize();
+
+    const preserved = store.get(edited.id);
+    expect(preserved.generationVersion).toBe(2);
+    expect(preserved.description).toBe('Ручной канон из предыдущей версии');
+    expect(preserved.identity.firstName).toBe('Ручное имя');
+    expect(await repository.listPersonaCanonBackups(edited.id, 10)).toEqual([]);
+
+    const preview = await store.previewRegeneration(edited.id);
+    expect(preview.changed).toBe(true);
+    expect(preview.requiresIndividualConfirmation).toBe(true);
+  });
+
+  it('requires individual confirmation before bulk regeneration can replace a sensitive manual canon', async () => {
+    const repository = new MemoryRepository();
+    const edited = generatePersonaV3('darwinboo2');
+    edited.identity.firstName = 'Ручное имя';
+    edited.description = 'устаревшее описание для проверки preview';
+    edited.manuallyEdited = true;
+    edited.manualOverrides = ['identity.firstName'];
+    await repository.upsertPersona(edited);
+    await repository.upsertBot({ username: 'darwinboo2', personaId: edited.id, enabled: true, connectionState: 'DISCONNECTED', chatConnected: false, messagesSent: 0 });
+
+    const store = new PersonaStore(repository);
+    await store.initialize();
+    const preview = await store.previewRegeneration(edited.id);
+
+    expect(preview.changed).toBe(true);
+    expect(preview.requiresIndividualConfirmation).toBe(true);
+    await expect(store.regenerateAll([{ personaId: preview.personaId, previewHash: preview.previewHash }]))
+      .rejects.toThrow('persona_regeneration_requires_individual_confirmation');
+    expect(store.get(edited.id).identity.firstName).toBe('Ручное имя');
+    expect(await repository.listPersonaCanonBackups(edited.id, 10)).toEqual([]);
   });
 });

@@ -61,6 +61,15 @@ export interface PersonaCanonBackupRecord {
   createdAt: number;
 }
 
+/**
+ * A canon replacement and its recovery point. Repositories must commit the
+ * whole collection atomically so a bulk operator action cannot stop halfway.
+ */
+export interface PersonaReplacementWithBackup {
+  backup: PersonaCanonBackupRecord;
+  persona: BotPersona;
+}
+
 export interface AppRepository {
   initialize(): Promise<void>;
   close(): Promise<void>;
@@ -69,6 +78,7 @@ export interface AppRepository {
   upsertPersona(persona: BotPersona): Promise<void>;
   deletePersona(id: string): Promise<void>;
   savePersonaCanonBackup(backup: PersonaCanonBackupRecord): Promise<void>;
+  replacePersonasWithBackups(replacements: PersonaReplacementWithBackup[]): Promise<void>;
   listPersonaCanonBackups(personaId: string, limit: number): Promise<PersonaCanonBackupRecord[]>;
   savePersonaMemory(memory: PersonaMemoryItem): Promise<void>;
   listPersonaMemories(personaId: string, limit: number): Promise<PersonaMemoryItem[]>;

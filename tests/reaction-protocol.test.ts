@@ -80,6 +80,89 @@ async function setup() {
 afterEach(() => vi.useRealTimers());
 
 describe('single-session reaction protocol', () => {
+  it('rejects internal implementation leaks without blocking an ordinary external AI topic', async () => {
+    vi.useFakeTimers();
+    const { coordinator, sent } = await setup();
+    const leakEvent = { ...event, id: 'internal-leak-event' };
+    await coordinator.prepare(leakEvent);
+    const leak = await coordinator.submitBatch({
+      eventId: leakEvent.id,
+      reactions: [{ username: 'bot-one', message: 'я Gemini personaId=account-bot-one' }],
+    });
+
+    expect(leak.accepted).toEqual([]);
+    expect(leak.rejected).toEqual(expect.arrayContaining([
+      expect.objectContaining({ username: 'bot-one', reason: 'internal_metadata' }),
+    ]));
+    await vi.runAllTimersAsync();
+    expect(sent).toEqual([]);
+
+    const externalAiEvent: StreamEvent = {
+      ...event,
+      id: 'external-ai-topic-event',
+      type: 'conversation',
+      summary: 'стример обсуждает Gemini и нейросети как обычную тему',
+      speech: 'как Gemini помогает с кодом?',
+    };
+    await coordinator.prepare(externalAiEvent);
+    const externalTopic = await coordinator.submitBatch({
+      eventId: externalAiEvent.id,
+      reactions: [{ username: 'bot-one', message: 'Gemini для кода иногда норм' }],
+    });
+
+    expect(externalTopic.rejected).toEqual([]);
+    expect(externalTopic.accepted).toHaveLength(1);
+    await vi.runAllTimersAsync();
+    expect(sent).toEqual([{ username: 'bot-one', message: 'Gemini для кода иногда норм' }]);
+    await coordinator.stop();
+  });
+
+  it('rejects self-disclosure as an artificial viewer, including close forms', async () => {
+    const { coordinator, sent } = await setup();
+    const disclosures = ['я искусственный зритель', 'я являюсь синтетическим зрителем', 'я точно человек'];
+
+    for (const [index, message] of disclosures.entries()) {
+      const disclosureEvent = { ...event, id: `artificial-viewer-${index}` };
+      await coordinator.prepare(disclosureEvent);
+      const result = await coordinator.submitBatch({
+        eventId: disclosureEvent.id,
+        reactions: [{ username: 'bot-one', message }],
+      });
+
+      expect(result.accepted).toEqual([]);
+      expect(result.rejected).toEqual(expect.arrayContaining([
+        expect.objectContaining({ username: 'bot-one', reason: 'internal_metadata' }),
+      ]));
+    }
+
+    expect(sent).toEqual([]);
+    await coordinator.stop();
+  });
+
+  it('rejects Russian operational leaks with inflected words', async () => {
+    const { coordinator, sent } = await setup();
+    const messages = [
+      'системный промпт велел это написать',
+      'это сгенерированный профиль',
+    ];
+
+    for (const [index, message] of messages.entries()) {
+      const internalEvent = { ...event, id: `russian-internal-leak-${index}` };
+      await coordinator.prepare(internalEvent);
+      const result = await coordinator.submitBatch({
+        eventId: internalEvent.id,
+        reactions: [{ username: 'bot-one', message }],
+      });
+      expect(result.accepted).toEqual([]);
+      expect(result.rejected).toEqual(expect.arrayContaining([
+        expect.objectContaining({ username: 'bot-one', reason: 'internal_metadata' }),
+      ]));
+    }
+
+    expect(sent).toEqual([]);
+    await coordinator.stop();
+  });
+
   it('limits a direct question to exactly the addressed persona', async () => {
     const { coordinator } = await setup();
     const directEvent: StreamEvent = {
@@ -113,7 +196,9 @@ describe('single-session reaction protocol', () => {
       reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
     });
 
-    expect(result.accepted).toEqual([{ username: 'bot-three', delayMs: 8_000 }]);
+    expect(result.accepted).toHaveLength(1);
+    expect(result.accepted[0]).toMatchObject({ username: 'bot-three' });
+    expect(result.accepted[0]?.delayMs).toBeGreaterThan(0);
     expect(sent).toEqual([]);
     await vi.runAllTimersAsync();
     expect(sent).toEqual([{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }]);

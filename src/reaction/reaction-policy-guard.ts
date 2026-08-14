@@ -85,6 +85,7 @@ export class ReactionPolicyGuard {
       }
       if (!message) { reject('empty_message'); continue; }
       if (isControlValue(message)) { reject('control_value'); continue; }
+      if (hasInternalMetadataLeak(message)) { reject('internal_metadata'); continue; }
       if (Buffer.byteLength(message, 'utf8') > this.maxMessageBytes()) { reject('message_too_long'); continue; }
       if (candidate.lastReactionAt && now - candidate.lastReactionAt < candidate.persona.behavior.minimumIntervalMs) {
         reject('account_cooldown'); continue;
@@ -145,4 +146,34 @@ export class ReactionPolicyGuard {
 function normalizeMessage(value: string): string { return value.replace(/\s+/g, ' ').trim(); }
 function isControlValue(value: string): boolean {
   return /^<\/?[a-z][^>]*>$/i.test(value) || /^<?skip>?[.!]?$/i.test(value) || /^[/.]/.test(value);
+}
+
+/**
+ * Rejects only operational self-disclosure and implementation identifiers. Terms
+ * such as Gemini or AI remain valid when the stream is discussing them normally.
+ */
+function hasInternalMetadataLeak(value: string): boolean {
+  const normalized = value.toLowerCase();
+  const implementationMarkers = [
+    /(?<![\p{L}\p{N}_])personaid(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])prepare_reaction_context(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])emit_reaction_batch(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])personacontextbuilder(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])reactionmemory(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])(?:system\s+(?:prompt|instruction)|системн\p{L}*\s+(?:промпт\p{L}*|инструкц\p{L}*))(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])(?:backend\s+metadata|метаданн\p{L}*\s+бэкенд\p{L}*|database\s+(?:field|metadata))(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])(?:generated\s+profile|profile\s+generation|ai\s+persona|bot\s+personality)(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])(?:сгенерированн\p{L}*\s+(?:профил\p{L}*|персонаж\p{L}*)|персон\p{L}*\s+в\s+промпт\p{L}*)(?![\p{L}\p{N}_])/iu,
+  ];
+  if (implementationMarkers.some((pattern) => pattern.test(normalized))) return true;
+
+  const selfDisclosure = [
+    /(?:^|[\s,.!?])я(?:\s+являюсь)?\s*(?:[—-]\s*)?(?:не\s+)?(?:бот(?:ик)?|ai|нейросет[\p{L}\p{N}_]*|нейронк[\p{L}\p{N}_]*|gemini|openai|chatgpt|gpt|языков(?:ая|ой)\s+модел[\p{L}\p{N}_]*|искусственн[\p{L}\p{N}_]*\s+(?:интеллект|зрител[\p{L}\p{N}_]*|viewer)|синтетическ[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|viewer)|виртуальн[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|viewer)|автоматизированн[\p{L}\p{N}_]*\s+(?:зрител[\p{L}\p{N}_]*|аккаунт[\p{L}\p{N}_]*))/iu,
+    /(?:^|[\s,.!?])я\s+(?:точно|реально)\s+человек(?=$|[\s,.!?])/iu,
+    /(?:^|[\s,.!?])i\s*(?:am|'m)\s+(?:an?\s+)?(?:bot|ai|language\s+model|gemini|openai|chatgpt|gpt|(?:artificial|synthetic|virtual|automated)\s+viewer)/iu,
+    /(?:^|[\s,.!?])i\s*(?:am|'m)\s+(?:definitely|really|a\s+real)\s+human(?=$|[\s,.!?])/iu,
+    /(?:меня|нас)\s+(?:создали|сгенерировали|настроили|запрограммировали)/iu,
+    /(?:у\s+меня|мне)\s+(?:прописан|назначен|выдан)\s+(?:промпт|профил|персон)/iu,
+  ];
+  return selfDisclosure.some((pattern) => pattern.test(normalized));
 }

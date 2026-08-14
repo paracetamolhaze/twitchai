@@ -146,8 +146,17 @@ interface PersonaSimilarityPair {
   leftPersonaId: string; rightPersonaId: string; leftUsername?: string; rightUsername?: string
   similarity: number; reasons: string[]
 }
+interface PersonaGenderDistribution {
+  male: number; female: number; malePercentage?: number; femalePercentage?: number; femaleUsernames?: string[]
+}
+interface PersonaIdentityChangeAudit {
+  username: string; canonicalName: string; status: 'matched' | 'diverged' | 'missing'
+  observed?: { firstName: string; preferredName?: string }
+}
 interface PersonaAuditReport {
   accountCount: number; personaCount: number; uniquePersonaCount: number; uniqueSpeechFingerprintCount: number
+  genderDistribution?: PersonaGenderDistribution
+  identityChanges?: PersonaIdentityChangeAudit[]
   countryOfBirthDistribution: Record<string, number>; currentCountryDistribution: Record<string, number>
   currentCityDistribution: Record<string, number>; occupationDistribution: Record<string, number>
   behaviorRanges: Record<string, { min: number; max: number }>; maximumSimilarity: number; averageSimilarity: number
@@ -157,6 +166,7 @@ interface PersonaAuditReport {
 }
 interface PersonaRegenerationPreview {
   personaId: string; username: string; current: Persona; proposed: Persona; previewHash: string; preservedManualOverrides: string[]; legacyManualReviewRequired: boolean
+  changed?: boolean; reason?: string; requiresIndividualConfirmation?: boolean
 }
 interface BulkRegenerationPreview {
   items: PersonaRegenerationPreview[]
@@ -164,7 +174,7 @@ interface BulkRegenerationPreview {
 }
 type ReactionRejectionReason =
   | 'duplicate_username' | 'unknown_candidate' | 'not_connected' | 'too_many_reactions'
-  | 'empty_message' | 'control_value' | 'message_too_long' | 'account_cooldown'
+  | 'empty_message' | 'control_value' | 'internal_metadata' | 'message_too_long' | 'account_cooldown'
   | 'account_busy' | 'global_rate_limit' | 'recent_duplicate' | 'invalid_item'
 interface ReactionDecision {
   eventId: string
@@ -238,6 +248,12 @@ const personaSummaryById = computed(() => new Map(personaSummaries.value.map((su
 const selectedPersonaSummary = computed(() => selectedPersona.value ? personaSummaryById.value.get(selectedPersona.value.id) : undefined)
 const selectedPersonaTooSimilar = computed(() => (selectedPersonaSummary.value?.uniqueness ?? 100)
   <= Math.round((1 - PERSONA_SIMILARITY_WARNING_THRESHOLD) * 100))
+const bulkChangedItems = computed(() => (bulkRegenerationPreview.value?.items ?? []).filter((item) => item.changed === true))
+const bulkIndividualConfirmationItems = computed(() => bulkChangedItems.value
+  .filter((item) => item.requiresIndividualConfirmation === true))
+const bulkApplicableItems = computed(() => bulkChangedItems.value
+  .filter((item) => item.requiresIndividualConfirmation !== true))
+const bulkUnchangedItems = computed(() => (bulkRegenerationPreview.value?.items ?? []).filter((item) => item.changed === false))
 
 const timeline = computed(() => [
   ...events.value.map((event) => ({
@@ -540,6 +556,11 @@ async function previewSelectedRegeneration(): Promise<void> {
 async function applySelectedRegeneration(): Promise<void> {
   const preview = regenerationPreview.value
   if (!preview) return
+  if (preview.changed === false) {
+    regenerationPreview.value = null
+    saveMessage.value = 'Проверка завершена: обновление не требуется, запись не изменена'
+    return
+  }
   try {
     personaBusy.value = true
     const saved = await api<Persona>(`/api/personas/${encodeURIComponent(preview.personaId)}/regenerate`, {
@@ -566,17 +587,22 @@ async function previewBulkRegeneration(): Promise<void> {
 async function applyBulkRegeneration(): Promise<void> {
   const preview = bulkRegenerationPreview.value
   if (!preview) return
+  const applicable = bulkApplicableItems.value
+  if (!applicable.length) {
+    saveMessage.value = 'Нет безопасных изменений для массового применения. Профили с ручными изменениями подтвердите отдельно.'
+    return
+  }
   try {
     personaBusy.value = true
     const result = await api<{ personas: Persona[]; audit: PersonaAuditReport }>('/api/persona-regeneration/apply', {
       method: 'POST',
-      body: JSON.stringify({ previews: preview.items.map((item) => ({ personaId: item.personaId, previewHash: item.previewHash })) }),
+      body: JSON.stringify({ previews: applicable.map((item) => ({ personaId: item.personaId, previewHash: item.previewHash })) }),
     })
     for (const persona of result.personas) replacePersona(persona)
     personaAudit.value = result.audit
     bulkRegenerationPreview.value = null
     await refreshPersonaSummaries()
-    saveMessage.value = `Пересоздано ${result.personas.length} автогенерированных личностей; резервные копии сохранены`
+    saveMessage.value = `Пересоздано ${result.personas.length} личностей без чувствительных ручных изменений; резервные копии сохранены`
   } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
   finally { personaBusy.value = false }
 }
@@ -736,7 +762,7 @@ function rejectionLabel(reason: ReactionRejectionReason): string {
   const labels: Record<ReactionRejectionReason, string> = {
     duplicate_username: 'аккаунт указан дважды', unknown_candidate: 'неизвестный аккаунт',
     not_connected: 'нет соединения', too_many_reactions: 'слишком много реакций',
-    empty_message: 'пустое сообщение', control_value: 'служебное значение',
+    empty_message: 'пустое сообщение', control_value: 'служебное значение', internal_metadata: 'внутренние служебные данные',
     message_too_long: 'сообщение слишком длинное', account_cooldown: 'пауза аккаунта',
     account_busy: 'аккаунт уже занят', global_rate_limit: 'общий лимит сообщений',
     recent_duplicate: 'похожее сообщение уже было', invalid_item: 'некорректная реакция',
@@ -1039,7 +1065,9 @@ onBeforeUnmount(() => {
               <div v-if="selectedPersonaSummary?.mostSimilarPersonaId" class="nested-card"><h4>Наиболее похожая личность</h4><p>{{ selectedPersonaSummary.mostSimilarUsername || selectedPersonaSummary.mostSimilarPersonaId }}</p><p class="muted">{{ selectedPersonaSummary.similarityReasons.join(' · ') || 'Сильного общего измерения не обнаружено' }}</p></div>
               <div class="nested-card"><h4>Проверка связности</h4><p v-if="!selectedPersonaSummary?.qualityWarnings.length" class="quality-ok">Ошибок и предупреждений нет.</p><ul v-else class="quality-warnings"><li v-for="warning in selectedPersonaSummary.qualityWarnings" :key="warning">{{ warning }}</li></ul></div>
               <p v-if="personaAudit && personaAudit.maximumSimilarity >= PERSONA_SIMILARITY_WARNING_THRESHOLD" class="notice error">⚠ В наборе есть слишком похожие личности: максимальное сходство {{ personaAudit.maximumSimilarity.toFixed(3) }}.</p>
-              <div v-if="personaAudit" class="audit-grid"><article><span>Аккаунтов / уникальных личностей</span><strong>{{ personaAudit.accountCount }} / {{ personaAudit.uniquePersonaCount }}</strong></article><article><span>Уникальных стилей речи</span><strong>{{ personaAudit.uniqueSpeechFingerprintCount }}</strong></article><article><span>Максимальное сходство</span><strong>{{ personaAudit.maximumSimilarity.toFixed(3) }}</strong></article><article><span>Среднее сходство</span><strong>{{ personaAudit.averageSimilarity.toFixed(3) }}</strong></article><article><span>Ошибок связности</span><strong>{{ personaAudit.coherenceErrors.length }}</strong></article><article><span>Предупреждений</span><strong>{{ personaAudit.coherenceWarnings.length }}</strong></article><article><span>Родственников на личность</span><strong>{{ personaAudit.structureRanges?.relatives?.min ?? '—' }}–{{ personaAudit.structureRanges?.relatives?.max ?? '—' }}</strong></article><article><span>Фактов на личность</span><strong>{{ personaAudit.structureRanges?.facts?.min ?? '—' }}–{{ personaAudit.structureRanges?.facts?.max ?? '—' }}</strong></article></div>
+              <div v-if="personaAudit" class="audit-grid"><article><span>Аккаунтов / уникальных личностей</span><strong>{{ personaAudit.accountCount }} / {{ personaAudit.uniquePersonaCount }}</strong></article><article><span>Мужчины / женщины в v3-наборе</span><strong>{{ personaAudit.genderDistribution?.male ?? '—' }} / {{ personaAudit.genderDistribution?.female ?? '—' }}</strong><small>{{ personaAudit.genderDistribution?.malePercentage ?? '—' }}% / {{ personaAudit.genderDistribution?.femalePercentage ?? '—' }}%</small></article><article><span>Уникальных стилей речи</span><strong>{{ personaAudit.uniqueSpeechFingerprintCount }}</strong></article><article><span>Максимальное сходство</span><strong>{{ personaAudit.maximumSimilarity.toFixed(3) }}</strong></article><article><span>Среднее сходство</span><strong>{{ personaAudit.averageSimilarity.toFixed(3) }}</strong></article><article><span>Ошибок связности</span><strong>{{ personaAudit.coherenceErrors.length }}</strong></article><article><span>Предупреждений</span><strong>{{ personaAudit.coherenceWarnings.length }}</strong></article><article><span>Родственников на личность</span><strong>{{ personaAudit.structureRanges?.relatives?.min ?? '—' }}–{{ personaAudit.structureRanges?.relatives?.max ?? '—' }}</strong></article><article><span>Фактов на личность</span><strong>{{ personaAudit.structureRanges?.facts?.min ?? '—' }}–{{ personaAudit.structureRanges?.facts?.max ?? '—' }}</strong></article></div>
+              <div v-if="personaAudit?.genderDistribution?.femaleUsernames?.length" class="nested-card"><h4>Женские профили в наборе</h4><p>{{ personaAudit.genderDistribution.femaleUsernames.join(', ') }}</p></div>
+              <div v-if="personaAudit?.identityChanges?.length" class="nested-card"><h4>Аудит пересобранных identity</h4><ul class="quality-warnings"><li v-for="change in personaAudit.identityChanges" :key="change.username"><strong>{{ change.username }}</strong> — {{ change.canonicalName }}: {{ change.status === 'matched' ? 'канон совпадает' : change.status === 'missing' ? 'профиль не назначен' : 'нужно проверить канон' }}</li></ul></div>
             </section>
 
             <div class="persona-editor-footer"><p class="muted">Сохранение изменяет канон. Обычный чат и Gemini не имеют доступа к этой операции.</p><button class="primary" type="submit" :disabled="personaBusy">{{ personaBusy ? 'Сохраняем…' : 'Сохранить личность' }}</button></div>
@@ -1053,19 +1081,21 @@ onBeforeUnmount(() => {
         <template v-if="regenerationPreview">
           <div class="panel-heading"><div><p class="eyebrow">ПРЕДПРОСМОТР</p><h3>Пересоздать {{ regenerationPreview.username }}</h3></div><button class="icon-button" type="button" @click="regenerationPreview = null">×</button></div>
           <p class="muted">Имя аккаунта и идентификатор личности останутся прежними. Перед записью сервер сохранит полный предыдущий канон; ручные разделы имеют приоритет.</p>
-          <p v-if="regenerationPreview.legacyManualReviewRequired" class="notice error">Этот профиль создан до появления точного учёта ручных полей. Он не менялся автоматически: внимательно сравните канон. Полная старая версия уже сохранена в PostgreSQL.</p>
+          <p v-if="regenerationPreview.changed === false" class="notice">Проверено: изменения не требуются. {{ regenerationPreview.reason || 'Текущий канон уже совпадает с предложенной генерацией.' }}</p>
+          <p v-if="regenerationPreview.requiresIndividualConfirmation" class="notice error">Нужно индивидуальное подтверждение: этот профиль нельзя применять массово. {{ regenerationPreview.reason }}</p>
+          <p v-else-if="regenerationPreview.legacyManualReviewRequired" class="notice error">Этот профиль создан до появления точного учёта ручных полей. Внимательно сравните канон перед индивидуальным применением. Полная старая версия уже сохранена в PostgreSQL.</p>
           <div class="preview-comparison"><article><span>Сейчас</span><h4>{{ regenerationPreview.current.name }}</h4><p>{{ personaPreviewText(regenerationPreview.current) }}</p><details open><summary>Полный текущий канон</summary><pre>{{ personaFullPreview(regenerationPreview.current) }}</pre></details></article><article><span>Новая личность</span><h4>{{ regenerationPreview.proposed.name }}</h4><p>{{ personaPreviewText(regenerationPreview.proposed) }}</p><details open><summary>Полный предлагаемый канон</summary><pre>{{ personaFullPreview(regenerationPreview.proposed) }}</pre></details></article></div>
           <div class="preview-notice"><strong>Сохранятся ручные разделы: {{ regenerationPreview.preservedManualOverrides.length }}</strong><small>{{ regenerationPreview.preservedManualOverrides.join(', ') || 'Ручных изменений пока нет' }}</small></div>
-          <div class="modal-actions"><button class="secondary" type="button" @click="regenerationPreview = null">Отмена</button><button class="primary" type="button" :disabled="personaBusy" @click="applySelectedRegeneration">Создать резервную копию и применить</button></div>
+          <div class="modal-actions"><button class="secondary" type="button" @click="regenerationPreview = null">Отмена</button><button class="primary" type="button" :disabled="personaBusy || regenerationPreview.changed === false" @click="applySelectedRegeneration">{{ regenerationPreview.requiresIndividualConfirmation ? 'Подтвердить индивидуально и применить' : 'Создать резервную копию и применить' }}</button></div>
         </template>
         <template v-else-if="bulkRegenerationPreview">
           <div class="panel-heading"><div><p class="eyebrow">МАССОВЫЙ ПРЕДПРОСМОТР</p><h3>Проверено личностей: {{ bulkRegenerationPreview.items.length }}</h3></div><button class="icon-button" type="button" @click="bulkRegenerationPreview = null">×</button></div>
-          <p class="muted">Ручные личности пропущены. Для каждой автоматически созданной записи будет сделана отдельная резервная копия; имя аккаунта, идентификатор личности и отслеживаемые ручные правки сохраняются.</p>
-          <p v-if="bulkRegenerationPreview.items.some(item => item.legacyManualReviewRequired)" class="notice error">Есть {{ bulkRegenerationPreview.items.filter(item => item.legacyManualReviewRequired).length }} профилей старой версии без прежней карты изменённых полей. Сервер не менял их автоматически; применение этого окна является явным подтверждением после сравнения.</p>
+          <p class="muted">Проверено: {{ bulkRegenerationPreview.items.length }} · изменится: {{ bulkChangedItems.length }} · без изменений: {{ bulkUnchangedItems.length }}. Ручные личности пропущены; безопасные изменения получат отдельные резервные копии.</p>
+          <p v-if="bulkIndividualConfirmationItems.length" class="notice error">{{ bulkIndividualConfirmationItems.length }} профилей с чувствительными ручными изменениями исключены из массового применения. Откройте каждый профиль, сравните канон и подтвердите обновление отдельно.</p>
           <p v-if="bulkRegenerationPreview.audit.maximumSimilarity >= PERSONA_SIMILARITY_WARNING_THRESHOLD" class="notice error">⚠ Предложенные личности слишком похожи: максимальное сходство {{ bulkRegenerationPreview.audit.maximumSimilarity.toFixed(3) }}.</p>
           <div class="audit-grid compact-audit"><article><span>Уникальных личностей</span><strong>{{ bulkRegenerationPreview.audit.uniquePersonaCount }}</strong></article><article><span>Уникальных стилей речи</span><strong>{{ bulkRegenerationPreview.audit.uniqueSpeechFingerprintCount }}</strong></article><article><span>Максимальное сходство</span><strong>{{ bulkRegenerationPreview.audit.maximumSimilarity.toFixed(3) }}</strong></article><article><span>Ошибок связности</span><strong>{{ bulkRegenerationPreview.audit.coherenceErrors.length }}</strong></article></div>
-          <div class="bulk-preview-list"><article v-for="item in bulkRegenerationPreview.items" :key="item.personaId"><strong>{{ item.username }}</strong><span>{{ item.current.identity.firstName }} → {{ item.proposed.identity.firstName }}<template v-if="item.proposed.identity.preferredName"> / {{ item.proposed.identity.preferredName }}</template></span><small>ручных разделов: {{ item.preservedManualOverrides.length }}</small><button class="text-button" type="button" @click="openBulkPersonaPreview(item)">Открыть полное сравнение</button></article></div>
-          <div class="modal-actions"><button class="secondary" type="button" @click="bulkRegenerationPreview = null">Отмена</button><button class="primary" type="button" :disabled="personaBusy || !bulkRegenerationPreview.items.length" @click="applyBulkRegeneration">Сделать резервные копии и применить всё</button></div>
+          <div class="bulk-preview-list"><article v-for="item in bulkRegenerationPreview.items" :key="item.personaId"><strong>{{ item.username }}</strong><span>{{ item.current.identity.firstName }} → {{ item.proposed.identity.firstName }}<template v-if="item.proposed.identity.preferredName"> / {{ item.proposed.identity.preferredName }}</template></span><small><template v-if="item.changed">Будет изменена</template><template v-else>Без изменений — будет пропущена</template> · ручных разделов: {{ item.preservedManualOverrides.length }}</small><small>{{ item.reason || 'Причина не указана сервером' }}</small><small v-if="item.requiresIndividualConfirmation" class="notice error">Нужно индивидуальное подтверждение; массово не применяется.</small><button class="text-button" type="button" @click="openBulkPersonaPreview(item)">{{ item.requiresIndividualConfirmation ? 'Открыть и подтвердить отдельно' : 'Открыть полное сравнение' }}</button></article></div>
+          <div class="modal-actions"><button class="secondary" type="button" @click="bulkRegenerationPreview = null">Отмена</button><button class="primary" type="button" :disabled="personaBusy || !bulkApplicableItems.length" @click="applyBulkRegeneration">Применить безопасные изменения: {{ bulkApplicableItems.length }}</button></div>
         </template>
       </section>
     </div>

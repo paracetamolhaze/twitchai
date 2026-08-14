@@ -19,6 +19,8 @@ const report = {
     currentLocation: persona.identity.currentLocation,
   })),
   occupations: audit.occupationDistribution,
+  genderDistribution: audit.genderDistribution,
+  identityChanges: audit.identityChanges,
   speechProfiles: personas.slice(0, 10).map((persona) => ({
     username: persona.generatedFromUsername,
     averageMessageWords: persona.speech.averageMessageWords,
