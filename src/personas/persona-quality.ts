@@ -78,9 +78,6 @@ export function validatePersonaCoherence(persona: BotPersona, now = new Date()):
   if (persona.behavior.verbosity.minWords > persona.behavior.verbosity.maxWords) {
     add('invalid_verbosity_range', 'error', 'behavior.verbosity', 'Минимальная длина сообщения больше максимальной.');
   }
-  if (persona.behavior.activity.averageDelayMs.min > persona.behavior.activity.averageDelayMs.max) {
-    add('invalid_delay_range', 'error', 'behavior.activity.averageDelayMs', 'Минимальная задержка больше максимальной.');
-  }
   if (persona.speech.messageExamples.length < 15) {
     add('few_speech_examples', 'warning', 'speech.messageExamples', 'Нужно не меньше 15 синтетических примеров речи.');
   }
@@ -142,8 +139,6 @@ export function auditPersonas(entries: AuditedPersona[]): PersonaAuditReport {
       eventSelectivity: range(entries.map(({ persona }) => persona.behavior.activity.eventSelectivity)),
       directReplyLikelihood: range(entries.map(({ persona }) => persona.behavior.activity.directReplyLikelihood)),
       sarcasmLevel: range(entries.map(({ persona }) => persona.behavior.sarcasmLevel)),
-      delayMinMs: range(entries.map(({ persona }) => persona.behavior.activity.averageDelayMs.min)),
-      delayMaxMs: range(entries.map(({ persona }) => persona.behavior.activity.averageDelayMs.max)),
     },
     structureRanges: {
       relatives: range(entries.map(({ persona }) => persona.family.length)),
@@ -246,9 +241,8 @@ function buildSimilarityPairs(entries: AuditedPersona[]): PersonaSimilarityPair[
 
 function mixedActivityDimension(left: BotPersona, right: BotPersona): SimilarityDimension {
   const tokenScore = jaccard(tokens([...left.behavior.activity.preferredEventTypes, ...left.behavior.activity.ignoredEventTypes, left.behavior.activity.chatFrequency]), tokens([...right.behavior.activity.preferredEventTypes, ...right.behavior.activity.ignoredEventTypes, right.behavior.activity.chatFrequency]));
-  const delayScore = (lengthSimilarity(left.behavior.activity.averageDelayMs.min, right.behavior.activity.averageDelayMs.min, 30_000)
-    + lengthSimilarity(left.behavior.minimumIntervalMs, right.behavior.minimumIntervalMs, 300_000)) / 2;
-  return { name: 'activity', label: 'похожий ритм и задержка', weight: 0.08, score: tokenScore * 0.65 + delayScore * 0.35 };
+  const intervalScore = lengthSimilarity(left.behavior.minimumIntervalMs, right.behavior.minimumIntervalMs, 300_000);
+  return { name: 'activity', label: 'похожий ритм активности', weight: 0.08, score: tokenScore * 0.75 + intervalScore * 0.25 };
 }
 
 function tokenDimension(name: string, label: string, weight: number, left: string[], right: string[], numericScore?: number): SimilarityDimension {

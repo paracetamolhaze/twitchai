@@ -5,7 +5,7 @@ import { BotAccountConfig } from '../config';
 import { Logger } from '../logger';
 import { PersonaAssignmentProblem, PersonaStore } from '../personas/persona-store';
 import { AppRepository, BotAccountRecord } from '../persistence/repository';
-import { ReactionBotCandidate } from '../reaction/types';
+import { ReactionBotCandidate, ReactionSendResult } from '../reaction/types';
 import { ChatMessage } from '../stream-brain/types';
 import { OfficialTwitchTokenValidator, TwitchTokenValidator } from './oauth-validator';
 import { TwitchAccessTokenProvider } from './oauth-service';
@@ -34,6 +34,7 @@ export type BotEnabledResult = 'updated' | 'bot_not_found' | PersonaAssignmentPr
 
 export class TwitchBotManager extends EventEmitter {
   private readonly bots = new Map<string, ManagedBot>();
+  private readonly persistenceTails = new WeakMap<ManagedBot, Promise<void>>();
   private readonly logger: Logger;
   private readonly validator: TwitchTokenValidator;
   private readerUsername?: string;
@@ -249,7 +250,7 @@ export class TwitchBotManager extends EventEmitter {
     if (this.channel && existing.config.enabled) await this.connectBot(existing);
   }
 
-  async send(username: string, message: string): Promise<boolean> {
+  async send(username: string, message: string): Promise<ReactionSendResult> {
     const bot = this.bots.get(username.toLowerCase());
     if (!bot?.client || bot.status.connectionState !== 'CONNECTED' || !bot.status.chatConnected) {
       this.logger.warn('Twitch send skipped because account is unavailable', {
@@ -259,7 +260,7 @@ export class TwitchBotManager extends EventEmitter {
         connectionState: bot?.status.connectionState ?? 'UNKNOWN',
         chatConnected: bot?.status.chatConnected ?? false,
       });
-      return false;
+      return { submitted: false, reason: 'account_unavailable' };
     }
     const now = Date.now();
     bot.sentAt = bot.sentAt.filter((at) => at > now - 30_000);
@@ -267,7 +268,7 @@ export class TwitchBotManager extends EventEmitter {
       this.logger.warn('Bot message blocked by local Twitch rate limiter', {
         bot: username, channel: this.channel, reason: 'local_rate_limit',
       });
-      return false;
+      return { submitted: false, reason: 'local_rate_limit' };
     }
     try {
       this.logger.info('Twitch send attempt', {
@@ -276,20 +277,21 @@ export class TwitchBotManager extends EventEmitter {
         messageBytes: Buffer.byteLength(message, 'utf8'),
       });
       await bot.client.say(`#${this.channel}`, message);
-      bot.sentAt.push(Date.now());
-      await this.patch(bot, {
+      const submittedAt = Date.now();
+      bot.sentAt.push(submittedAt);
+      void this.patch(bot, {
         messagesSent: bot.status.messagesSent + 1,
         lastMessage: message,
-        lastReactionAt: Date.now(),
+        lastReactionAt: submittedAt,
         lastError: undefined,
       });
-      this.logger.info('Twitch send succeeded', { bot: username, channel: this.channel });
-      return true;
+      this.logger.info('Twitch message submitted', { bot: username, channel: this.channel });
+      return { submitted: true, submittedAt };
     } catch (cause) {
       const error = cause instanceof Error ? cause.message : String(cause);
-      await this.patch(bot, { lastError: error });
+      void this.patch(bot, { lastError: error });
       this.logger.warn('Twitch message send failed', { bot: username, channel: this.channel, error: error.slice(0, 240) });
-      return false;
+      return { submitted: false, reason: 'twitch_send_failed' };
     }
   }
 
@@ -410,7 +412,19 @@ export class TwitchBotManager extends EventEmitter {
     this.emit('status', this.listStatuses());
   }
 
-  private async persist(bot: ManagedBot): Promise<void> { await this.options.repository.upsertBot(bot.status); }
+  private async persist(bot: ManagedBot): Promise<void> {
+    const snapshot = structuredClone(bot.status);
+    const previous = this.persistenceTails.get(bot) ?? Promise.resolve();
+    const write = previous
+      .catch(() => undefined)
+      .then(() => this.options.repository.upsertBot(snapshot));
+    this.persistenceTails.set(bot, write);
+    try {
+      await write;
+    } finally {
+      if (this.persistenceTails.get(bot) === write) this.persistenceTails.delete(bot);
+    }
+  }
 }
 
 function assignmentProblemMessage(problem: PersonaAssignmentProblem): string {

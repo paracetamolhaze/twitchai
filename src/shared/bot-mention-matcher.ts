@@ -58,7 +58,7 @@ export function detectSpokenReactionSignal(
       candidate: {
         timestamp: Date.now(),
         type: 'conversation',
-        summary: `Streamer directly addressed ${mentions.map((username) => `@${username}`).join(', ')}`,
+        summary: `Стример напрямую обратился к ${mentions.map((username) => `@${username}`).join(', ')}`,
         speech,
         importance: 0.9,
         confidence: 0.95,
@@ -72,7 +72,7 @@ export function detectSpokenReactionSignal(
     candidate: {
       timestamp: Date.now(),
       type: 'conversation',
-      summary: 'Streamer clearly greeted the chat at the beginning of the stream',
+      summary: 'Стример явно поприветствовал чат в начале трансляции',
       speech,
       importance: 0.8,
       confidence: 0.9,

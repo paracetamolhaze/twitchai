@@ -96,6 +96,12 @@ export interface ReactionDecisionRecord {
   silentCandidateCount: number;
 }
 
+export type ReactionSendFailureReason = 'account_unavailable' | 'local_rate_limit' | 'twitch_send_failed';
+
+export type ReactionSendResult =
+  | { submitted: true; submittedAt: number }
+  | { submitted: false; reason: ReactionSendFailureReason };
+
 export type DirectTargetUnavailableReason = 'unknown_bot' | 'disabled' | 'not_connected' | 'chat_disconnected';
 
 export type ReactionTraceStage =
@@ -110,7 +116,31 @@ export type ReactionTraceStage =
 
 export type ReactionTraceOutcome = 'PENDING' | 'SILENT' | 'SCHEDULED' | 'SENT' | 'PARTIAL' | 'FAILED' | 'STALE';
 
-/** Metadata-only, end-to-end explanation of why a detected event did or did not reach Twitch chat. */
+export interface ReactionTraceTiming {
+  /** When the backend received Gemini's normalized event. */
+  detectedAt: number;
+  /** When candidate context was ready and returned to Gemini. */
+  contextReadyAt?: number;
+  /** When Gemini returned the final batch. */
+  decisionAt?: number;
+  /** When the last accepted reaction reached a terminal IRC send state. */
+  completedAt?: number;
+}
+
+export interface ReactionTraceReaction {
+  username: string;
+  message: string;
+  artificialDelayMs: number;
+  status: 'ACCEPTED' | 'SCHEDULED' | 'SENT' | 'FAILED';
+  selectedAt: number;
+  scheduledAt?: number;
+  /** When the IRC client submitted the message; Twitch does not expose display acknowledgement here. */
+  sentAt?: number;
+  failedAt?: number;
+  failureReason?: string;
+}
+
+/** End-to-end explanation of why a detected event did or did not reach Twitch chat. */
 export interface ReactionTraceRecord {
   eventId: string;
   timestamp: number;
@@ -125,10 +155,14 @@ export interface ReactionTraceRecord {
   directMentions: string[];
   directTargetUnavailable: Array<{ username: string; reason: DirectTargetUnavailableReason }>;
   geminiSelected: string[];
+  /** Compatibility projection derived from reactions. */
   policyAccepted: string[];
   policyRejected: ReactionRejection[];
+  /** Compatibility projections derived from reactions. */
   scheduled: string[];
   sent: string[];
   sendFailed: Array<{ username: string; reason: string }>;
+  timing: ReactionTraceTiming;
+  reactions: ReactionTraceReaction[];
   terminalReason?: string;
 }

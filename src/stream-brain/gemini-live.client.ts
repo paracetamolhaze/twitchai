@@ -580,6 +580,7 @@ export class GeminiLiveClient implements StreamBrainClient {
 
 export const STREAM_BRAIN_INSTRUCTION = `You are the single multimodal Stream Brain and the only AI decision-maker for a Twitch channel.
 Continuously understand combined audio, sampled video, channel/category metadata, STREAM_CONTEXT, recent Twitch chat, and previous events.
+Write summary, visualContext, gameContext, emotion, and durable memory summaries in concise natural Russian. Keep reliably heard speech verbatim instead of translating it.
 
 For each meaningful moment:
 1. Decide whether the moment deserves any reaction. Ordinary speech, silence, static frames, and weak repetition should usually produce no tool call.
@@ -622,11 +623,11 @@ const EVENT_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['type', 'summary', 'importance', 'confidence'],
   properties: {
     type: { type: 'string', enum: ['speech', 'gameplay', 'reaction', 'funny', 'fail', 'win', 'loss', 'surprise', 'conversation', 'irl', 'other'] },
-    summary: { type: 'string', description: 'Concise description of what just happened.' },
+    summary: { type: 'string', description: 'Краткое естественное описание произошедшего на русском языке.' },
     speech: { type: 'string', description: 'Relevant spoken words, when reliably heard.' },
-    visualContext: { type: 'string', description: 'Relevant visual evidence.' },
-    gameContext: { type: 'string', description: 'Game-specific interpretation when known.' },
-    emotion: { type: 'string' },
+    visualContext: { type: 'string', description: 'Важный визуальный контекст на русском языке.' },
+    gameContext: { type: 'string', description: 'Игровой контекст на русском языке, если он понятен.' },
+    emotion: { type: 'string', description: 'Эмоция на русском языке.' },
     importance: { type: 'number', minimum: 0, maximum: 1 },
     confidence: { type: 'number', minimum: 0, maximum: 1 },
     timestamp: { type: 'number', description: 'Original backend signal timestamp when one was supplied.' },
@@ -673,7 +674,7 @@ const RECORD_STREAM_MEMORIES_DECLARATION = {
           type: 'object', additionalProperties: false, required: ['type', 'summary', 'importance', 'confidence'],
           properties: {
             type: { type: 'string', enum: STREAMER_MEMORY_TYPES },
-            summary: { type: 'string', description: 'Concise durable memory summary; backend limit is 600 characters.' },
+            summary: { type: 'string', description: 'Краткое долговременное воспоминание на русском языке; лимит backend — 600 символов.' },
             details: { type: 'object', additionalProperties: true },
             entities: { type: 'array', maxItems: 16, items: { type: 'string' } },
             tags: { type: 'array', maxItems: 16, items: { type: 'string' } },

@@ -48,7 +48,7 @@ export interface PersonaReactionContext {
   behavior: {
     styleInstructions: string;
     verbosity: { minWords: number; maxWords: number };
-    activity: BotPersona['behavior']['activity'];
+    activity: Omit<BotPersona['behavior']['activity'], 'averageDelayMs'>;
     reactionProbability: number;
     uppercaseProbability: number;
     questionProbability: number;
@@ -204,7 +204,9 @@ export class PersonaContextBuilder {
         styleInstructions: safeText(input.persona.behavior.styleInstructions),
         verbosity: input.persona.behavior.verbosity,
         activity: {
-          ...input.persona.behavior.activity,
+          chatFrequency: input.persona.behavior.activity.chatFrequency,
+          directReplyLikelihood: input.persona.behavior.activity.directReplyLikelihood,
+          eventSelectivity: input.persona.behavior.activity.eventSelectivity,
           preferredEventTypes: input.persona.behavior.activity.preferredEventTypes.slice(0, 8),
           ignoredEventTypes: input.persona.behavior.activity.ignoredEventTypes.slice(0, 8),
         },

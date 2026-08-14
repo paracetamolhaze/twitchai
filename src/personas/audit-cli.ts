@@ -36,7 +36,6 @@ const report = {
     eventSelectivity: persona.behavior.activity.eventSelectivity,
     directReplyLikelihood: persona.behavior.activity.directReplyLikelihood,
     sarcasmLevel: persona.behavior.sarcasmLevel,
-    delayMs: persona.behavior.activity.averageDelayMs,
     chatFrequency: persona.behavior.activity.chatFrequency,
   })),
   examples: personas.filter((persona) => exampleUsernames.has(persona.generatedFromUsername ?? '')),

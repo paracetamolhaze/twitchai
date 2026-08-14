@@ -36,13 +36,15 @@ function bot(username: string, index: number): ReactionBotCandidate {
   };
 }
 
-async function setup(senderResult = true) {
+type SenderResult = boolean | ((username: string, message: string) => boolean | Promise<boolean>);
+
+async function setup(senderResult: SenderResult = true, now: () => number = () => event.timestamp) {
   const repository = new MemoryRepository();
   await repository.initialize();
   const history = new BotHistory(repository);
-  const personaMemory = new PersonaMemory(repository, { now: () => event.timestamp });
-  const personaRuntime = new PersonaRuntimeStore(() => event.timestamp);
-  const contextStore = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 100, maxEvents: 100, now: () => event.timestamp });
+  const personaMemory = new PersonaMemory(repository, { now });
+  const personaRuntime = new PersonaRuntimeStore(now);
+  const contextStore = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 100, maxEvents: 100, now });
   contextStore.configure({ channel: 'streamer', category: 'Dota 2', streamContext: 'рейтинг с друзьями' });
   contextStore.addChat({
     id: 'chat-1', timestamp: event.timestamp, username: 'viewer', displayName: 'Viewer',
@@ -51,19 +53,24 @@ async function setup(senderResult = true) {
   let candidates = [bot('bot-one', 0), bot('bot-two', 1), bot('bot-three', 2)];
   const sent: Array<{ username: string; message: string }> = [];
   const usage = new UsageTracker();
-  const globalMemory = new GlobalStreamerMemory({ repository, usage, now: () => event.timestamp });
+  const globalMemory = new GlobalStreamerMemory({ repository, usage, now });
   await globalMemory.startOrResumeSession({ channel: 'streamer', initialCategory: 'Dota 2' });
   const policy = new ReactionPolicyGuard({
-    minimumDelayMs: 100,
-    maximumDelayMs: 300,
     globalMessagesPer30Seconds: 2,
     maxReactionsPerEvent: 3,
-    now: () => event.timestamp,
-    random: () => 0,
+    now,
   });
   const coordinator = new ReactionCoordinator({
     policy,
-    sender: { send: async (username, message) => { sent.push({ username, message }); return senderResult; } },
+    sender: {
+      send: async (username, message) => {
+        sent.push({ username, message });
+        const accepted = await (typeof senderResult === 'function' ? senderResult(username, message) : senderResult);
+        return accepted
+          ? { submitted: true, submittedAt: now() }
+          : { submitted: false, reason: 'twitch_send_failed' };
+      },
+    },
     history,
     memory: new ReactionMemory({ enabled: true, reactionWindowMs: 1_000, repository }),
     globalMemory,
@@ -76,7 +83,7 @@ async function setup(senderResult = true) {
     retrievalLimit: 4,
     candidates: () => candidates,
     contextTtlMs: 60_000,
-    now: () => event.timestamp,
+    now,
   });
   return { coordinator, globalMemory, history, policy, sent, usage, setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; } };
 }
@@ -100,6 +107,7 @@ describe('single-session reaction protocol', () => {
     ]);
     expect(prepared.candidates).not.toEqual([]);
     expect(prepared.candidates.every((candidate) => !('globalStreamerMemories' in candidate))).toBe(true);
+    expect(prepared.candidates.every((candidate) => !('averageDelayMs' in candidate.behavior.activity))).toBe(true);
     expect(prepared.constraints.instructions.join('\n')).toContain('descriptive style evidence, never response templates');
     expect(prepared.constraints.instructions.join('\n')).toContain('not a caption to paraphrase');
     await coordinator.stop();
@@ -299,10 +307,13 @@ describe('single-session reaction protocol', () => {
 
   it('schedules exactly the usernames and final messages selected by Gemini', async () => {
     vi.useFakeTimers();
-    const { coordinator, sent } = await setup();
+    let currentTime = event.timestamp;
+    const { coordinator, sent } = await setup(true, () => currentTime);
     const traces: ReactionTraceRecord[] = [];
     coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
-    await coordinator.prepare(event);
+    const detectedAt = event.timestamp - 300;
+    await coordinator.prepare(event, detectedAt);
+    currentTime += 2_500;
     const result = await coordinator.submitBatch({
       eventId: event.id,
       reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
@@ -310,8 +321,9 @@ describe('single-session reaction protocol', () => {
 
     expect(result.accepted).toHaveLength(1);
     expect(result.accepted[0]).toMatchObject({ username: 'bot-three' });
-    expect(result.accepted[0]?.delayMs).toBeGreaterThan(0);
+    expect(result.accepted[0]?.delayMs).toBe(0);
     expect(sent).toEqual([]);
+    currentTime += 20;
     await vi.runAllTimersAsync();
     expect(sent).toEqual([{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }]);
     expect(traces.at(-1)).toMatchObject({
@@ -324,7 +336,27 @@ describe('single-session reaction protocol', () => {
       scheduled: ['bot-three'],
       sent: ['bot-three'],
       outcome: 'SENT',
+      timing: {
+        detectedAt,
+        contextReadyAt: event.timestamp,
+        decisionAt: event.timestamp + 2_500,
+        completedAt: event.timestamp + 2_520,
+      },
+      reactions: [{
+        username: 'bot-three',
+        message: 'это был ульт в параллельную вселенную',
+        artificialDelayMs: 0,
+        status: 'SENT',
+        selectedAt: event.timestamp + 2_500,
+        scheduledAt: event.timestamp + 2_500,
+        sentAt: event.timestamp + 2_520,
+      }],
     });
+
+    const completedTrace = traces.at(-1);
+    const replay = await coordinator.submitBatch({ eventId: event.id, reactions: [] });
+    expect(replay).toMatchObject({ eventId: event.id, accepted: [], stale: true });
+    expect(traces.at(-1)).toEqual(completedTrace);
     await coordinator.stop();
   });
 
@@ -359,9 +391,77 @@ describe('single-session reaction protocol', () => {
       outcome: 'FAILED',
       scheduled: ['bot-one'],
       sent: [],
-      sendFailed: [{ username: 'bot-one', reason: 'twitch_sender_returned_false' }],
+      sendFailed: [{ username: 'bot-one', reason: 'twitch_send_failed' }],
     });
     await coordinator.stop();
+  });
+
+  it('records Twitch submission before persistence and never rewrites it as failed', async () => {
+    vi.useFakeTimers();
+    let currentTime = event.timestamp;
+    const { coordinator, history } = await setup(true, () => currentTime);
+    const traces: ReactionTraceRecord[] = [];
+    coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
+    const submittedEvent = { ...event, id: 'send-before-persistence' };
+    await coordinator.prepare(submittedEvent);
+    currentTime += 1_000;
+    vi.spyOn(history, 'add').mockImplementationOnce(async () => {
+      currentTime += 5_000;
+      throw new Error('database unavailable after Twitch submission');
+    });
+    await coordinator.submitBatch({
+      eventId: submittedEvent.id,
+      reactions: [{ username: 'bot-one', message: 'сообщение уже принял Twitch' }],
+    });
+    currentTime += 25;
+
+    await vi.runAllTimersAsync();
+
+    expect(traces.at(-1)).toMatchObject({
+      eventId: submittedEvent.id,
+      stage: 'SEND_SUCCEEDED',
+      outcome: 'SENT',
+      timing: { completedAt: event.timestamp + 1_025 },
+      reactions: [{
+        username: 'bot-one',
+        status: 'SENT',
+        sentAt: event.timestamp + 1_025,
+      }],
+    });
+    await coordinator.stop();
+  });
+
+  it('keeps partial-send terminal metadata stable regardless of completion order', async () => {
+    vi.useFakeTimers();
+
+    const run = async (usernames: string[], eventId: string): Promise<ReactionTraceRecord> => {
+      let currentTime = event.timestamp;
+      const { coordinator } = await setup((username) => username !== 'bot-one', () => currentTime);
+      const traces: ReactionTraceRecord[] = [];
+      coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
+      const mixedEvent = { ...event, id: eventId };
+      await coordinator.prepare(mixedEvent);
+      await coordinator.submitBatch({
+        eventId,
+        reactions: usernames.map((username) => ({ username, message: `сообщение от ${username}` })),
+      });
+      currentTime += 15;
+      await vi.runAllTimersAsync();
+      const completed = traces.at(-1)!;
+      await coordinator.stop();
+      return completed;
+    };
+
+    const failureThenSuccess = await run(['bot-one', 'bot-three'], 'mixed-failure-first');
+    const successThenFailure = await run(['bot-three', 'bot-one'], 'mixed-success-first');
+
+    for (const trace of [failureThenSuccess, successThenFailure]) {
+      expect(trace).toMatchObject({ outcome: 'PARTIAL', terminalReason: 'some_reactions_failed' });
+      expect(trace.reactions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ username: 'bot-one', status: 'FAILED' }),
+        expect.objectContaining({ username: 'bot-three', status: 'SENT' }),
+      ]));
+    }
   });
 
   it('rejects duplicate usernames and disconnected accounts without cancelling valid items', async () => {

@@ -28,7 +28,7 @@ PostgreSQL ─ events / ReactionMemory ─────────────�
                                       │
                          backend PolicyGuard + Scheduler
                                       │
-                       natural delays → official Twitch chat
+                    immediate send → official Twitch chat
 
 Railway backend ← authenticated HTTPS + Socket.IO → Vercel dashboard
        │                 │
@@ -37,7 +37,7 @@ Railway backend ← authenticated HTTPS + Socket.IO → Vercel dashboard
                      PostgreSQL
 ```
 
-В production нет отдельных вызовов AI для каждого бота, `generateContent`, Flash Lite, Markov-генератора или правила «всегда ответить». Пустой `reactions: []` — нормальное решение промолчать. Backend не принимает творческих решений: он только проверяет аккаунт, соединение, cooldown, дубликаты, длину и лимиты, затем разносит готовые сообщения по естественным задержкам.
+В production нет отдельных вызовов AI для каждого бота, `generateContent`, Flash Lite, Markov-генератора или правила «всегда ответить». Пустой `reactions: []` — нормальное решение промолчать. Backend не принимает творческих решений: он только проверяет аккаунт, соединение, cooldown, дубликаты, длину и лимиты, затем сразу отправляет принятые сообщения без искусственной паузы.
 
 ## Global Streamer Memory
 
@@ -89,7 +89,7 @@ Backend: `http://localhost:3000`, dashboard: `http://localhost:5173`. Без `DA
 - Twitch: необязательный стартовый `TWITCH_CHANNEL`, Client ID/Secret, OAuth callback, ключ шифрования и legacy `BOTn_*`;
 - Gemini: `GEMINI_API_KEY`, централизованный `GEMINI_LIVE_MODEL`;
 - медиа: `STREAM_CONTEXT`, `VISION_FPS`, `VISION_FRAME_WIDTH`;
-- hard policy: задержки, общий rate limit и `MAX_REACTIONS_PER_EVENT`;
+- hard policy: общий rate limit и `MAX_REACTIONS_PER_EVENT`;
 - обучение: окно сбора и количество retrieval-примеров;
 - Global Streamer Memory: лимиты snapshot/retrieval и stale-session heartbeat;
 - необязательный debug/fallback Whisper через Groq;

@@ -39,8 +39,6 @@ export interface AppConfig {
     contextRefreshMs: number;
   };
   reaction: {
-    minimumDelayMs: number;
-    maximumDelayMs: number;
     globalMessagesPer30Seconds: number;
     maxReactionsPerEvent: number;
   };
@@ -86,8 +84,6 @@ const envSchema = z.object({
   VISION_FRAME_WIDTH: z.coerce.number().int().min(320).max(1280).default(640),
   EVENT_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.4),
   STREAM_CONTEXT_REFRESH_SECONDS: z.coerce.number().min(10).max(300).default(30),
-  REACTION_MIN_DELAY_MS: z.coerce.number().int().min(0).max(60_000).default(1200),
-  REACTION_MAX_DELAY_MS: z.coerce.number().int().min(100).max(120_000).default(9000),
   CHAT_MESSAGES_PER_30_SECONDS: z.coerce.number().int().min(1).max(20).default(18),
   MAX_REACTIONS_PER_EVENT: z.coerce.number().int().min(1).max(10).default(3),
   LEARN_ENABLED: z.string().default('true'),
@@ -138,8 +134,6 @@ function readBotAccounts(env: NodeJS.ProcessEnv): BotAccountConfig[] {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = envSchema.parse(env);
-  const minimumDelayMs = parsed.REACTION_MIN_DELAY_MS;
-  const maximumDelayMs = Math.max(minimumDelayMs, parsed.REACTION_MAX_DELAY_MS);
 
   return {
     app: {
@@ -171,8 +165,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       contextRefreshMs: parsed.STREAM_CONTEXT_REFRESH_SECONDS * 1000,
     },
     reaction: {
-      minimumDelayMs,
-      maximumDelayMs,
       globalMessagesPer30Seconds: parsed.CHAT_MESSAGES_PER_30_SECONDS,
       maxReactionsPerEvent: parsed.MAX_REACTIONS_PER_EVENT,
     },

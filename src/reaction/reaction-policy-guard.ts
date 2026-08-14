@@ -9,12 +9,9 @@ import {
 } from './types';
 
 export interface ReactionPolicyOptions {
-  minimumDelayMs: number;
-  maximumDelayMs: number;
   globalMessagesPer30Seconds: number;
   maxReactionsPerEvent: number;
   maxMessageBytes?: number;
-  random?: () => number;
   now?: () => number;
 }
 
@@ -32,13 +29,11 @@ export interface PolicyBatchResult {
 }
 
 export class ReactionPolicyGuard {
-  private readonly random: () => number;
   private readonly now: () => number;
   private readonly recentGlobalSends: number[] = [];
   private readonly reservations = new Map<string, { username: string; scheduledAt: number }>();
 
   constructor(private readonly options: ReactionPolicyOptions) {
-    this.random = options.random ?? Math.random;
     this.now = options.now ?? Date.now;
   }
 
@@ -109,8 +104,8 @@ export class ReactionPolicyGuard {
       if (await input.isDuplicate(username, message)) { reject('recent_duplicate'); continue; }
 
       const reservationId = randomUUID();
-      const delayMs = this.delayFor(candidate, accepted.length, Math.min(input.reactions.length, this.options.maxReactionsPerEvent));
-      this.reservations.set(reservationId, { username, scheduledAt: now + delayMs });
+      const delayMs = 0;
+      this.reservations.set(reservationId, { username, scheduledAt: now });
       accepted.push({
         reservationId,
         event: input.event,
@@ -133,16 +128,6 @@ export class ReactionPolicyGuard {
 
   private availableCapacity(): number {
     return Math.max(0, this.options.globalMessagesPer30Seconds - this.recentGlobalSends.length - this.reservations.size);
-  }
-
-  private delayFor(candidate: ReactionBotCandidate, index: number, count: number): number {
-    const configuredMinimum = Math.max(0, this.options.minimumDelayMs);
-    const configuredMaximum = Math.max(configuredMinimum, this.options.maximumDelayMs);
-    const personaDelay = candidate.persona.behavior.activity.averageDelayMs;
-    const minimum = Math.max(configuredMinimum, personaDelay.min);
-    const maximum = Math.max(minimum, Math.min(configuredMaximum, personaDelay.max));
-    const span = maximum - minimum;
-    return Math.round(minimum + ((index + this.random()) / Math.max(1, count)) * span);
   }
 
   private prune(now: number): void {

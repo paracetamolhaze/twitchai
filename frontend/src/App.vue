@@ -284,8 +284,26 @@ interface ReactionTrace {
   scheduled: string[]
   sent: string[]
   sendFailed: Array<{ username: string; reason: string }>
+  timing?: {
+    detectedAt: number
+    contextReadyAt?: number
+    decisionAt?: number
+    completedAt?: number
+  }
+  reactions?: Array<{
+    username: string
+    message: string
+    artificialDelayMs: number
+    status: 'ACCEPTED' | 'SCHEDULED' | 'SENT' | 'FAILED'
+    selectedAt: number
+    scheduledAt?: number
+    sentAt?: number
+    failedAt?: number
+    failureReason?: string
+  }>
   terminalReason?: string
 }
+type ReactionTraceMessage = NonNullable<ReactionTrace['reactions']>[number]
 
 const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3000').replace(/\/$/, '')
 const PERSONA_SIMILARITY_WARNING_THRESHOLD = 0.65
@@ -422,13 +440,21 @@ const healthItems = computed(() => [
     label: 'Медиапоток',
     tone: overview.streamBrain.mediaConnected ? 'ok' : overview.streamBrain.mediaState === 'ERROR' ? 'error' : overview.streamBrain.mediaState === 'CONNECTING' ? 'pending' : 'idle',
     status: overview.streamBrain.mediaConnected ? 'Идёт стрим' : overview.streamBrain.mediaState === 'ERROR' ? 'Требует внимания' : overview.streamBrain.mediaState === 'CONNECTING' ? 'Поиск медиапотока…' : 'Стрим офлайн — норма',
-    detail: overview.streamBrain.mediaConnected ? 'Аудио и выбранные видеокадры' : stateLabel(overview.streamBrain.mediaState),
+    detail: overview.streamBrain.mediaConnected
+      ? 'Аудио и выбранные видеокадры'
+      : overview.streamBrain.mediaState === 'ERROR' && overview.streamBrain.lastError
+        ? mediaErrorLabel(overview.streamBrain.lastError)
+        : stateLabel(overview.streamBrain.mediaState),
   },
   {
     label: 'Gemini Live',
     tone: overview.streamBrain.geminiStable ? 'ok' : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) ? 'error' : overview.streamBrain.geminiSessionActive ? 'pending' : 'idle',
     status: overview.streamBrain.geminiStable ? 'Стабильно' : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) ? 'Требует внимания' : overview.streamBrain.geminiSessionActive ? 'Подключение…' : 'Физически остановлена',
-    detail: overview.streamBrain.geminiStable ? 'Единая Live-сессия стабильна' : overview.streamBrain.lastError || sessionReasonLabel(overview.streamBrain.geminiSessionReason),
+    detail: overview.streamBrain.geminiStable
+      ? 'Единая Live-сессия стабильна'
+      : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) && overview.streamBrain.lastError
+        ? operatorErrorLabel(overview.streamBrain.lastError)
+        : sessionReasonLabel(overview.streamBrain.geminiSessionReason),
   },
 ])
 const refreshableUsernames = computed(() => new Set(
@@ -907,7 +933,7 @@ function personaFullPreview(persona: Persona): string {
     `Характер: ${persona.character.summary}\nЧерты: ${list(persona.character.traits)}\nСильные стороны: ${list(persona.character.strengths)}\nНедостатки: ${list(persona.character.flaws)}\nЮмор: ${persona.character.humor}\nВ конфликте: ${persona.character.conflictStyle}`,
     `Интересы — игры: ${list(persona.interests.games)}; музыка: ${list(persona.interests.music)}; еда: ${list(persona.interests.food)}; другое: ${list(persona.interests.other)}`,
     `Речь — в среднем ${persona.speech.averageMessageWords} слов; начала: ${list(persona.speech.openingPatterns)}; окончания: ${list(persona.speech.endingPatterns)}; любимые выражения: ${list(persona.speech.favoriteExpressions)}; смех: ${list(persona.speech.laughStyles)}; пунктуация: ${persona.speech.punctuationStyle}; регистр: ${persona.speech.capitalizationStyle}; примеры: ${list(persona.speech.messageExamples)}`,
-    `Поведение — вероятность реакции ${persona.behavior.reactionProbability}; избирательность ${persona.behavior.activity.eventSelectivity}; прямой ответ ${persona.behavior.activity.directReplyLikelihood}; частота ${activityFrequencyLabel(persona.behavior.activity.chatFrequency)}; задержка ${persona.behavior.activity.averageDelayMs.min}–${persona.behavior.activity.averageDelayMs.max} мс; предпочитает: ${list(persona.behavior.activity.preferredEventTypes)}; игнорирует: ${list(persona.behavior.activity.ignoredEventTypes)}; инструкции: ${persona.behavior.styleInstructions}`,
+    `Поведение — вероятность реакции ${persona.behavior.reactionProbability}; избирательность ${persona.behavior.activity.eventSelectivity}; прямой ответ ${persona.behavior.activity.directReplyLikelihood}; частота ${activityFrequencyLabel(persona.behavior.activity.chatFrequency)}; предпочитает: ${list(persona.behavior.activity.preferredEventTypes)}; игнорирует: ${list(persona.behavior.activity.ignoredEventTypes)}; инструкции: ${persona.behavior.styleInstructions}`,
     `Границы личного — общая: ${disclosureLevelLabel(persona.disclosure.defaultLevel)}; семья: ${disclosureLevelLabel(persona.disclosure.topics.family)}; работа: ${disclosureLevelLabel(persona.disclosure.topics.work)}; отношения: ${disclosureLevelLabel(persona.disclosure.topics.relationships)}; деньги: ${disclosureLevelLabel(persona.disclosure.topics.money)}; местоположение: ${disclosureLevelLabel(persona.disclosure.topics.location)}`,
     `Twitch — впервые: ${persona.streamerRelationship.firstSeen || 'не указано'}; знакомство ${persona.streamerRelationship.familiarity}; поддержка ${persona.streamerRelationship.supportiveness}; поддразнивание ${persona.streamerRelationship.teasingLevel}; любимые эфиры: ${list(persona.streamerRelationship.favoriteStreamTypes)}; повторяющиеся отсылки: ${list(persona.streamerRelationship.recurringReferences)}`,
     `Точная техническая копия всех полей канона:\n${JSON.stringify(persona, null, 2)}`,
@@ -1026,18 +1052,129 @@ function sessionReasonLabel(reason: BrainStatus['geminiSessionReason']): string 
     fatal_error: 'Переподключения остановлены', application_stopped: 'Приложение остановлено', disabled: 'Gemini выключена',
   })[reason]
 }
+function operatorErrorLabel(message?: string): string {
+  if (!message) return 'Техническая причина не указана.'
+  const normalized = message.toLowerCase()
+  if (/no playable streams found|stream.*offline|not live/u.test(normalized)) return 'Трансляция сейчас офлайн.'
+  if (/api.?key|invalid key|authentication|unauthorized|\b401\b/u.test(normalized)) return 'Gemini отклонила ключ доступа. Проверьте ключ на Railway.'
+  if (/permission denied|forbidden|\b403\b/u.test(normalized)) return 'У ключа Gemini недостаточно прав для этой модели.'
+  if (/quota|resource exhausted|rate.?limit|\b429\b/u.test(normalized)) return 'Достигнут лимит Gemini. Подключение возобновится после восстановления лимита.'
+  if (/\b1007\b|invalid argument|malformed|protocol/u.test(normalized)) return 'Gemini отклонила формат данных или настройки сессии.'
+  if (/timed? ?out|timeout/u.test(normalized)) return 'Gemini не ответила вовремя. Система попробует переподключиться.'
+  if (/network|websocket|socket|econn|fetch failed|dns|connection/u.test(normalized)) return 'Соединение с Gemini прервалось. Система попробует переподключиться.'
+  return 'Произошла техническая ошибка Gemini. Подробность доступна ниже.'
+}
+function mediaErrorLabel(message?: string): string {
+  if (!message) return 'Не удалось получить медиапоток.'
+  const normalized = message.toLowerCase()
+  if (/no playable streams found|stream.*offline|not live/u.test(normalized)) return 'Трансляция сейчас офлайн.'
+  if (/ffmpeg|decoder|codec|invalid data/u.test(normalized)) return 'Не удалось декодировать аудио или видео трансляции.'
+  if (/streamlink/u.test(normalized)) return 'Streamlink не смог открыть медиапоток Twitch.'
+  if (/timed? ?out|timeout|network|econn|fetch failed|dns|connection/u.test(normalized)) return 'Соединение с медиапотоком Twitch прервалось.'
+  return 'Произошла техническая ошибка медиапотока.'
+}
+function closeReasonLabel(code?: number, reason?: string): string {
+  const labels: Record<number, string> = {
+    1000: 'Соединение штатно закрыто.',
+    1001: 'Сервер завершил соединение или перезапускается.',
+    1006: 'Соединение неожиданно оборвалось.',
+    1007: 'Gemini отклонила формат переданных данных.',
+    1008: 'Gemini отклонила запрос по правилам сервиса.',
+    1011: 'На стороне Gemini произошла внутренняя ошибка.',
+    1012: 'Сервис Gemini перезапускается.',
+    1013: 'Сервис Gemini временно перегружен.',
+  }
+  return code !== undefined && labels[code] ? labels[code] : reason ? operatorErrorLabel(reason) : 'Причина отсутствует.'
+}
 function reactionTraceStageLabel(stage: ReactionTrace['stage']): string {
   return ({
     EVENT_DETECTED: 'событие найдено', CANDIDATES_PREPARED: 'кандидаты подготовлены',
-    GEMINI_SELECTED: 'Gemini выбрала', POLICY_VALIDATED: 'политика проверила', SCHEDULED: 'запланировано',
+    GEMINI_SELECTED: 'Gemini выбрала', POLICY_VALIDATED: 'защита проверила', SCHEDULED: 'передано на отправку',
     SEND_SUCCEEDED: 'отправлено', SEND_FAILED: 'ошибка отправки', STOPPED: 'цепочка остановлена',
   })[stage]
 }
 function reactionTraceOutcomeLabel(outcome: ReactionTrace['outcome']): string {
   return ({
-    PENDING: 'в процессе', SILENT: 'осознанная тишина', SCHEDULED: 'ожидает отправки',
-    SENT: 'доставлено в Twitch', PARTIAL: 'частично отправлено', FAILED: 'не отправлено', STALE: 'контекст устарел',
+    PENDING: 'в процессе', SILENT: 'осознанная тишина', SCHEDULED: 'отправляется сейчас',
+    SENT: 'отправлено в Twitch', PARTIAL: 'частично отправлено', FAILED: 'не отправлено', STALE: 'контекст устарел',
   })[outcome]
+}
+function reactionTraceMessageStatusLabel(status: ReactionTraceMessage['status']): string {
+  return ({
+    ACCEPTED: 'принято защитой', SCHEDULED: 'ожидает отправки', SENT: 'отправлено', FAILED: 'не отправлено',
+  })[status]
+}
+function formatMilliseconds(value?: number): string {
+  if (value === undefined || !Number.isFinite(value)) return '—'
+  const milliseconds = Math.max(0, value)
+  return milliseconds < 1000
+    ? `${Math.round(milliseconds)} мс`
+    : `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)} с`
+}
+function elapsed(start?: number, end?: number): string {
+  return start === undefined || end === undefined ? '—' : formatMilliseconds(end - start)
+}
+function traceDetectedAt(trace: ReactionTrace): number {
+  return trace.timing?.detectedAt ?? trace.timestamp
+}
+function traceContextDuration(trace: ReactionTrace): string {
+  return elapsed(traceDetectedAt(trace), trace.timing?.contextReadyAt)
+}
+function traceGeminiDuration(trace: ReactionTrace): string {
+  return elapsed(trace.timing?.contextReadyAt ?? traceDetectedAt(trace), trace.timing?.decisionAt)
+}
+function traceReactionEnd(reaction: ReactionTraceMessage): number | undefined {
+  return reaction.sentAt ?? reaction.failedAt
+}
+function traceDeliveryDuration(reaction: ReactionTraceMessage): string {
+  return elapsed(reaction.selectedAt, traceReactionEnd(reaction))
+}
+function traceTotalDuration(trace: ReactionTrace, reaction: ReactionTraceMessage): string {
+  return elapsed(traceDetectedAt(trace), traceReactionEnd(reaction))
+}
+function reactionTraceReasonLabel(reason?: string): string {
+  if (!reason) return 'Решение ещё формируется.'
+  return ({
+    gemini_selected_silence: 'Gemini решила, что для этого момента естественнее промолчать.',
+    reaction_context_stale: 'Ответ Gemini пришёл после закрытия контекста события.',
+    reaction_context_expired_before_gemini_batch: 'Gemini не успела вернуть решение до истечения контекста.',
+    gemini_disconnected_before_reaction_batch: 'Gemini отключилась до того, как вернула решение.',
+    all_selected_reactions_rejected: 'Все выбранные сообщения остановила защитная проверка.',
+    coordinator_stopped: 'Сервис остановился до отправки сообщения.',
+    account_unavailable_at_send: 'Аккаунт потерял соединение перед отправкой.',
+    persona_reassigned: 'Личность аккаунта изменилась до отправки.',
+    recent_duplicate_at_send: 'Перед отправкой обнаружилось недавнее похожее сообщение.',
+    account_unavailable: 'Аккаунт недоступен для отправки.',
+    local_rate_limit: 'Сообщение остановил локальный лимит Twitch.',
+    twitch_send_failed: 'Не удалось передать сообщение в соединение Twitch.',
+    twitch_sender_returned_false: 'Сервис отправки вернул ошибку.',
+    some_reactions_failed: 'Часть выбранных сообщений отправилась, а часть остановилась с ошибкой.',
+  } as Record<string, string>)[reason] || 'Цепочка остановилась по неизвестной технической причине.'
+}
+function directTargetReasonLabel(reason: string): string {
+  return ({
+    unknown_bot: 'аккаунт не найден', disabled: 'аккаунт выключен',
+    not_connected: 'аккаунт не подключён', chat_disconnected: 'нет соединения с чатом',
+  } as Record<string, string>)[reason] || 'адресат недоступен'
+}
+function diagnosticOperationLabel(operation?: string): string {
+  if (!operation) return '—'
+  if (operation.startsWith('tool_response:')) {
+    return `ответ инструмента: ${diagnosticToolLabel(operation.slice('tool_response:'.length))}`
+  }
+  return ({
+    connect: 'подключение', audio: 'аудио', video: 'видеокадр',
+    reaction_signal: 'сигнал реакции', context_update: 'обновление контекста',
+    memory_snapshot: 'снимок памяти',
+  } as Record<string, string>)[operation] || 'неизвестная операция'
+}
+function diagnosticToolLabel(tool?: string): string {
+  if (!tool) return '—'
+  return ({
+    prepare_reaction_context: 'подготовка контекста реакции',
+    emit_reaction_batch: 'готовый пакет реакций',
+    record_stream_memories: 'запись памяти стрима',
+  } as Record<string, string>)[tool] || 'неизвестный инструмент'
 }
 function kindLabel(kind: ChatMessage['kind']): string {
   return ({ viewer: 'зритель', bot: 'бот', system: 'система' })[kind]
@@ -1271,26 +1408,72 @@ onBeforeUnmount(() => {
           </section>
           <section class="panel metric-strip"><div><span>Медиа</span><strong>→</strong></div><div><span>Gemini Live</span><strong>→</strong></div><div><span>Контекст персон</span><strong>→</strong></div><div><span>Единый пакет</span><strong>→</strong></div><div><span>Чат Twitch</span><strong>✓</strong></div></section>
           <section class="metric-strip">
-            <div><span>Текущий стрим</span><strong>{{ usage.currentStream.active ? `${usage.currentStream.durationMinutes.toFixed(1)} мин` : 'не активен' }}</strong></div><div><span>Захвачено аудио / видео</span><strong>{{ usage.currentStream.capturedAudioMinutes.toFixed(1) }} / {{ usage.currentStream.capturedVideoMinutes.toFixed(1) }} мин</strong></div><div><span>Отправлено Gemini аудио / видео</span><strong>{{ usage.currentStream.geminiAudioSentMinutes.toFixed(1) }} / {{ usage.currentStream.geminiVideoSentMinutes.toFixed(1) }} мин</strong></div><div><span>Токены текущего стрима</span><strong>{{ usage.currentStream.geminiInputTokens }} / {{ usage.currentStream.geminiOutputTokens }}</strong></div><div><span>Reconnect / сообщения</span><strong>{{ usage.currentStream.geminiReconnects }} / {{ usage.currentStream.sentResponses }}</strong></div>
+            <div><span>Текущий стрим</span><strong>{{ usage.currentStream.active ? `${usage.currentStream.durationMinutes.toFixed(1)} мин` : 'не активен' }}</strong></div><div><span>Захвачено аудио / видео</span><strong>{{ usage.currentStream.capturedAudioMinutes.toFixed(1) }} / {{ usage.currentStream.capturedVideoMinutes.toFixed(1) }} мин</strong></div><div><span>Отправлено Gemini аудио / видео</span><strong>{{ usage.currentStream.geminiAudioSentMinutes.toFixed(1) }} / {{ usage.currentStream.geminiVideoSentMinutes.toFixed(1) }} мин</strong></div><div><span>Токены текущего стрима</span><strong>{{ usage.currentStream.geminiInputTokens }} / {{ usage.currentStream.geminiOutputTokens }}</strong></div><div><span>Переподключения / сообщения</span><strong>{{ usage.currentStream.geminiReconnects }} / {{ usage.currentStream.sentResponses }}</strong></div>
           </section>
           <section class="panel metric-strip">
-            <div><span>Всего захвачено аудио / видео</span><strong>{{ usage.capturedAudioMinutes.toFixed(1) }} / {{ usage.capturedVideoMinutes.toFixed(1) }} мин</strong></div><div><span>Всего отправлено Gemini</span><strong>{{ usage.geminiAudioSentMinutes.toFixed(1) }} / {{ usage.geminiVideoSentMinutes.toFixed(1) }} мин</strong></div><div><span>Reconnect всего</span><strong>{{ usage.geminiReconnects }}</strong></div><div><span>Токены всего</span><strong>{{ usage.geminiInputTokens }} / {{ usage.geminiOutputTokens }}</strong></div><div><span>Создано / отправлено</span><strong>{{ usage.generatedResponses }} / {{ usage.sentResponses }}</strong></div>
+            <div><span>Всего захвачено аудио / видео</span><strong>{{ usage.capturedAudioMinutes.toFixed(1) }} / {{ usage.capturedVideoMinutes.toFixed(1) }} мин</strong></div><div><span>Всего отправлено Gemini</span><strong>{{ usage.geminiAudioSentMinutes.toFixed(1) }} / {{ usage.geminiVideoSentMinutes.toFixed(1) }} мин</strong></div><div><span>Всего переподключений</span><strong>{{ usage.geminiReconnects }}</strong></div><div><span>Токены всего</span><strong>{{ usage.geminiInputTokens }} / {{ usage.geminiOutputTokens }}</strong></div><div><span>Создано / отправлено</span><strong>{{ usage.generatedResponses }} / {{ usage.sentResponses }}</strong></div>
           </section>
           <section class="panel debug-context">
-            <div><h3>Диагностика Gemini Live</h3><p>Стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние сокета: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · protocol errors: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Последнее закрытие: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ overview.streamBrain.lastCloseReason || 'причина отсутствует' }} · возраст сессии {{ overview.streamBrain.lastSessionAgeMs !== undefined ? `${(overview.streamBrain.lastSessionAgeMs / 1000).toFixed(1)} с` : '—' }}</p><p>Последние операции: outbound <b>{{ overview.streamBrain.lastOutbound || '—' }}</b> · tool call <b>{{ overview.streamBrain.lastToolCall || '—' }}</b> · tool response <b>{{ overview.streamBrain.lastToolResponse || '—' }}</b> · media <b>{{ overview.streamBrain.lastMediaInput || '—' }}</b></p><p>Распознано устных обращений: <b>{{ overview.streamBrain.spokenMentionsDetected || 0 }}</b> · доступных ботов при последнем обращении: <b>{{ overview.streamBrain.eligibleBots ?? '—' }}</b></p></div>
-            <pre>{{ (overview.streamBrain.outboundTrace || []).map(item => `${formatTime(item.at)} ${item.type}${item.bytes !== undefined ? ` (${item.bytes} B)` : ''}`).join('\n') || 'Исходящих операций пока нет.' }}</pre>
+            <div><h3>Диагностика Gemini Live</h3><p>Стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние соединения: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · ошибок протокола: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Последнее закрытие: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ closeReasonLabel(overview.streamBrain.lastCloseCode, overview.streamBrain.lastCloseReason) }} · возраст сессии {{ overview.streamBrain.lastSessionAgeMs !== undefined ? `${(overview.streamBrain.lastSessionAgeMs / 1000).toFixed(1)} с` : '—' }}</p><details v-if="overview.streamBrain.lastCloseReason"><summary>Техническое сообщение сервера</summary><code>{{ overview.streamBrain.lastCloseReason }}</code></details><p>Последние операции: исходящая <b>{{ diagnosticOperationLabel(overview.streamBrain.lastOutbound) }}</b> · вызов инструмента <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolCall) }}</b> · ответ инструмента <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolResponse) }}</b> · медиа <b>{{ diagnosticOperationLabel(overview.streamBrain.lastMediaInput) }}</b></p><p>Распознано устных обращений: <b>{{ overview.streamBrain.spokenMentionsDetected || 0 }}</b> · доступных ботов при последнем обращении: <b>{{ overview.streamBrain.eligibleBots ?? '—' }}</b></p></div>
+            <pre>{{ (overview.streamBrain.outboundTrace || []).map(item => `${formatTime(item.at)} ${diagnosticOperationLabel(item.type)}${item.bytes !== undefined ? ` (${item.bytes} байт)` : ''}`).join('\n') || 'Исходящих операций пока нет.' }}</pre>
           </section>
-          <div class="section-heading"><div><p class="eyebrow">СКВОЗНОЙ REACTION TRACE</p><h2>Почему сообщение дошло или остановилось</h2></div></div>
-          <section class="event-grid">
-            <article v-for="trace in reactionTraces" :key="`${trace.eventId}-${trace.updatedAt}`" class="event-card"><div class="event-top"><time>{{ formatTime(trace.updatedAt) }}</time><span>{{ reactionTraceStageLabel(trace.stage) }}</span><b>{{ reactionTraceOutcomeLabel(trace.outcome) }}</b></div><h3>{{ trace.summary }}</h3><p>Доступно: {{ trace.eligibleBots }} · передано Gemini: {{ trace.candidateCount }} · выбрано: {{ trace.geminiSelected.length }} · принято: {{ trace.policyAccepted.length }} · запланировано: {{ trace.scheduled.length }} · отправлено: {{ trace.sent.length }}</p><small v-if="trace.directTargetUnavailable.length">Прямой адресат недоступен: {{ trace.directTargetUnavailable.map(item => `@${item.username}: ${item.reason}`).join(', ') }}</small><small v-if="trace.policyRejected.length">Отклонено политикой: {{ trace.policyRejected.map(item => `${item.username}: ${rejectionLabel(item.reason)}`).join(', ') }}</small><small v-if="trace.sendFailed.length">Ошибка отправки: {{ trace.sendFailed.map(item => `${item.username}: ${item.reason}`).join(', ') }}</small><small v-if="trace.terminalReason">Итоговая причина: {{ trace.terminalReason }}</small></article>
-            <div v-if="!reactionTraces.length" class="empty-state panel">Трассировок реакций пока нет.</div>
+          <div class="section-heading reaction-trace-heading">
+            <div><p class="eyebrow">СКВОЗНАЯ ЦЕПОЧКА РЕАКЦИИ</p><h2>На какой момент ответил бот</h2></div>
+            <p class="muted">Один блок связывает момент стрима с точным сообщением. Время считается с обнаружения события системой; задержка самого видеопотока до обнаружения сюда не входит.</p>
+          </div>
+          <section class="event-grid reaction-trace-grid">
+            <article v-for="trace in reactionTraces" :key="`${trace.eventId}-${trace.updatedAt}`" class="event-card reaction-trace-card">
+              <div class="event-top">
+                <time>{{ formatTime(traceDetectedAt(trace)) }}</time>
+                <span>{{ reactionTraceStageLabel(trace.stage) }}</span>
+                <b>{{ reactionTraceOutcomeLabel(trace.outcome) }}</b>
+              </div>
+              <div class="trace-moment">
+                <span>НА ЧТО ОТРЕАГИРОВАЛ</span>
+                <h3>{{ trace.summary }}</h3>
+              </div>
+              <div v-if="trace.reactions?.length" class="trace-reactions">
+                <article v-for="reaction in (trace.reactions || [])" :key="reaction.username" class="trace-reaction">
+                  <div class="trace-reaction-heading">
+                    <span>ЧТО НАПИСАЛ</span>
+                    <strong>@{{ reaction.username }}</strong>
+                    <b :class="['trace-delivery-status', reaction.status.toLowerCase()]">{{ reactionTraceMessageStatusLabel(reaction.status) }}</b>
+                  </div>
+                  <blockquote>«{{ reaction.message }}»</blockquote>
+                  <p class="trace-link"><strong>Почему:</strong> Gemini выбрала эту реплику как реакцию именно на описанный выше момент.</p>
+                  <div class="trace-timing-grid">
+                    <div><span>Подготовка контекста</span><strong>{{ traceContextDuration(trace) }}</strong></div>
+                    <div><span>Решение Gemini</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
+                    <div><span>Искусственная пауза</span><strong class="zero-delay">{{ formatMilliseconds(reaction.artificialDelayMs) }}</strong></div>
+                    <div><span>От решения до отправки</span><strong>{{ traceDeliveryDuration(reaction) }}</strong></div>
+                    <div><span>Всего от обнаружения</span><strong>{{ traceTotalDuration(trace, reaction) }}</strong></div>
+                  </div>
+                  <p v-if="reaction.failureReason" class="trace-stop-reason">{{ reactionTraceReasonLabel(reaction.failureReason) }}</p>
+                </article>
+              </div>
+              <div v-else-if="trace.reactions === undefined" class="trace-no-reaction">
+                <strong>{{ trace.sent.length ? 'Сообщение отправлено в Twitch. Подробная связь с текстом появится после обновления серверной части.' : reactionTraceReasonLabel(trace.terminalReason) }}</strong>
+              </div>
+              <div v-else class="trace-no-reaction">
+                <strong>{{ reactionTraceReasonLabel(trace.terminalReason) }}</strong>
+                <div class="trace-timing-grid compact">
+                  <div><span>Подготовка контекста</span><strong>{{ traceContextDuration(trace) }}</strong></div>
+                  <div><span>Решение Gemini</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
+                  <div><span>Искусственная пауза</span><strong>не применялась</strong></div>
+                  <div><span>Вся цепочка</span><strong>{{ elapsed(traceDetectedAt(trace), trace.timing?.completedAt) }}</strong></div>
+                </div>
+              </div>
+              <details class="trace-details">
+                <summary>Технические детали цепочки</summary>
+                <p>Доступно аккаунтов: {{ trace.eligibleBots }} · передано Gemini: {{ trace.candidateCount }} · выбрано: {{ trace.geminiSelected.length }} · принято: {{ trace.policyAccepted.length }} · отправлено: {{ trace.sent.length }}</p>
+                <small v-if="trace.directTargetUnavailable.length">Прямой адресат недоступен: {{ trace.directTargetUnavailable.map(item => `@${item.username}: ${directTargetReasonLabel(item.reason)}`).join(', ') }}</small>
+                <small v-if="trace.policyRejected.length">Защитная проверка остановила: {{ trace.policyRejected.map(item => `${item.username}: ${rejectionLabel(item.reason)}`).join(', ') }}</small>
+                <small v-if="trace.sendFailed.length">Ошибка отправки: {{ trace.sendFailed.map(item => `${item.username}: ${reactionTraceReasonLabel(item.reason)}`).join(', ') }}</small>
+              </details>
+            </article>
+            <div v-if="!reactionTraces.length" class="empty-state panel">Реакций пока нет. Они появятся после первого понятного момента стрима.</div>
           </section>
-          <div class="section-heading"><div><p class="eyebrow">ПОСЛЕДНИЕ РЕШЕНИЯ AI</p><h2>Кто решил реагировать</h2></div></div>
-          <section class="event-grid">
-            <article v-for="decision in decisions" :key="`${decision.eventId}-${decision.timestamp}`" class="event-card"><div class="event-top"><time>{{ formatTime(decision.timestamp) }}</time><b>{{ decision.selected.length ? `${decision.selected.length} реакц.` : 'тишина' }}</b></div><div v-if="decision.selected.length"><p v-for="reaction in decision.selected" :key="reaction.username"><strong>@{{ reaction.username }}</strong> — {{ reaction.message }} <small>через {{ (reaction.delayMs / 1000).toFixed(1) }} с</small></p></div><p v-else>Gemini решила, что естественнее промолчать.</p><small>Кандидатов: {{ decision.candidateCount }} · промолчали: {{ decision.silentCandidateCount }}</small><small v-if="decision.rejected.length">Фильтр отклонил: {{ decision.rejected.map((item) => `${item.username}: ${rejectionLabel(item.reason)}`).join(', ') }}</small></article>
-            <div v-if="!decisions.length" class="empty-state panel">Решений пока нет.</div>
-          </section>
-          <div class="section-heading"><div><p class="eyebrow">СОБЫТИЯ</p><h2>Понятые моменты стрима</h2></div></div>
+          <div class="section-heading"><div><p class="eyebrow">РАСПОЗНАННЫЕ СОБЫТИЯ</p><h2>Понятые моменты стрима</h2></div></div>
           <section class="event-grid">
             <article v-for="event in events" :key="event.id" class="event-card"><div class="event-top"><time>{{ formatTime(event.timestamp) }}</time><span>{{ event.category || overview.category || 'Категория неизвестна' }}</span><b>{{ eventTypeLabel(event.type) }}</b></div><h3>{{ event.summary }}</h3><p v-if="event.speech">«{{ event.speech }}»</p><div class="event-bars"><label>важность <meter min="0" max="1" :value="event.importance"></meter><b>{{ event.importance.toFixed(2) }}</b></label><label>уверенность <meter min="0" max="1" :value="event.confidence"></meter><b>{{ event.confidence.toFixed(2) }}</b></label></div><small>{{ sourceLabel(event.source) }}<template v-if="event.directMentions.length"> · @{{ event.directMentions.join(', @') }}</template></small></article>
             <div v-if="!events.length" class="empty-state panel">Нормализованных событий пока нет.</div>
@@ -1404,9 +1587,9 @@ onBeforeUnmount(() => {
             <section v-else-if="personaTab === 'character'" class="persona-section">
               <label>Характер<textarea v-model="selectedPersona.character.summary" rows="3"></textarea></label><div class="two-fields"><label>Юмор<input v-model="selectedPersona.character.humor" /></label><label>Поведение в конфликте<input v-model="selectedPersona.character.conflictStyle" /></label></div>
               <div class="four-columns"><div><div class="subsection-heading"><h4>Черты</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.character.traits, 'новая черта')">+</button></div><div v-for="(_, index) in selectedPersona.character.traits" :key="index" class="inline-edit"><input v-model="selectedPersona.character.traits[index]" /><button type="button" @click="selectedPersona.character.traits.splice(index, 1)">×</button></div></div><div><div class="subsection-heading"><h4>Сильные стороны</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.character.strengths, 'новая сильная сторона')">+</button></div><div v-for="(_, index) in selectedPersona.character.strengths" :key="index" class="inline-edit"><input v-model="selectedPersona.character.strengths[index]" /><button type="button" @click="selectedPersona.character.strengths.splice(index, 1)">×</button></div></div><div><div class="subsection-heading"><h4>Недостатки</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.character.flaws, 'новый недостаток')">+</button></div><div v-for="(_, index) in selectedPersona.character.flaws" :key="index" class="inline-edit"><input v-model="selectedPersona.character.flaws[index]" /><button type="button" @click="selectedPersona.character.flaws.splice(index, 1)">×</button></div></div><div><div class="subsection-heading"><h4>Слепые зоны</h4><button type="button" class="text-button" @click="addTextItem(selectedPersona.behavior.imperfections.blindSpots, 'новая слепая зона')">+</button></div><div v-for="(_, index) in selectedPersona.behavior.imperfections.blindSpots" :key="index" class="inline-edit"><input v-model="selectedPersona.behavior.imperfections.blindSpots[index]" /><button type="button" @click="selectedPersona.behavior.imperfections.blindSpots.splice(index, 1)">×</button></div></div></div>
-              <label>Инструкции поведения<textarea v-model="selectedPersona.behavior.styleInstructions" rows="3"></textarea></label><div class="three-fields"><label>Минимум слов<input v-model.number="selectedPersona.behavior.verbosity.minWords" type="number" min="1" max="50" /></label><label>Максимум слов<input v-model.number="selectedPersona.behavior.verbosity.maxWords" type="number" min="1" max="100" /></label><label>Минимальная пауза, мс<input v-model.number="selectedPersona.behavior.minimumIntervalMs" type="number" min="1000" /></label></div>
+              <label>Инструкции поведения<textarea v-model="selectedPersona.behavior.styleInstructions" rows="3"></textarea></label><div class="three-fields"><label>Минимум слов<input v-model.number="selectedPersona.behavior.verbosity.minWords" type="number" min="1" max="50" /></label><label>Максимум слов<input v-model.number="selectedPersona.behavior.verbosity.maxWords" type="number" min="1" max="100" /></label><label>Минимальный интервал между сообщениями, мс<input v-model.number="selectedPersona.behavior.minimumIntervalMs" type="number" min="1000" /></label></div>
               <div class="slider-grid"><label>Склонность реагировать <b>{{ selectedPersona.behavior.reactionProbability.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.reactionProbability" type="range" min="0" max="1" step="0.05" /></label><label>Избирательность событий <b>{{ selectedPersona.behavior.activity.eventSelectivity.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.activity.eventSelectivity" type="range" min="0" max="1" step="0.05" /></label><label>Ответ на прямое обращение <b>{{ selectedPersona.behavior.activity.directReplyLikelihood.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.activity.directReplyLikelihood" type="range" min="0" max="1" step="0.05" /></label><label>Сарказм <b>{{ selectedPersona.behavior.sarcasmLevel.toFixed(2) }}</b><input v-model.number="selectedPersona.behavior.sarcasmLevel" type="range" min="0" max="1" step="0.05" /></label></div>
-              <div class="three-fields"><label>Частота активности<select v-model="selectedPersona.behavior.activity.chatFrequency"><option value="very-low">очень редко</option><option value="low">редко</option><option value="medium">средне</option><option value="high">активно</option></select></label><label>Задержка от, мс<input v-model.number="selectedPersona.behavior.activity.averageDelayMs.min" type="number" min="0" /></label><label>Задержка до, мс<input v-model.number="selectedPersona.behavior.activity.averageDelayMs.max" type="number" min="0" /></label></div>
+              <div class="three-fields"><label>Частота активности<select v-model="selectedPersona.behavior.activity.chatFrequency"><option value="very-low">очень редко</option><option value="low">редко</option><option value="medium">средне</option><option value="high">активно</option></select></label></div>
               <div class="two-fields"><label>Любимые типы событий<input :value="selectedPersona.behavior.activity.preferredEventTypes.join(', ')" @change="selectedPersona.behavior.activity.preferredEventTypes = ($event.target as HTMLInputElement).value.split(',').map(value => value.trim()).filter(Boolean)" /></label><label>Игнорируемые типы событий<input :value="selectedPersona.behavior.activity.ignoredEventTypes.join(', ')" @change="selectedPersona.behavior.activity.ignoredEventTypes = ($event.target as HTMLInputElement).value.split(',').map(value => value.trim()).filter(Boolean)" /></label></div>
             </section>
 

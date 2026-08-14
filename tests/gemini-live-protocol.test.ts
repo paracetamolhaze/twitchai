@@ -34,6 +34,9 @@ describe('Gemini Live three-tool protocol', () => {
     expect(STREAM_BRAIN_INSTRUCTION).toContain('Never concatenate openingPatterns, fillerWords, favoriteExpressions, or endingPatterns');
     expect(STREAM_BRAIN_INSTRUCTION).toContain('compare the draft against that candidate\'s recentMessages');
     expect(STREAM_BRAIN_INSTRUCTION).toContain('The event summary is evidence, not a caption to paraphrase');
+    expect(STREAM_BRAIN_INSTRUCTION).toContain(
+      'Write summary, visualContext, gameContext, emotion, and durable memory summaries in concise natural Russian',
+    );
   });
 
   it('handles every tool call in a server message and correlates synchronous responses by id', async () => {

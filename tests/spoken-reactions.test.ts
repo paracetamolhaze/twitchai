@@ -14,6 +14,7 @@ describe('spoken Twitch bot signals', () => {
       kind: 'direct_mention',
       candidate: {
         type: 'conversation',
+        summary: 'Стример напрямую обратился к @karlbekner',
         speech: 'Карлбекнер, ты тут?',
         directMentions: ['karlbekner'],
       },
@@ -31,6 +32,7 @@ describe('spoken Twitch bot signals', () => {
       kind: 'greeting',
       candidate: {
         type: 'conversation',
+        summary: 'Стример явно поприветствовал чат в начале трансляции',
         directMentions: [],
       },
     });

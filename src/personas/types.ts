@@ -193,6 +193,7 @@ export interface PersonaActivityPattern {
   eventSelectivity: number;
   preferredEventTypes: string[];
   ignoredEventTypes: string[];
+  /** @deprecated Retained only to read existing v3 persona records; reaction scheduling ignores it. */
   averageDelayMs: { min: number; max: number };
 }
 

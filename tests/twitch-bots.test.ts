@@ -19,13 +19,36 @@ class FakeClient extends EventEmitter {
   async say(_channel: string, message: string): Promise<[string]> { this.sent.push(message); return [message]; }
 }
 
+class BlockingBotRepository extends MemoryRepository {
+  private nextBotWrite?: { started: () => void; wait: Promise<void> };
+
+  blockNextBotWrite(): { started: Promise<void>; release: () => void } {
+    let markStarted!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    this.nextBotWrite = { started: markStarted, wait };
+    return { started, release };
+  }
+
+  override async upsertBot(bot: Parameters<MemoryRepository['upsertBot']>[0]): Promise<void> {
+    const gate = this.nextBotWrite;
+    if (gate) {
+      this.nextBotWrite = undefined;
+      gate.started();
+      await gate.wait;
+    }
+    await super.upsertBot(bot);
+  }
+}
+
 describe('TwitchBotManager isolation', () => {
   async function setup(
     accounts: Array<{ username: string; oauthToken: string; enabled: boolean }>,
     storedPersonaId?: string,
     storedEnabled?: boolean,
+    repository: MemoryRepository = new MemoryRepository(),
   ) {
-    const repository = new MemoryRepository();
     const personas = new PersonaStore(repository);
     await personas.initialize();
     if (storedPersonaId && accounts[0]) {
@@ -85,7 +108,34 @@ describe('TwitchBotManager isolation', () => {
   it('never sends through a disabled account', async () => {
     const { manager } = await setup([{ username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: false }]);
     expect(manager.listStatuses()[0]?.connectionState).toBe('DISABLED');
-    expect(await manager.send('gigantiuz', 'hello')).toBe(false);
+    expect(await manager.send('gigantiuz', 'hello')).toEqual({ submitted: false, reason: 'account_unavailable' });
+    await manager.stop();
+  });
+
+  it('returns the Twitch submission timestamp before bot-status persistence finishes', async () => {
+    const repository = new BlockingBotRepository();
+    const { manager } = await setup(
+      [{ username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true }],
+      undefined,
+      undefined,
+      repository,
+    );
+    const gate = repository.blockNextBotWrite();
+    const sendPromise = manager.send('gigantiuz', 'без искусственной паузы');
+
+    await gate.started;
+    await Promise.resolve();
+    const result = await sendPromise;
+
+    expect(result).toEqual({ submitted: true, submittedAt: expect.any(Number) });
+    expect(manager.listStatuses()[0]).toMatchObject({
+      messagesSent: 1,
+      lastMessage: 'без искусственной паузы',
+      lastReactionAt: result.submitted ? result.submittedAt : undefined,
+    });
+
+    gate.release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     await manager.stop();
   });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveViewerConversationTargets, shouldPersistViewerMemory } from '../src/application';
+import { resolveViewerConversationTargets, shouldPersistViewerMemory, viewerConversationSummary } from '../src/application';
 import { BotHistory } from '../src/personas/bot-history';
 import { isAccountClassificationQuestion, PersonaContextBuilder } from '../src/personas/persona-context-builder';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
@@ -376,6 +376,15 @@ describe('deep persistent personas', () => {
       { username: 'bot-artem', personaId: 'artem' },
     ], [], recentPersonaIds);
     expect(targets).toEqual([{ username: 'bot-maxim', personaId: 'maxim' }]);
+  });
+
+  it('describes direct and continued Twitch conversations in Russian', () => {
+    expect(viewerConversationSummary('viewer', ['bot-maxim'], 'ты тут?', true)).toBe(
+      'viewer напрямую обратился(ась) к @bot-maxim: ты тут?',
+    );
+    expect(viewerConversationSummary('viewer', ['bot-maxim'], 'а дальше?', false)).toBe(
+      'viewer продолжил(а) недавний разговор с @bot-maxim: а дальше?',
+    );
   });
 
   it('uses deterministic memory ordering when relevance and timestamps tie', async () => {

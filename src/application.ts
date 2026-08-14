@@ -83,8 +83,6 @@ export class Application {
     this.contextStore = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 200, maxEvents: 100 });
     this.personas = new PersonaStore(this.repository);
     this.policy = new ReactionPolicyGuard({
-      minimumDelayMs: config.reaction.minimumDelayMs,
-      maximumDelayMs: config.reaction.maximumDelayMs,
       globalMessagesPer30Seconds: config.reaction.globalMessagesPer30Seconds,
       maxReactionsPerEvent: config.reaction.maxReactionsPerEvent,
     });
@@ -160,9 +158,10 @@ export class Application {
         handlers: {
           onRecordStreamMemories: (batch) => this.globalMemory.recordFromGemini(batch),
           onPrepareReactionContext: async (candidate) => {
+            const detectedAt = Date.now();
             const event = await this.brain.acceptCandidate(candidate);
             if (!event) throw new Error('invalid_event');
-            return this.coordinator.prepare(event);
+            return this.coordinator.prepare(event, detectedAt);
           },
           onEmitReactionBatch: (batch) => this.coordinator.submitBatch(batch),
           onTranscript: (text) => {
@@ -185,7 +184,7 @@ export class Application {
         logger: this.logger,
         onTranscript: (text) => {
           const candidate: StreamEventCandidate = {
-            type: 'speech', summary: `Streamer said: ${text}`, speech: text, importance: 0.5, confidence: 0.8,
+            type: 'speech', summary: `Стример сказал: ${text}`, speech: text, importance: 0.5, confidence: 0.8,
           };
           if (this.gemini?.isConnected()) this.gemini.requestReaction(candidate);
           else void this.brain.acceptCandidate(candidate, 'fallback-transcription');
@@ -516,9 +515,12 @@ export class Application {
     this.brain.requestReaction({
       timestamp: message.timestamp,
       type: 'conversation',
-      summary: explicitMentions.length > 0
-        ? `${message.username} directly addressed ${targets.map(({ username }) => `@${username}`).join(', ')}: ${message.message}`
-        : `${message.username} continued a recent conversation with @${targets[0]!.username}: ${message.message}`,
+      summary: viewerConversationSummary(
+        message.username,
+        targets.map(({ username }) => username),
+        message.message,
+        explicitMentions.length > 0,
+      ),
       speech: message.message,
       importance: 0.85,
       confidence: 1,
@@ -798,6 +800,18 @@ export function resolveViewerConversationTargets<T extends { username: string; p
     if (account) return [account];
   }
   return [];
+}
+
+export function viewerConversationSummary(
+  viewerUsername: string,
+  targetUsernames: string[],
+  message: string,
+  direct: boolean,
+): string {
+  const targets = targetUsernames.map((username) => `@${username}`).join(', ');
+  return direct
+    ? `${viewerUsername} напрямую обратился(ась) к ${targets}: ${message}`
+    : `${viewerUsername} продолжил(а) недавний разговор с ${targets}: ${message}`;
 }
 
 export function viewerMemoryImportance(message: string): number {
