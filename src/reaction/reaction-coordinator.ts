@@ -48,7 +48,27 @@ export interface ReactionCoordinatorOptions {
   retrievalLimit: number;
   candidates: () => ReactionBotCandidate[];
   contextTtlMs?: number;
+  /** How long to wait for a sent message to echo back from Twitch before calling it undelivered. */
+  deliveryEchoTimeoutMs?: number;
+  /**
+   * Whether chat is currently being observed. Delivery can only be judged while some account is
+   * reading the channel; without one nothing would ever confirm and every message would be
+   * reported undelivered. Absent means never judge.
+   */
+  observesChat?: () => boolean;
   now?: () => number;
+}
+
+interface PendingDelivery {
+  eventId: string;
+  username: string;
+  sentAt: number;
+  timer: NodeJS.Timeout;
+}
+
+/** Normalized so an echo differing only in whitespace still counts as the same message. */
+function deliveryKey(username: string, message: string): string {
+  return `${username.toLowerCase()}::${message.replace(/\s+/g, ' ').trim()}`;
 }
 
 interface PendingContext {
@@ -75,6 +95,8 @@ export class ReactionCoordinator extends EventEmitter {
   private readonly contextTtlMs: number;
   private readonly timers = new Map<NodeJS.Timeout, PlannedReaction>();
   private readonly pendingContexts = new Map<string, PendingContext>();
+  private readonly pendingDeliveries = new Map<string, PendingDelivery>();
+  private readonly deliveryEchoTimeoutMs: number;
   private readonly traces = new Map<string, ReactionTraceRecord>();
   private stopped = false;
 
@@ -83,6 +105,7 @@ export class ReactionCoordinator extends EventEmitter {
     this.logger = options.logger.child('DECISION');
     this.now = options.now ?? Date.now;
     this.contextTtlMs = options.contextTtlMs ?? 45_000;
+    this.deliveryEchoTimeoutMs = options.deliveryEchoTimeoutMs ?? 10_000;
   }
 
   async submitBatch(input: unknown): Promise<ReactionBatchResult> {
@@ -213,7 +236,7 @@ export class ReactionCoordinator extends EventEmitter {
 
   recordBrainDecision(
     eventId: string,
-    metadata: { interactionId: string; previousInteractionId?: string; latencyMs: number },
+    metadata: { interactionId: string; previousInteractionId?: string; latencyMs: number; apiLatencyMs?: number },
   ): void {
     const trace = this.traces.get(eventId);
     if (!trace) return;
@@ -227,6 +250,9 @@ export class ReactionCoordinator extends EventEmitter {
         brainStartedAt: brainReadyAt - Math.max(0, metadata.latencyMs),
         brainReadyAt,
         brainLatencyMs: Math.max(0, metadata.latencyMs),
+        ...(metadata.apiLatencyMs !== undefined
+          ? { brainApiLatencyMs: Math.max(0, metadata.apiLatencyMs) }
+          : {}),
       },
     });
   }
@@ -270,6 +296,40 @@ export class ReactionCoordinator extends EventEmitter {
     };
     this.traces.set(event.id, trace);
     this.emitTrace(trace);
+
+    // A spoken name was recognised for an account that is configured but not currently enabled and
+    // connected, so narrowing to the mentioned accounts left nobody who could answer. Close the
+    // trace here with the real reason and register no pending context: the Brain is given an empty
+    // availableBots and skips the call entirely, instead of paying for a decision that could only
+    // be silence and then reporting it as an expired context 45 seconds later.
+    if (candidates.length === 0) {
+      this.updateTrace(event.id, {
+        stage: 'STOPPED',
+        outcome: 'FAILED',
+        terminalReason: 'no_available_candidate',
+        timing: { ...trace.timing, completedAt: this.now() },
+      });
+      this.logger.info('Event has no available candidate; Brain call skipped', {
+        eventId: event.id,
+        directMentions: event.directMentions,
+        directTargetUnavailable,
+      });
+      return {
+        event,
+        triggerKind: 'external_stream_event',
+        availableBots: [],
+        recentChatDelta: [],
+        targetedPersonaContext: [],
+        reactionExamples: [],
+        deltas: [],
+        constraints: {
+          maxReactions: this.options.policy.maxReactions(),
+          maxMessageBytes: this.options.policy.maxMessageBytes(),
+          globalSlotsAvailable: this.options.policy.globalSlotsAvailable(),
+          expiresAt: this.now(),
+        },
+      };
+    }
 
     const targetedCandidates = directTargets.size > 0 ? candidates : [];
     const [histories, reactionExamples] = await Promise.all([
@@ -362,6 +422,8 @@ export class ReactionCoordinator extends EventEmitter {
   async stop(): Promise<void> {
     this.stopped = true;
     this.clearPendingContexts();
+    for (const pending of this.pendingDeliveries.values()) clearTimeout(pending.timer);
+    this.pendingDeliveries.clear();
     for (const [timer, plan] of this.timers) {
       clearTimeout(timer);
       this.options.policy.releaseReservation(plan.reservationId);
@@ -425,7 +487,8 @@ export class ReactionCoordinator extends EventEmitter {
       }
       const sentAt = sendResult.submittedAt;
       this.recordSendSuccess(eventId, current.username, sentAt);
-      this.logger.info('Bot reaction submitted to Twitch', { bot: current.username, eventId, message: plan.message });
+      this.awaitDeliveryEcho(eventId, current.username, plan.message, sentAt);
+      this.logger.info('Bot reaction submitted to Twitch', { bot: current.username, eventId, text: plan.message });
       try {
         this.options.policy.recordSent(sentAt, plan.reservationId);
         this.options.usage.recordSentResponse();
@@ -453,6 +516,59 @@ export class ReactionCoordinator extends EventEmitter {
     } finally {
       this.options.policy.releaseReservation(plan.reservationId);
     }
+  }
+
+  /**
+   * Twitch never acknowledges a PRIVMSG, and tmi.js `say()` resolves once the bytes reach the
+   * socket — so a message dropped by spam handling, followers-only mode, an unverified account or
+   * AutoMod looks exactly like a delivered one. The reader account does receive every message the
+   * channel actually shows, including the other bots', so an echo arriving back is the only real
+   * delivery evidence available. Anything still unmatched when the window closes was not shown.
+   *
+   * Known blind spot: for the reader account's own messages tmi.js emits the echo locally rather
+   * than receiving it from Twitch, so those confirm even if Twitch dropped them.
+   */
+  private awaitDeliveryEcho(eventId: string, username: string, message: string, sentAt: number): void {
+    if (!this.options.observesChat?.()) return;
+    const key = deliveryKey(username, message);
+    const existing = this.pendingDeliveries.get(key);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      this.pendingDeliveries.delete(key);
+      this.options.usage.recordUndeliveredMessage();
+      this.markReactionUndelivered(eventId, username);
+      this.logger.warn('Reaction never appeared in Twitch chat', {
+        bot: username, eventId, text: message, waitedMs: this.deliveryEchoTimeoutMs,
+      });
+    }, this.deliveryEchoTimeoutMs);
+    timer.unref?.();
+    this.pendingDeliveries.set(key, { eventId, username, timer, sentAt });
+  }
+
+  /**
+   * Called for every chat message the reader account observes. A match retires the pending
+   * delivery, which is what turns "we wrote it to the socket" into "the channel actually shows it".
+   */
+  confirmDelivery(username: string, message: string): void {
+    const key = deliveryKey(username, message);
+    const pending = this.pendingDeliveries.get(key);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingDeliveries.delete(key);
+    this.options.usage.recordConfirmedDelivery();
+    this.logger.info('Reaction confirmed visible in Twitch chat', {
+      bot: username, eventId: pending.eventId, roundTripMs: this.now() - pending.sentAt,
+    });
+  }
+
+  private markReactionUndelivered(eventId: string, username: string): void {
+    const trace = this.traces.get(eventId);
+    if (!trace) return;
+    this.updateTrace(eventId, {
+      reactions: trace.reactions.map((reaction) => reaction.username === username
+        ? { ...reaction, status: 'UNDELIVERED' as const }
+        : reaction),
+    });
   }
 
   private removePending(eventId: string): void {

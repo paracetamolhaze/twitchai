@@ -45,13 +45,18 @@ export class Logger {
 
   private write(level: LogLevel, message: string, fields: LogFields): void {
     if (LEVELS[level] < LEVELS[this.minimumLevel]) return;
+    // `message` is written last on purpose. Spreading fields over it let any caller passing a
+    // `message` field replace the event name with arbitrary content — 'Bot reaction submitted to
+    // Twitch' logged the chat text as its own name, which made send-success events unsearchable in
+    // production logs. A caller's own `message` is preserved under `messageField` instead.
+    const { message: shadowed, ...safeFields } = { ...this.base, ...fields };
     const entry = redact({
       timestamp: new Date().toISOString(),
       level,
       component: this.component,
+      ...safeFields,
+      ...(shadowed !== undefined ? { messageField: shadowed } : {}),
       message,
-      ...this.base,
-      ...fields,
     });
     const line = JSON.stringify(entry);
     if (level === 'error') console.error(line);

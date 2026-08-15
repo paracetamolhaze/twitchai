@@ -13,6 +13,8 @@ export interface ReactionPolicyOptions {
   globalMessagesPer30Seconds: number;
   maxReactionsPerEvent: number;
   maxMessageBytes?: number;
+  /** Spacing between accounts in one batch so two never reach Twitch in the same instant. */
+  batchStaggerMs?: number;
   now?: () => number;
 }
 
@@ -31,11 +33,13 @@ export interface PolicyBatchResult {
 
 export class ReactionPolicyGuard {
   private readonly now: () => number;
+  private readonly batchStaggerMs: number;
   private readonly recentGlobalSends: number[] = [];
   private readonly reservations = new Map<string, { username: string; scheduledAt: number }>();
 
   constructor(private readonly options: ReactionPolicyOptions) {
     this.now = options.now ?? Date.now;
+    this.batchStaggerMs = options.batchStaggerMs ?? 900;
   }
 
   maxReactions(): number { return this.options.maxReactionsPerEvent; }
@@ -106,8 +110,12 @@ export class ReactionPolicyGuard {
       if (await input.isDuplicate(username, message)) { reject('recent_duplicate'); continue; }
 
       const reservationId = randomUUID();
-      const delayMs = 0;
-      this.reservations.set(reservationId, { username, scheduledAt: now });
+      // Transport spacing, not the human-typing simulation removed in b650a98: the first accepted
+      // account still answers immediately. Production logs showed two different accounts hitting
+      // Twitch 4-5ms apart, which its spam handling can silently drop with no error back to us,
+      // so each additional account in the same batch is offset by a fixed step.
+      const delayMs = accepted.length * this.batchStaggerMs;
+      this.reservations.set(reservationId, { username, scheduledAt: now + delayMs });
       accepted.push({
         reservationId,
         trigger: input.trigger,

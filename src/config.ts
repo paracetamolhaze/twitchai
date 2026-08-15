@@ -34,6 +34,7 @@ export interface AppConfig {
     brainThinkingLevel: 'low' | 'medium' | 'high';
     brainEventMergeWindowMs: number;
     brainContextRolloverTokens: number;
+    brainInteractionTimeoutMs: number;
   };
   stream: {
     context: string;
@@ -45,6 +46,7 @@ export interface AppConfig {
   reaction: {
     globalMessagesPer30Seconds: number;
     maxReactionsPerEvent: number;
+    batchStaggerMs: number;
   };
   learning: {
     enabled: boolean;
@@ -104,6 +106,9 @@ const envSchema = z.object({
   // tokens before ever resetting. Roll over much sooner instead; a fresh bootstrap is cheap
   // (~15K tokens) next to letting the chain run unchecked.
   BRAIN_CONTEXT_ROLLOVER_TOKENS: z.coerce.number().int().min(100_000).max(1_048_576).default(150_000),
+  // Must stay below the 45s reaction context TTL: a decision arriving after its context expired is
+  // discarded anyway, so waiting longer only holds up every event queued behind it.
+  BRAIN_INTERACTION_TIMEOUT_SECONDS: z.coerce.number().int().min(5).max(40).default(35),
   STREAM_CONTEXT: z.string().default(''),
   VISION_FPS: z.coerce.number().min(0.05).max(1).default(1),
   VISION_FRAME_WIDTH: z.coerce.number().int().min(320).max(1280).default(640),
@@ -111,6 +116,9 @@ const envSchema = z.object({
   STREAM_CONTEXT_REFRESH_SECONDS: z.coerce.number().min(10).max(300).default(30),
   CHAT_MESSAGES_PER_30_SECONDS: z.coerce.number().int().min(1).max(20).default(18),
   MAX_REACTIONS_PER_EVENT: z.coerce.number().int().min(1).max(10).default(3),
+  // Spacing between accounts answering the same event. The first still replies immediately; this
+  // only stops two accounts hitting Twitch in the same instant, which it can drop silently.
+  REACTION_BATCH_STAGGER_MS: z.coerce.number().int().min(0).max(10_000).default(900),
   LEARN_ENABLED: z.string().default('true'),
   LEARN_REACTION_WINDOW_SECONDS: z.coerce.number().int().min(5).max(120).default(25),
   LEARN_RETRIEVAL_LIMIT: z.coerce.number().int().min(1).max(10).default(4),
@@ -205,6 +213,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       brainThinkingLevel: parsed.GEMINI_BRAIN_THINKING_LEVEL,
       brainEventMergeWindowMs: parsed.BRAIN_EVENT_MERGE_WINDOW_MS,
       brainContextRolloverTokens: parsed.BRAIN_CONTEXT_ROLLOVER_TOKENS,
+      brainInteractionTimeoutMs: parsed.BRAIN_INTERACTION_TIMEOUT_SECONDS * 1000,
     },
     stream: {
       context: parsed.STREAM_CONTEXT.trim(),
@@ -216,6 +225,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     reaction: {
       globalMessagesPer30Seconds: parsed.CHAT_MESSAGES_PER_30_SECONDS,
       maxReactionsPerEvent: parsed.MAX_REACTIONS_PER_EVENT,
+      batchStaggerMs: parsed.REACTION_BATCH_STAGGER_MS,
     },
     learning: {
       enabled: bool(parsed.LEARN_ENABLED, true),

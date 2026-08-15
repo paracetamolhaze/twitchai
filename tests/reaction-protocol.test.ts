@@ -51,6 +51,9 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
     message: '@bot-two ну что скажешь?', kind: 'viewer',
   });
   let candidates = [bot('bot-one', 0), bot('bot-two', 1), bot('bot-three', 2)];
+  // Off by default: delivery can only be judged while an account is reading chat, and most tests
+  // here have no reader, so arming the watchdog would report every message as undelivered.
+  let observesChat = false;
   const sent: Array<{ username: string; message: string }> = [];
   const usage = new UsageTracker();
   const globalMemory = new GlobalStreamerMemory({ repository, usage, now });
@@ -83,9 +86,15 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
     retrievalLimit: 4,
     candidates: () => candidates,
     contextTtlMs: 60_000,
+    observesChat: () => observesChat,
+    deliveryEchoTimeoutMs: 10_000,
     now,
   });
-  return { coordinator, globalMemory, history, policy, sent, usage, setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; } };
+  return {
+    coordinator, globalMemory, history, policy, sent, usage,
+    setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; },
+    setObservesChat: (value: boolean) => { observesChat = value; },
+  };
 }
 
 afterEach(() => vi.useRealTimers());
@@ -387,6 +396,100 @@ describe('single-session reaction protocol', () => {
     expect(result).toMatchObject({ accepted: [], rejected: [] });
     expect(sent).toEqual([]);
     expect(usage.snapshot().emptyReactionBatches).toBe(1);
+    await coordinator.stop();
+  });
+
+  describe('Twitch delivery confirmation', () => {
+    // Twitch acknowledges nothing when a message is sent and tmi.js resolves once the bytes reach
+    // the socket, so a message dropped by spam handling, followers-only mode or AutoMod is
+    // indistinguishable from a delivered one. The reader account seeing it come back is the only
+    // real evidence, and without that the dashboard reported sends that chat never showed.
+    it('marks a reaction undelivered when it never comes back through the reader account', async () => {
+      vi.useFakeTimers();
+      const { coordinator, usage, setObservesChat } = await setup();
+      usage.startStream();
+      setObservesChat(true);
+      const traces: ReactionTraceRecord[] = [];
+      coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
+      await coordinator.prepareBrainEvent(event, 0);
+      await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+      });
+      await vi.runOnlyPendingTimersAsync();
+      expect(usage.snapshot().currentStream.undeliveredMessages).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(usage.snapshot().currentStream.undeliveredMessages).toBe(1);
+      expect(usage.snapshot().currentStream.confirmedDeliveries).toBe(0);
+      expect(traces.at(-1)?.reactions?.[0]).toMatchObject({ username: 'bot-three', status: 'UNDELIVERED' });
+      await coordinator.stop();
+    });
+
+    it('confirms a reaction that comes back through the reader account and never flags it', async () => {
+      vi.useFakeTimers();
+      const { coordinator, usage, setObservesChat } = await setup();
+      usage.startStream();
+      setObservesChat(true);
+      await coordinator.prepareBrainEvent(event, 0);
+      await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+      });
+      await vi.runOnlyPendingTimersAsync();
+      // Whitespace differs from what was sent; the channel showed the same message all the same.
+      coordinator.confirmDelivery('bot-three', '  это был ульт  в параллельную вселенную ');
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(usage.snapshot().currentStream.confirmedDeliveries).toBe(1);
+      expect(usage.snapshot().currentStream.undeliveredMessages).toBe(0);
+      await coordinator.stop();
+    });
+
+    it('judges nothing while no account is reading chat, instead of calling every send undelivered', async () => {
+      vi.useFakeTimers();
+      const { coordinator, usage } = await setup();
+      usage.startStream();
+      await coordinator.prepareBrainEvent(event, 0);
+      await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(usage.snapshot().currentStream.undeliveredMessages).toBe(0);
+      expect(usage.snapshot().currentStream.confirmedDeliveries).toBe(0);
+      await coordinator.stop();
+    });
+  });
+
+  it('spaces accounts in one batch so two never reach Twitch in the same instant', async () => {
+    vi.useFakeTimers();
+    const { coordinator } = await setup();
+    await coordinator.prepareBrainEvent(event, 0);
+    const result = await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [
+        { username: 'bot-one', message: 'первая реплика про этот момент' },
+        { username: 'bot-three', message: 'вторая реплика совершенно другая' },
+      ],
+    });
+    // The first account still answers immediately — this is transport spacing, not a typing delay.
+    expect(result.accepted.map((item) => item.delayMs)).toEqual([0, 900]);
+    await coordinator.stop();
+  });
+
+  it('never spends a Brain call when the named account is unavailable', async () => {
+    const { coordinator, setCandidates } = await setup();
+    const traces: ReactionTraceRecord[] = [];
+    coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
+    setCandidates([bot('bot-one', 0)]);
+    const prepared = await coordinator.prepareBrainEvent(
+      { ...event, id: 'event-mention', type: 'direct_mention', directMentions: ['bot-two'] }, 0,
+    );
+    // A spoken name recognised for a configured but currently unavailable account: nobody can
+    // answer, so asking the model to choose from an empty list could only ever return silence.
+    expect(prepared.availableBots).toEqual([]);
+    expect(traces.at(-1)).toMatchObject({ outcome: 'FAILED', terminalReason: 'no_available_candidate' });
     await coordinator.stop();
   });
 

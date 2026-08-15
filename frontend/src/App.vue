@@ -170,6 +170,8 @@ interface Usage {
     geminiInputTokens: number
     geminiOutputTokens: number
     sentResponses: number
+    confirmedDeliveries: number
+    undeliveredMessages: number
     perception: Usage['perception']
     brain: Usage['brain']
     totalAi: Usage['totalAi']
@@ -339,6 +341,7 @@ interface ReactionTrace {
     brainStartedAt?: number
     brainReadyAt?: number
     brainLatencyMs?: number
+    brainApiLatencyMs?: number
     decisionAt?: number
     completedAt?: number
   }
@@ -403,6 +406,7 @@ const usage = reactive<Usage>({
     active: false, durationMinutes: 0, capturedAudioMinutes: 0, capturedVideoMinutes: 0,
     geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0, geminiReconnects: 0,
     geminiInputTokens: 0, geminiOutputTokens: 0, sentResponses: 0,
+    confirmedDeliveries: 0, undeliveredMessages: 0,
     perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0 },
     brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
     totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
@@ -1190,6 +1194,7 @@ function reactionTraceOutcomeLabel(outcome: ReactionTrace['outcome']): string {
 function reactionTraceMessageStatusLabel(status: ReactionTraceMessage['status']): string {
   return ({
     ACCEPTED: 'принято защитой', SCHEDULED: 'ожидает отправки', SENT: 'отправлено', FAILED: 'не отправлено',
+    UNDELIVERED: 'Twitch не показал',
   })[status]
 }
 function formatMilliseconds(value?: number): string {
@@ -1209,9 +1214,17 @@ function traceContextDuration(trace: ReactionTrace): string {
   return elapsed(traceDetectedAt(trace), trace.timing?.contextReadyAt)
 }
 function traceGeminiDuration(trace: ReactionTrace): string {
+  // Prefer the model call on its own. The older brainLatencyMs counts from when the event was
+  // observed, so on a backed-up queue it reported the wait as if the model had been slow.
+  if (trace.timing?.brainApiLatencyMs !== undefined) return formatMilliseconds(trace.timing.brainApiLatencyMs)
   return trace.timing?.brainLatencyMs !== undefined
     ? formatMilliseconds(trace.timing.brainLatencyMs)
     : elapsed(trace.timing?.brainStartedAt ?? trace.timing?.contextReadyAt ?? traceDetectedAt(trace), trace.timing?.brainReadyAt ?? trace.timing?.decisionAt)
+}
+function traceQueueWait(trace: ReactionTrace): string {
+  const total = trace.timing?.brainLatencyMs
+  const api = trace.timing?.brainApiLatencyMs
+  return total !== undefined && api !== undefined ? formatMilliseconds(Math.max(0, total - api)) : '—'
 }
 function traceReactionEnd(reaction: ReactionTraceMessage): number | undefined {
   return reaction.sentAt ?? reaction.failedAt
@@ -1228,6 +1241,7 @@ function reactionTraceReasonLabel(reason?: string): string {
     gemini_selected_silence: 'Brain решил, что для этого момента естественнее промолчать.',
     reaction_context_stale: 'Решение Brain пришло после закрытия контекста события.',
     reaction_context_expired_before_gemini_batch: 'Brain не успел вернуть решение до истечения контекста.',
+    no_available_candidate: 'Названный аккаунт сейчас недоступен — отвечать некому, Brain не вызывался.',
     gemini_disconnected_before_reaction_batch: 'Brain остановился до того, как вернул решение.',
     all_selected_reactions_rejected: 'Все выбранные сообщения остановила защитная проверка.',
     coordinator_stopped: 'Сервис остановился до отправки сообщения.',
@@ -1512,6 +1526,8 @@ onBeforeUnmount(() => {
             <div><span>Решения Brain</span><strong>{{ overview.geminiBrain.decisions }}</strong></div>
             <div><span>Осознанная тишина</span><strong>{{ overview.geminiBrain.silentDecisions }}</strong></div>
             <div><span>Создано / отправлено</span><strong>{{ overview.geminiBrain.generatedReactions }} / {{ usage.currentStream.sentResponses }}</strong></div>
+            <div><span>Подтверждено в чате</span><strong>{{ usage.currentStream.confirmedDeliveries }}</strong></div>
+            <div><span>Twitch не показал</span><strong>{{ usage.currentStream.undeliveredMessages }}</strong></div>
             <div><span>Всего / в час</span><strong>${{ usage.currentStream.totalAi.estimatedCostUsd.toFixed(4) }} / ${{ usage.currentStream.totalAi.estimatedCostPerHourUsd.toFixed(4) }}</strong></div>
           </section>
           <section class="panel metric-strip">
@@ -1566,6 +1582,7 @@ onBeforeUnmount(() => {
                   <p class="trace-link"><strong>Почему:</strong> Brain 3.7 связал эту реплику именно с описанным выше событием и выбрал @{{ reaction.username }}.</p>
                   <div class="trace-timing-grid">
                     <div><span>Подготовка контекста</span><strong>{{ traceContextDuration(trace) }}</strong></div>
+                    <div><span>Ожидание в очереди</span><strong>{{ traceQueueWait(trace) }}</strong></div>
                     <div><span>Решение Brain 3.7</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
                     <div><span>От решения до отправки</span><strong>{{ traceDeliveryDuration(reaction) }}</strong></div>
                     <div><span>Всего от обнаружения</span><strong>{{ traceTotalDuration(trace, reaction) }}</strong></div>
@@ -1580,6 +1597,7 @@ onBeforeUnmount(() => {
                 <strong>{{ reactionTraceReasonLabel(trace.terminalReason) }}</strong>
                 <div class="trace-timing-grid compact">
                   <div><span>Подготовка контекста</span><strong>{{ traceContextDuration(trace) }}</strong></div>
+                  <div><span>Ожидание в очереди</span><strong>{{ traceQueueWait(trace) }}</strong></div>
                   <div><span>Решение Brain 3.7</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
                   <div><span>Вся цепочка</span><strong>{{ elapsed(traceDetectedAt(trace), trace.timing?.completedAt) }}</strong></div>
                 </div>

@@ -61,6 +61,10 @@ export interface UsageSnapshot {
   eventsDetected: number;
   generatedResponses: number;
   sentResponses: number;
+  /** Sends the reader account saw come back, so the channel really showed them. */
+  confirmedDeliveries: number;
+  /** Sends Twitch accepted without error but never showed — dropped silently on their side. */
+  undeliveredMessages: number;
   skippedResponses: number;
   memoryToolCalls: number;
   memoriesCreated: number;
@@ -111,6 +115,8 @@ export interface CurrentStreamUsageSnapshot {
   geminiInputTokens: number;
   geminiOutputTokens: number;
   sentResponses: number;
+  confirmedDeliveries: number;
+  undeliveredMessages: number;
   perception: PerceptionUsageSnapshot;
   brain: BrainUsageSnapshot;
   totalAi: TotalAiUsageSnapshot;
@@ -178,6 +184,10 @@ export class UsageTracker {
   private eventsDetected = 0;
   private generatedResponses = 0;
   private sentResponses = 0;
+  private confirmedDeliveries = 0;
+  private currentConfirmedDeliveries = 0;
+  private undeliveredMessages = 0;
+  private currentUndeliveredMessages = 0;
   private skippedResponses = 0;
   private memoryToolCalls = 0;
   private memoriesCreated = 0;
@@ -208,6 +218,8 @@ export class UsageTracker {
     this.currentGeminiInputTokens = 0;
     this.currentGeminiOutputTokens = 0;
     this.currentSentResponses = 0;
+    this.currentConfirmedDeliveries = 0;
+    this.currentUndeliveredMessages = 0;
     this.currentEventsDetected = 0;
     this.currentLiveInputByModality = emptyModalities();
     this.currentLiveOutputByModality = emptyModalities();
@@ -266,6 +278,16 @@ export class UsageTracker {
   recordSentResponse(): void {
     this.sentResponses += 1;
     if (this.streamStartedAt !== undefined) this.currentSentResponses += 1;
+  }
+  /** Message came back through the reader account, so the channel really showed it. */
+  recordConfirmedDelivery(): void {
+    this.confirmedDeliveries += 1;
+    if (this.streamStartedAt !== undefined) this.currentConfirmedDeliveries += 1;
+  }
+  /** Written to Twitch without error but never echoed back — silently dropped on their side. */
+  recordUndeliveredMessage(): void {
+    this.undeliveredMessages += 1;
+    if (this.streamStartedAt !== undefined) this.currentUndeliveredMessages += 1;
   }
   recordSkipped(): void { this.skippedResponses += 1; }
   recordMemoryToolCall(): void { this.memoryToolCalls += 1; }
@@ -366,6 +388,8 @@ export class UsageTracker {
       eventsDetected: this.eventsDetected,
       generatedResponses: this.generatedResponses,
       sentResponses: this.sentResponses,
+      confirmedDeliveries: this.confirmedDeliveries,
+      undeliveredMessages: this.undeliveredMessages,
       skippedResponses: this.skippedResponses,
       memoryToolCalls: this.memoryToolCalls,
       memoriesCreated: this.memoriesCreated,
@@ -390,6 +414,8 @@ export class UsageTracker {
         geminiInputTokens: this.currentGeminiInputTokens,
         geminiOutputTokens: this.currentGeminiOutputTokens,
         sentResponses: this.currentSentResponses,
+        confirmedDeliveries: this.currentConfirmedDeliveries,
+        undeliveredMessages: this.currentUndeliveredMessages,
         perception: currentPerception,
         brain: currentBrain,
         totalAi: currentTotalAi,

@@ -117,7 +117,10 @@ export interface ReactionTraceTiming {
   /** When the stateful Brain interaction started and completed. */
   brainStartedAt?: number;
   brainReadyAt?: number;
+  /** Wall time since the event was observed — includes waiting behind other events on the queue. */
   brainLatencyMs?: number;
+  /** The model call on its own, so a backed-up queue is distinguishable from a slow model. */
+  brainApiLatencyMs?: number;
   /** When Gemini returned the final batch. */
   decisionAt?: number;
   /** When the last accepted reaction reached a terminal IRC send state. */
@@ -128,7 +131,11 @@ export interface ReactionTraceReaction {
   username: string;
   message: string;
   artificialDelayMs: number;
-  status: 'ACCEPTED' | 'SCHEDULED' | 'SENT' | 'FAILED';
+  /**
+   * UNDELIVERED means Twitch accepted the write but the message never came back through the reader
+   * account, so the channel never showed it — distinct from FAILED, where the send itself errored.
+   */
+  status: 'ACCEPTED' | 'SCHEDULED' | 'SENT' | 'FAILED' | 'UNDELIVERED';
   selectedAt: number;
   scheduledAt?: number;
   /** When the IRC client submitted the message; Twitch does not expose display acknowledgement here. */

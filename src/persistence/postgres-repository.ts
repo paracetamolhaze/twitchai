@@ -372,8 +372,12 @@ export class PostgresRepository implements AppRepository {
       `INSERT INTO reaction_examples
        (id, occurred_at, game, stream_context, event_type, event_summary, transcript, chat_messages)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      // chat_messages is JSONB. node-postgres renders a JS array as a Postgres array literal
+      // ({a,b}), which JSONB rejects with "invalid input syntax for type json" — every save failed
+      // in production. Objects are JSON-serialized by the driver, which is why the payload/config/
+      // metrics columns nearby work untouched; only this array parameter needs explicit stringify.
       [example.id, new Date(example.timestamp), example.game, example.streamContext, example.eventType,
-        example.event, example.transcript ?? null, example.chatMessages],
+        example.event, example.transcript ?? null, JSON.stringify(example.chatMessages)],
     );
   }
 

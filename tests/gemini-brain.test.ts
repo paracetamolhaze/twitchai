@@ -369,8 +369,50 @@ describe('Gemini 3.7 stateful Brain', () => {
 
     await service.enqueueEvent(firstEvent);
 
-    expect(onDecision).toHaveBeenCalledWith(firstEvent, expect.anything(), 1_000, 'B', 'A');
+    // 300ms preparing context + 700ms in the API. The total is what the operator waited; the API
+    // figure is reported separately so a queue backed up behind a slow event is not misread as the
+    // model itself being slow.
+    expect(onDecision).toHaveBeenCalledWith(firstEvent, expect.anything(), 1_000, 'B', 'A', 700);
     expect(service.getStatus().lastLatencyMs).toBe(1_000);
+  });
+
+  it('abandons an interaction that outlives its deadline instead of holding the queue', async () => {
+    vi.useFakeTimers();
+    const onDecision = vi.fn(async () => undefined);
+    let decisionCalls = 0;
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        if (request.kind === 'bootstrap') {
+          return {
+            id: 'A', status: 'completed', outputText: '{"ready":true}',
+            usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+          };
+        }
+        decisionCalls += 1;
+        // The production failure was one call running 97s: its own reaction context expired at 45s
+        // and the two events behind it waited 87s and 73s just to have their context prepared.
+        if (decisionCalls === 1) return new Promise(() => {});
+        return {
+          id: 'B', status: 'completed', outputText: '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+        };
+      },
+    };
+    const service = brainService(client, { onDecision, interactionTimeoutMs: 1_000 });
+    await service.startStream();
+
+    const stuck = service.enqueueEvent(firstEvent);
+    const stuckSettled = stuck.then(() => 'resolved', () => 'rejected');
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(await stuckSettled).toBe('rejected');
+
+    // The queue must be usable again immediately; the deadline exists to release it, and a second
+    // deadline's worth of retrying would defeat that, so a timeout is never retried.
+    const next = service.enqueueEvent({ ...firstEvent, id: 'event-2' });
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(next).resolves.toMatchObject({ reactions: [] });
+    expect(decisionCalls).toBe(2);
+    vi.useRealTimers();
   });
 
   it('makes no Interactions API call for events received while the stream session is offline', async () => {

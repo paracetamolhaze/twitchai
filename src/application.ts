@@ -105,6 +105,7 @@ export class Application {
     this.policy = new ReactionPolicyGuard({
       globalMessagesPer30Seconds: config.reaction.globalMessagesPer30Seconds,
       maxReactionsPerEvent: config.reaction.maxReactionsPerEvent,
+      batchStaggerMs: config.reaction.batchStaggerMs,
     });
     this.memory = new ReactionMemory({
       enabled: config.learning.enabled,
@@ -167,6 +168,7 @@ export class Application {
       logger: this.logger,
       retrievalLimit: this.config.learning.retrievalLimit,
       candidates: () => this.botManager.candidates(),
+      observesChat: () => this.botManager.hasChatReader(),
     });
 
     if (this.config.gemini.apiKey) {
@@ -177,12 +179,13 @@ export class Application {
         bootstrap: (reason) => this.buildBrainBootstrap(reason),
         prepareEvent: (event, chatAfter, emittedAt) =>
           this.coordinator.prepareBrainEvent(event, chatAfter, emittedAt),
-        onDecision: (event, decision, latencyMs, interactionId, previousInteractionId) =>
-          this.applyBrainDecision(event, decision, latencyMs, interactionId, previousInteractionId),
+        onDecision: (event, decision, latencyMs, interactionId, previousInteractionId, apiLatencyMs) =>
+          this.applyBrainDecision(event, decision, latencyMs, interactionId, previousInteractionId, apiLatencyMs),
         usage: this.usage,
         logger: this.logger,
         eventMergeWindowMs: this.config.gemini.brainEventMergeWindowMs,
         contextRolloverTokens: this.config.gemini.brainContextRolloverTokens,
+        interactionTimeoutMs: this.config.gemini.brainInteractionTimeoutMs,
       });
       this.gemini = new GeminiLiveClient({
         apiKey: this.config.gemini.apiKey,
@@ -609,8 +612,9 @@ export class Application {
     latencyMs: number,
     interactionId: string,
     previousInteractionId: string,
+    apiLatencyMs: number,
   ): Promise<void> {
-    this.coordinator.recordBrainDecision(event.id, { interactionId, previousInteractionId, latencyMs });
+    this.coordinator.recordBrainDecision(event.id, { interactionId, previousInteractionId, latencyMs, apiLatencyMs });
     await this.coordinator.submitBatch({
       eventId: event.id,
       reactions: decision.reactions.map(({ username, message }) => ({ username, message })),
@@ -753,6 +757,9 @@ export class Application {
   private async handleChat(message: ChatMessage): Promise<void> {
     this.contextStore.addChat(message);
     this.api.emitChat(message);
+    // Twitch acknowledges nothing when a message is sent, so a message coming back through the
+    // reader account is the only evidence the channel actually showed it.
+    if (message.kind === 'bot') this.coordinator.confirmDelivery(message.username, message.message);
     if (message.kind !== 'viewer') {
       this.memory.recordChat(message);
       return;

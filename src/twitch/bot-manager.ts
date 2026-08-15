@@ -383,6 +383,17 @@ export class TwitchBotManager extends EventEmitter {
     }
   }
 
+  /**
+   * Whether some account is currently reading channel chat. Only the reader account's connection
+   * receives incoming messages, so without one there is no way to observe whether a message we
+   * sent actually reached the channel.
+   */
+  hasChatReader(): boolean {
+    if (!this.readerUsername) return false;
+    const reader = this.bots.get(this.readerUsername);
+    return reader?.status.connectionState === 'CONNECTED' && reader.status.chatConnected;
+  }
+
   private chooseReader(excluding: string): void {
     this.readerUsername = [...this.bots.values()].find((candidate) =>
       candidate.config.username !== excluding && candidate.status.connectionState === 'CONNECTED' && candidate.status.chatConnected,
