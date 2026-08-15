@@ -65,6 +65,36 @@ describe('Gemini Live perception protocol', () => {
     client.stop();
   });
 
+  it('never shows Live its own bots\' chat messages, so an autonomous Persona Drive message cannot cause Live to emit a StreamEvent about itself', async () => {
+    // Closes the one path that wasn't already guarded by Application.handleChat's kind !== 'viewer'
+    // check (application.ts): that guard stops a bot message from ever reaching the direct
+    // chat-shortcut StreamEvent path, but Live's own independent emit_stream_event judgment reads
+    // this same context text — if a bot's message were visible here, Live could react to it on its
+    // own, creating a real StreamEvent (and a real Brain reaction) with zero involvement from
+    // PersonaDriveService's own AI-chain-depth gate, which only guards Persona Drive's own scheduler.
+    let parameters: LiveConnectParameters | undefined;
+    const sendRealtimeInput = vi.fn();
+    const session = { sendRealtimeInput, sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({ connect: async (value) => { parameters = value; return session; } });
+    await client.start();
+    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    sendRealtimeInput.mockClear();
+    client.updateContext({
+      channel: 'streamer', category: 'Dota 2', streamContext: '', isLive: true,
+      recentChat: [
+        { id: '1', timestamp: 1, username: 'realviewer', displayName: 'realviewer', message: 'го дальше катку', kind: 'viewer' },
+        { id: '2', timestamp: 2, username: 'karlbekner', displayName: 'karlbekner', message: 'кстати про драфт саппортов — так и не разобрали до конца', kind: 'bot' },
+      ],
+      recentEvents: [], botUsernames: ['karlbekner'], updatedAt: Date.now(),
+    });
+    const call = sendRealtimeInput.mock.calls.find((entry) => typeof entry[0]?.text === 'string');
+    const sentText = call?.[0]?.text as string;
+    expect(sentText).toContain('realviewer: го дальше катку');
+    expect(sentText).not.toContain('драфт саппортов');
+    expect(sentText).not.toContain('karlbekner:');
+    client.stop();
+  });
+
   it('reaches READY when the SDK delivers setupComplete before connect() resolves', async () => {
     // @google/genai's real Live.connect() queues incoming messages until its own internal
     // setupComplete promise settles, then flushes them to callbacks.onmessage() BEFORE the
