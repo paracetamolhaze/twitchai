@@ -558,6 +558,9 @@ export class Application {
       this.api.emitBots(bots);
       this.api.emitOverview();
     });
+    this.botManager.on('sendRejected', ({ username, msgid }: { username: string; msgid: string }) => {
+      this.coordinator.rejectDelivery(username, msgid);
+    });
     this.botManager.on('chat', (message: ChatMessage) => {
       void this.handleChat(message).catch((cause: unknown) => this.logger.warn('Chat context handling failed', { cause }));
     });

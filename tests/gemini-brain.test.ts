@@ -415,6 +415,42 @@ describe('Gemini 3.7 stateful Brain', () => {
     vi.useRealTimers();
   });
 
+  it('keeps the interaction chain after a deadline miss instead of re-sending the whole bootstrap', async () => {
+    vi.useFakeTimers();
+    const requests: BrainInteractionRequest[] = [];
+    let decisionCalls = 0;
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        if (request.kind === 'bootstrap') {
+          return {
+            id: 'A', status: 'completed', outputText: '{"ready":true}',
+            usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+          };
+        }
+        decisionCalls += 1;
+        if (decisionCalls === 1) return new Promise(() => {});
+        return {
+          id: 'B', status: 'completed', outputText: '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+        };
+      },
+    };
+    const service = brainService(client, { interactionTimeoutMs: 1_000 });
+    await service.startStream();
+
+    const stuck = service.enqueueEvent(firstEvent).then(() => 'resolved', () => 'rejected');
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(await stuck).toBe('rejected');
+
+    await service.enqueueEvent({ ...firstEvent, id: 'event-2' });
+    // Production discarded the chain on every timeout, which forced a recovery bootstrap that
+    // blocked the queue again and caused the next timeout — four full bootstraps in ten minutes.
+    expect(requests.filter((request) => request.kind === 'bootstrap')).toHaveLength(1);
+    expect(requests.at(-1)?.previousInteractionId).toBe('A');
+    vi.useRealTimers();
+  });
+
   it('makes no Interactions API call for events received while the stream session is offline', async () => {
     const client: BrainInteractionClient = { create: vi.fn() };
     const service = brainService(client);

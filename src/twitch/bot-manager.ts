@@ -32,6 +32,18 @@ export type TwitchChatClient = Pick<tmi.Client, 'connect' | 'disconnect' | 'say'
 export type PersonaAssignmentResult = 'updated' | 'bot_not_found' | 'persona_not_found' | 'persona_in_use' | PersonaAssignmentProblem;
 export type BotEnabledResult = 'updated' | 'bot_not_found' | PersonaAssignmentProblem;
 
+/**
+ * NOTICE msg-ids that mean Twitch refused to show a message we sent. Everything else (room-state
+ * announcements, host notices) is informational and must not be reported as a delivery failure.
+ */
+const SEND_REJECTION_NOTICES = new Set([
+  'msg_banned', 'msg_bad_characters', 'msg_channel_blocked', 'msg_channel_suspended',
+  'msg_duplicate', 'msg_emoteonly', 'msg_facebook', 'msg_followersonly',
+  'msg_followersonly_followed', 'msg_followersonly_zero', 'msg_r9k', 'msg_ratelimit',
+  'msg_rejected', 'msg_rejected_mandatory', 'msg_slowmode', 'msg_subsonly', 'msg_suspended',
+  'msg_timedout', 'msg_verified_email', 'msg_requires_verified_phone_number',
+]);
+
 export class TwitchBotManager extends EventEmitter {
   private readonly bots = new Map<string, ManagedBot>();
   private readonly persistenceTails = new WeakMap<ManagedBot, Promise<void>>();
@@ -360,6 +372,19 @@ export class TwitchBotManager extends EventEmitter {
       client.on('disconnected', (reason) => {
         if (this.readerUsername === bot.config.username) this.chooseReader(bot.config.username);
         void this.patch(bot, { connectionState: bot.config.enabled ? 'DISCONNECTED' : 'DISABLED', chatConnected: false, lastError: reason });
+      });
+      // Twitch does report why it refuses a message — as an IRC NOTICE on the sending account's
+      // own connection, never as an error from say(). Without this handler a refusal was
+      // indistinguishable from a delivered message: followers-only mode, a ban, a duplicate, slow
+      // mode or an AutoMod hold all looked like success.
+      client.on('notice', (_channel: string, msgid: string, notice: string) => {
+        if (!SEND_REJECTION_NOTICES.has(msgid)) {
+          this.logger.info('Twitch notice', { bot: bot.config.username, msgid, notice });
+          return;
+        }
+        void this.patch(bot, { lastError: `${msgid}: ${notice}` });
+        this.logger.warn('Twitch refused the message', { bot: bot.config.username, msgid, notice });
+        this.emit('sendRejected', { username: bot.config.username, msgid, notice });
       });
       client.on('message', (_channel, tags, message, self) => {
         if (this.readerUsername !== bot.config.username) return;

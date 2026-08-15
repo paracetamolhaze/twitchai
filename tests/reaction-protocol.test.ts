@@ -446,6 +446,34 @@ describe('single-session reaction protocol', () => {
       await coordinator.stop();
     });
 
+    it('uses the reason Twitch reported instead of waiting out the echo window', async () => {
+      vi.useFakeTimers();
+      const { coordinator, usage, setObservesChat } = await setup();
+      usage.startStream();
+      setObservesChat(true);
+      const traces: ReactionTraceRecord[] = [];
+      coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
+      await coordinator.prepareBrainEvent(event, 0);
+      await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+      });
+      await vi.runOnlyPendingTimersAsync();
+
+      // Twitch reports refusals as an IRC NOTICE on the sending account's connection, never as an
+      // error from say(); that reason is far more useful than a generic non-appearance.
+      coordinator.rejectDelivery('bot-three', 'msg_followersonly');
+      expect(usage.snapshot().currentStream.undeliveredMessages).toBe(1);
+      expect(traces.at(-1)?.reactions?.[0]).toMatchObject({
+        username: 'bot-three', status: 'UNDELIVERED', failureReason: 'msg_followersonly',
+      });
+
+      // The echo watchdog must not fire again for a delivery already accounted for.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(usage.snapshot().currentStream.undeliveredMessages).toBe(1);
+      await coordinator.stop();
+    });
+
     it('judges nothing while no account is reading chat, instead of calling every send undelivered', async () => {
       vi.useFakeTimers();
       const { coordinator, usage } = await setup();

@@ -561,12 +561,30 @@ export class ReactionCoordinator extends EventEmitter {
     });
   }
 
-  private markReactionUndelivered(eventId: string, username: string): void {
+  /**
+   * Twitch refused the message and said why on the sending account's connection. That is a far
+   * better answer than waiting out the echo window and reporting a generic non-appearance, so the
+   * pending delivery is retired immediately with the reported reason.
+   */
+  rejectDelivery(username: string, reason: string): void {
+    const match = [...this.pendingDeliveries.entries()]
+      .filter(([, pending]) => pending.username.toLowerCase() === username.toLowerCase())
+      .sort((left, right) => right[1].sentAt - left[1].sentAt)[0];
+    if (!match) return;
+    const [key, pending] = match;
+    clearTimeout(pending.timer);
+    this.pendingDeliveries.delete(key);
+    this.options.usage.recordUndeliveredMessage();
+    this.markReactionUndelivered(pending.eventId, pending.username, reason);
+    this.logger.warn('Twitch refused a reaction', { bot: pending.username, eventId: pending.eventId, reason });
+  }
+
+  private markReactionUndelivered(eventId: string, username: string, reason?: string): void {
     const trace = this.traces.get(eventId);
     if (!trace) return;
     this.updateTrace(eventId, {
       reactions: trace.reactions.map((reaction) => reaction.username === username
-        ? { ...reaction, status: 'UNDELIVERED' as const }
+        ? { ...reaction, status: 'UNDELIVERED' as const, ...(reason ? { failureReason: reason } : {}) }
         : reaction),
     });
   }
