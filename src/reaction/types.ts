@@ -1,9 +1,5 @@
 import { BotPersona } from '../personas/types';
-import { PersonaReactionContext } from '../personas/persona-context-builder';
 import { BotConnectionState } from '../persistence/repository';
-import { ReactionExample } from '../learning/types';
-import { StreamerMemory } from '../global-memory/types';
-import { ChatMessage } from '../stream-brain/types';
 import { StreamEvent } from '../stream-brain/types';
 
 export const REACTION_BATCH_PROTOCOL_MAX_ITEMS = 10;
@@ -26,27 +22,6 @@ export interface PlannedReaction {
   directMention: boolean;
   viewerUsername?: string;
   message: string;
-}
-
-export interface ReactionContextCandidate extends PersonaReactionContext {
-  rateLimit: { cooldownRemainingMs: number; busy: boolean };
-}
-
-export interface PreparedReactionContext {
-  eventId: string;
-  event: StreamEvent;
-  recentChat: ChatMessage[];
-  /** Supplied once per event, never repeated inside each persona candidate. */
-  globalStreamerMemories: StreamerMemory[];
-  candidates: ReactionContextCandidate[];
-  reactionExamples: ReactionExample[];
-  constraints: {
-    maxReactions: number;
-    maxMessageBytes: number;
-    globalSlotsAvailable: number;
-    expiresAt: number;
-    instructions: string[];
-  };
 }
 
 export interface SubmittedReaction {
@@ -121,6 +96,10 @@ export interface ReactionTraceTiming {
   detectedAt: number;
   /** When candidate context was ready and returned to Gemini. */
   contextReadyAt?: number;
+  /** When the stateful Brain interaction started and completed. */
+  brainStartedAt?: number;
+  brainReadyAt?: number;
+  brainLatencyMs?: number;
   /** When Gemini returned the final batch. */
   decisionAt?: number;
   /** When the last accepted reaction reached a terminal IRC send state. */
@@ -164,5 +143,8 @@ export interface ReactionTraceRecord {
   sendFailed: Array<{ username: string; reason: string }>;
   timing: ReactionTraceTiming;
   reactions: ReactionTraceReaction[];
+  brainInteractionId?: string;
+  brainPreviousInteractionId?: string;
+  brainPreviousInteractionUsed?: boolean;
   terminalReason?: string;
 }

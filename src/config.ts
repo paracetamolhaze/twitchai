@@ -30,6 +30,10 @@ export interface AppConfig {
   gemini: {
     apiKey?: string;
     liveModel: string;
+    brainModel: string;
+    brainThinkingLevel: 'low' | 'medium' | 'high';
+    brainEventMergeWindowMs: number;
+    brainContextRolloverTokens: number;
   };
   stream: {
     context: string;
@@ -79,6 +83,10 @@ const envSchema = z.object({
   TWITCH_CATEGORY_REFRESH_SECONDS: z.coerce.number().min(30).max(3600).default(120),
   GEMINI_API_KEY: z.string().trim().optional(),
   GEMINI_LIVE_MODEL: z.string().trim().default('gemini-3.1-flash-live-preview'),
+  GEMINI_BRAIN_MODEL: z.string().trim().default('gemini-3.7-flash'),
+  GEMINI_BRAIN_THINKING_LEVEL: z.enum(['low', 'medium', 'high']).default('low'),
+  BRAIN_EVENT_MERGE_WINDOW_MS: z.coerce.number().int().min(0).max(2_000).default(250),
+  BRAIN_CONTEXT_ROLLOVER_TOKENS: z.coerce.number().int().min(100_000).max(1_048_576).default(786_432),
   STREAM_CONTEXT: z.string().default(''),
   VISION_FPS: z.coerce.number().min(0.05).max(1).default(1),
   VISION_FRAME_WIDTH: z.coerce.number().int().min(320).max(1280).default(640),
@@ -156,6 +164,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     gemini: {
       apiKey: parsed.GEMINI_API_KEY,
       liveModel: parsed.GEMINI_LIVE_MODEL,
+      brainModel: parsed.GEMINI_BRAIN_MODEL,
+      brainThinkingLevel: parsed.GEMINI_BRAIN_THINKING_LEVEL,
+      brainEventMergeWindowMs: parsed.BRAIN_EVENT_MERGE_WINDOW_MS,
+      brainContextRolloverTokens: parsed.BRAIN_CONTEXT_ROLLOVER_TOKENS,
     },
     stream: {
       context: parsed.STREAM_CONTEXT.trim(),

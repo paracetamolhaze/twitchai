@@ -38,12 +38,33 @@ interface BrainStatus {
   spokenMentionsDetected?: number
   eligibleBots?: number
 }
+interface GeminiBrainStatus {
+  state: 'OFFLINE' | 'STARTING' | 'READY' | 'THINKING' | 'ERROR'
+  model: string
+  thinkingLevel: 'low' | 'medium' | 'high'
+  sessionStartedAt?: number
+  interactionStartedAt?: number
+  previousInteractionId?: string
+  interactions: number
+  decisions: number
+  silentDecisions: number
+  generatedReactions: number
+  averageLatencyMs: number
+  lastLatencyMs?: number
+  lastError?: string
+  rebuiltSessions: number
+  rollovers: number
+  contextTokens: number
+  bootstrapChars: number
+  bootstrapInputTokens: number
+}
 interface Overview {
   channel: string
   category: string
   isLive: boolean
   twitchConnected: boolean
   streamBrain: BrainStatus
+  geminiBrain: GeminiBrainStatus
   activeBots: number
   totalBots: number
   uptimeSeconds: number
@@ -121,6 +142,19 @@ interface Usage {
   memoriesMerged: number
   memoriesSuperseded: number
   memoryRetrievals: number
+  perception: {
+    sessionDurationMinutes: number; audioSentMinutes: number; videoSentMinutes: number
+    inputTokens: number; outputTokens: number; toolCalls: number; events: number; estimatedCostUsd: number
+  }
+  brain: {
+    interactions: number; decisions: number; inputTokens: number; cachedInputTokens: number
+    outputTokens: number; thinkingTokens: number; totalTokens: number
+    averageLatencyMs: number; lastLatencyMs?: number; estimatedCostUsd: number
+  }
+  totalAi: {
+    estimatedCostUsd: number; estimatedCostPerHourUsd: number
+    eventsPerHour: number; brainDecisionsPerHour: number; messagesPerHour: number
+  }
   currentStream: {
     active: boolean
     startedAt?: number
@@ -133,6 +167,9 @@ interface Usage {
     geminiInputTokens: number
     geminiOutputTokens: number
     sentResponses: number
+    perception: Usage['perception']
+    brain: Usage['brain']
+    totalAi: Usage['totalAi']
   }
 }
 type StreamerMemoryType = 'fact' | 'preference' | 'person' | 'relationship' | 'plan' | 'promise' | 'result' | 'place' | 'trip' | 'running_joke' | 'important_event' | 'recurring_context' | 'other'
@@ -287,6 +324,9 @@ interface ReactionTrace {
   timing?: {
     detectedAt: number
     contextReadyAt?: number
+    brainStartedAt?: number
+    brainReadyAt?: number
+    brainLatencyMs?: number
     decisionAt?: number
     completedAt?: number
   }
@@ -301,6 +341,9 @@ interface ReactionTrace {
     failedAt?: number
     failureReason?: string
   }>
+  brainInteractionId?: string
+  brainPreviousInteractionId?: string
+  brainPreviousInteractionUsed?: boolean
   terminalReason?: string
 }
 type ReactionTraceMessage = NonNullable<ReactionTrace['reactions']>[number]
@@ -324,6 +367,11 @@ const overview = reactive<Overview>({
     mediaConnected: false, geminiConnected: false, geminiStable: false,
     geminiSessionActive: false, geminiSessionReason: 'application_stopped',
   },
+  geminiBrain: {
+    state: 'OFFLINE', model: 'gemini-3.7-flash', thinkingLevel: 'low', interactions: 0, decisions: 0,
+    silentDecisions: 0, generatedReactions: 0, averageLatencyMs: 0, rebuiltSessions: 0,
+    rollovers: 0, contextTokens: 0, bootstrapChars: 0, bootstrapInputTokens: 0,
+  },
   activeBots: 0, totalBots: 0, uptimeSeconds: 0,
 })
 const usage = reactive<Usage>({
@@ -333,10 +381,16 @@ const usage = reactive<Usage>({
   preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0,
   guardRejections: 0, eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0,
   memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0,
+  perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0 },
+  brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
+  totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
   currentStream: {
     active: false, durationMinutes: 0, capturedAudioMinutes: 0, capturedVideoMinutes: 0,
     geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0, geminiReconnects: 0,
     geminiInputTokens: 0, geminiOutputTokens: 0, sentResponses: 0,
+    perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0 },
+    brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
+    totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
   },
 })
 const bots = ref<Bot[]>([])
@@ -455,6 +509,14 @@ const healthItems = computed(() => [
       : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) && overview.streamBrain.lastError
         ? operatorErrorLabel(overview.streamBrain.lastError)
         : sessionReasonLabel(overview.streamBrain.geminiSessionReason),
+  },
+  {
+    label: 'Gemini Brain',
+    tone: ['READY', 'THINKING'].includes(overview.geminiBrain.state) ? 'ok' : overview.geminiBrain.state === 'ERROR' ? 'error' : 'idle',
+    status: overview.geminiBrain.state === 'READY' ? 'Готов' : overview.geminiBrain.state === 'THINKING' ? 'Принимает решение…' : overview.geminiBrain.state === 'STARTING' ? 'Загружает контекст…' : overview.geminiBrain.state === 'ERROR' ? 'Требует внимания' : 'Остановлен вместе со стримом',
+    detail: overview.geminiBrain.lastError
+      ? operatorErrorLabel(overview.geminiBrain.lastError)
+      : `${overview.geminiBrain.decisions} решений · среднее ${formatMilliseconds(overview.geminiBrain.averageLatencyMs)}`,
   },
 ])
 const refreshableUsernames = computed(() => new Set(
@@ -1038,10 +1100,11 @@ function formatSessionDuration(startedAt?: number): string {
   return startedAt ? formatDuration(Math.max(0, Math.floor((Date.now() - startedAt) / 1000))) : '—'
 }
 function stateClass(state: ConnectionState): string { return state.toLowerCase() }
-function stateLabel(state: ConnectionState | BrainState | BrainStatus['mediaState']): string {
+function stateLabel(state: ConnectionState | BrainState | BrainStatus['mediaState'] | GeminiBrainStatus['state']): string {
   return ({
     DISCONNECTED: 'Отключено', STOPPED: 'Остановлено', OFFLINE: 'Стрим офлайн',
     CONNECTING: 'Подключение', CONNECTED: 'Подключено', STREAMING: 'Медиапоток идёт',
+    STARTING: 'Запуск', READY: 'Готов', THINKING: 'Принимает решение',
     ERROR: 'Ошибка', FATAL_CONFIG_ERROR: 'Фатальная ошибка конфигурации', DISABLED: 'Выключено',
   } as Record<string, string>)[state] || state
 }
@@ -1089,7 +1152,7 @@ function closeReasonLabel(code?: number, reason?: string): string {
 function reactionTraceStageLabel(stage: ReactionTrace['stage']): string {
   return ({
     EVENT_DETECTED: 'событие найдено', CANDIDATES_PREPARED: 'кандидаты подготовлены',
-    GEMINI_SELECTED: 'Gemini выбрала', POLICY_VALIDATED: 'защита проверила', SCHEDULED: 'передано на отправку',
+    GEMINI_SELECTED: 'Brain выбрал реакцию', POLICY_VALIDATED: 'защита проверила', SCHEDULED: 'передано на отправку',
     SEND_SUCCEEDED: 'отправлено', SEND_FAILED: 'ошибка отправки', STOPPED: 'цепочка остановлена',
   })[stage]
 }
@@ -1121,7 +1184,9 @@ function traceContextDuration(trace: ReactionTrace): string {
   return elapsed(traceDetectedAt(trace), trace.timing?.contextReadyAt)
 }
 function traceGeminiDuration(trace: ReactionTrace): string {
-  return elapsed(trace.timing?.contextReadyAt ?? traceDetectedAt(trace), trace.timing?.decisionAt)
+  return trace.timing?.brainLatencyMs !== undefined
+    ? formatMilliseconds(trace.timing.brainLatencyMs)
+    : elapsed(trace.timing?.brainStartedAt ?? trace.timing?.contextReadyAt ?? traceDetectedAt(trace), trace.timing?.brainReadyAt ?? trace.timing?.decisionAt)
 }
 function traceReactionEnd(reaction: ReactionTraceMessage): number | undefined {
   return reaction.sentAt ?? reaction.failedAt
@@ -1135,10 +1200,10 @@ function traceTotalDuration(trace: ReactionTrace, reaction: ReactionTraceMessage
 function reactionTraceReasonLabel(reason?: string): string {
   if (!reason) return 'Решение ещё формируется.'
   return ({
-    gemini_selected_silence: 'Gemini решила, что для этого момента естественнее промолчать.',
-    reaction_context_stale: 'Ответ Gemini пришёл после закрытия контекста события.',
-    reaction_context_expired_before_gemini_batch: 'Gemini не успела вернуть решение до истечения контекста.',
-    gemini_disconnected_before_reaction_batch: 'Gemini отключилась до того, как вернула решение.',
+    gemini_selected_silence: 'Brain решил, что для этого момента естественнее промолчать.',
+    reaction_context_stale: 'Решение Brain пришло после закрытия контекста события.',
+    reaction_context_expired_before_gemini_batch: 'Brain не успел вернуть решение до истечения контекста.',
+    gemini_disconnected_before_reaction_batch: 'Brain остановился до того, как вернул решение.',
     all_selected_reactions_rejected: 'Все выбранные сообщения остановила защитная проверка.',
     coordinator_stopped: 'Сервис остановился до отправки сообщения.',
     account_unavailable_at_send: 'Аккаунт потерял соединение перед отправкой.',
@@ -1164,23 +1229,20 @@ function diagnosticOperationLabel(operation?: string): string {
   }
   return ({
     connect: 'подключение', audio: 'аудио', video: 'видеокадр',
-    reaction_signal: 'сигнал реакции', context_update: 'обновление контекста',
-    memory_snapshot: 'снимок памяти',
+    context_update: 'минимальный контекст восприятия',
   } as Record<string, string>)[operation] || 'неизвестная операция'
 }
 function diagnosticToolLabel(tool?: string): string {
   if (!tool) return '—'
   return ({
-    prepare_reaction_context: 'подготовка контекста реакции',
-    emit_reaction_batch: 'готовый пакет реакций',
-    record_stream_memories: 'запись памяти стрима',
+    emit_stream_event: 'значимое событие стрима',
   } as Record<string, string>)[tool] || 'неизвестный инструмент'
 }
 function kindLabel(kind: ChatMessage['kind']): string {
   return ({ viewer: 'зритель', bot: 'бот', system: 'система' })[kind]
 }
 function eventTypeLabel(type: string): string {
-  return ({ speech: 'речь', gameplay: 'игровой момент', reaction: 'реакция', funny: 'смешной момент', fail: 'ошибка', win: 'победа', loss: 'поражение', surprise: 'неожиданность', conversation: 'разговор', irl: 'вне игры', other: 'другое' } as Record<string, string>)[type] || type
+  return ({ speech: 'речь', gameplay: 'игровой момент', reaction: 'реакция', funny: 'смешной момент', fail: 'ошибка', win: 'победа', loss: 'поражение', surprise: 'неожиданность', conversation: 'разговор', greeting: 'приветствие', visual: 'визуальное событие', question: 'вопрос', direct_mention: 'прямое обращение', irl: 'вне игры', other: 'другое' } as Record<string, string>)[type] || type
 }
 function sourceLabel(source: StreamEvent['source']): string {
   return ({ 'gemini-live': 'Gemini Live', chat: 'чат', 'fallback-transcription': 'резервная транскрипция' })[source]
@@ -1397,24 +1459,45 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="activePage === 'brain'">
-          <div class="page-heading"><div><p class="eyebrow">МУЛЬТИМОДАЛЬНОЕ ПОНИМАНИЕ</p><h1>Мозг стрима</h1></div><p class="muted">Одна Gemini Live-сессия понимает медиа, выбирает персон и пишет все финальные реакции.</p></div>
+          <div class="page-heading"><div><p class="eyebrow">ДВА НЕЗАВИСИМЫХ AI-СЛОЯ</p><h1>Мозг стрима</h1></div><p class="muted">Gemini Live только видит и слышит. Stateful Gemini Brain решает, кому и что написать.</p></div>
           <section class="brain-summary">
-            <div><span>Сессия Gemini Live</span><strong>{{ stateLabel(overview.streamBrain.state) }}</strong></div>
-            <div><span>Модель</span><strong>{{ overview.streamBrain.model || '—' }}</strong></div>
-            <div><span>Сессия физически активна</span><strong>{{ overview.streamBrain.geminiSessionActive ? 'Да' : 'Нет' }}</strong></div>
-            <div><span>Причина состояния</span><strong>{{ sessionReasonLabel(overview.streamBrain.geminiSessionReason) }}</strong></div>
-            <div><span>Длительность сессии</span><strong>{{ formatSessionDuration(overview.streamBrain.sessionStartedAt) }}</strong></div>
+            <div><span>PERCEPTION · Gemini Live</span><strong>{{ stateLabel(overview.streamBrain.geminiState) }}</strong></div>
+            <div><span>Live-модель</span><strong>{{ overview.streamBrain.model || '—' }}</strong></div>
+            <div><span>BRAIN · Gemini Interactions</span><strong>{{ stateLabel(overview.geminiBrain.state) }}</strong></div>
+            <div><span>Brain-модель / thinking</span><strong>{{ overview.geminiBrain.model }} / {{ overview.geminiBrain.thinkingLevel }}</strong></div>
+            <div><span>Возраст Brain-сессии</span><strong>{{ formatSessionDuration(overview.geminiBrain.sessionStartedAt) }}</strong></div>
             <div><span>Последнее событие</span><strong>{{ formatTime(overview.streamBrain.lastEventAt) }}</strong></div>
           </section>
-          <section class="panel metric-strip"><div><span>Медиа</span><strong>→</strong></div><div><span>Gemini Live</span><strong>→</strong></div><div><span>Контекст персон</span><strong>→</strong></div><div><span>Единый пакет</span><strong>→</strong></div><div><span>Чат Twitch</span><strong>✓</strong></div></section>
+          <section class="panel metric-strip"><div><span>Twitch media</span><strong>→</strong></div><div><span>3.1 Live · восприятие</span><strong>→</strong></div><div><span>StreamEvent</span><strong>→</strong></div><div><span>3.7 Brain · решение</span><strong>→</strong></div><div><span>Policy / Twitch</span><strong>✓</strong></div></section>
+          <div class="section-heading"><div><p class="eyebrow">ТЕКУЩИЙ ЭФИР</p><h2>Расход и результат</h2></div></div>
           <section class="metric-strip">
-            <div><span>Текущий стрим</span><strong>{{ usage.currentStream.active ? `${usage.currentStream.durationMinutes.toFixed(1)} мин` : 'не активен' }}</strong></div><div><span>Захвачено аудио / видео</span><strong>{{ usage.currentStream.capturedAudioMinutes.toFixed(1) }} / {{ usage.currentStream.capturedVideoMinutes.toFixed(1) }} мин</strong></div><div><span>Отправлено Gemini аудио / видео</span><strong>{{ usage.currentStream.geminiAudioSentMinutes.toFixed(1) }} / {{ usage.currentStream.geminiVideoSentMinutes.toFixed(1) }} мин</strong></div><div><span>Токены текущего стрима</span><strong>{{ usage.currentStream.geminiInputTokens }} / {{ usage.currentStream.geminiOutputTokens }}</strong></div><div><span>Переподключения / сообщения</span><strong>{{ usage.currentStream.geminiReconnects }} / {{ usage.currentStream.sentResponses }}</strong></div>
+            <div><span>3.1 Live · длительность</span><strong>{{ usage.currentStream.perception.sessionDurationMinutes.toFixed(1) }} мин</strong></div>
+            <div><span>3.1 · аудио / видео</span><strong>{{ usage.currentStream.perception.audioSentMinutes.toFixed(1) }} / {{ usage.currentStream.perception.videoSentMinutes.toFixed(1) }} мин</strong></div>
+            <div><span>3.1 · input / output</span><strong>{{ usage.currentStream.perception.inputTokens }} / {{ usage.currentStream.perception.outputTokens }}</strong></div>
+            <div><span>3.1 · стоимость</span><strong>${{ usage.currentStream.perception.estimatedCostUsd.toFixed(4) }}</strong></div>
+          </section>
+          <section class="metric-strip">
+            <div><span>3.7 · interactions / decisions</span><strong>{{ usage.currentStream.brain.interactions }} / {{ usage.currentStream.brain.decisions }}</strong></div>
+            <div><span>3.7 · input / cached</span><strong>{{ usage.currentStream.brain.inputTokens }} / {{ usage.currentStream.brain.cachedInputTokens }}</strong></div>
+            <div><span>3.7 · output / thinking</span><strong>{{ usage.currentStream.brain.outputTokens }} / {{ usage.currentStream.brain.thinkingTokens }}</strong></div>
+            <div><span>3.7 · latency / стоимость</span><strong>{{ formatMilliseconds(usage.currentStream.brain.averageLatencyMs) }} / ${{ usage.currentStream.brain.estimatedCostUsd.toFixed(4) }}</strong></div>
           </section>
           <section class="panel metric-strip">
-            <div><span>Всего захвачено аудио / видео</span><strong>{{ usage.capturedAudioMinutes.toFixed(1) }} / {{ usage.capturedVideoMinutes.toFixed(1) }} мин</strong></div><div><span>Всего отправлено Gemini</span><strong>{{ usage.geminiAudioSentMinutes.toFixed(1) }} / {{ usage.geminiVideoSentMinutes.toFixed(1) }} мин</strong></div><div><span>Всего переподключений</span><strong>{{ usage.geminiReconnects }}</strong></div><div><span>Токены всего</span><strong>{{ usage.geminiInputTokens }} / {{ usage.geminiOutputTokens }}</strong></div><div><span>Создано / отправлено</span><strong>{{ usage.generatedResponses }} / {{ usage.sentResponses }}</strong></div>
+            <div><span>События Live</span><strong>{{ usage.currentStream.perception.events }}</strong></div>
+            <div><span>Решения Brain</span><strong>{{ overview.geminiBrain.decisions }}</strong></div>
+            <div><span>Осознанная тишина</span><strong>{{ overview.geminiBrain.silentDecisions }}</strong></div>
+            <div><span>Создано / отправлено</span><strong>{{ overview.geminiBrain.generatedReactions }} / {{ usage.currentStream.sentResponses }}</strong></div>
+            <div><span>Всего / в час</span><strong>${{ usage.currentStream.totalAi.estimatedCostUsd.toFixed(4) }} / ${{ usage.currentStream.totalAi.estimatedCostPerHourUsd.toFixed(4) }}</strong></div>
+          </section>
+          <section class="panel metric-strip">
+            <div><span>Событий / час</span><strong>{{ usage.currentStream.totalAi.eventsPerHour.toFixed(1) }}</strong></div>
+            <div><span>Решений / час</span><strong>{{ usage.currentStream.totalAi.brainDecisionsPerHour.toFixed(1) }}</strong></div>
+            <div><span>Сообщений / час</span><strong>{{ usage.currentStream.totalAi.messagesPerHour.toFixed(1) }}</strong></div>
+            <div><span>Brain context tokens</span><strong>{{ overview.geminiBrain.contextTokens }}</strong></div>
+            <div><span>Bootstrap chars / tokens</span><strong>{{ overview.geminiBrain.bootstrapChars }} / {{ overview.geminiBrain.bootstrapInputTokens }}</strong></div>
           </section>
           <section class="panel debug-context">
-            <div><h3>Диагностика Gemini Live</h3><p>Стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние соединения: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · ошибок протокола: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Последнее закрытие: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ closeReasonLabel(overview.streamBrain.lastCloseCode, overview.streamBrain.lastCloseReason) }} · возраст сессии {{ overview.streamBrain.lastSessionAgeMs !== undefined ? `${(overview.streamBrain.lastSessionAgeMs / 1000).toFixed(1)} с` : '—' }}</p><details v-if="overview.streamBrain.lastCloseReason"><summary>Техническое сообщение сервера</summary><code>{{ overview.streamBrain.lastCloseReason }}</code></details><p>Последние операции: исходящая <b>{{ diagnosticOperationLabel(overview.streamBrain.lastOutbound) }}</b> · вызов инструмента <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolCall) }}</b> · ответ инструмента <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolResponse) }}</b> · медиа <b>{{ diagnosticOperationLabel(overview.streamBrain.lastMediaInput) }}</b></p><p>Распознано устных обращений: <b>{{ overview.streamBrain.spokenMentionsDetected || 0 }}</b> · доступных ботов при последнем обращении: <b>{{ overview.streamBrain.eligibleBots ?? '—' }}</b></p></div>
+            <div><h3>Диагностика двух слоёв</h3><p>Perception стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · ошибок протокола: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Brain: <b>{{ stateLabel(overview.geminiBrain.state) }}</b> · последнее решение {{ formatMilliseconds(overview.geminiBrain.lastLatencyMs) }} · среднее {{ formatMilliseconds(overview.geminiBrain.averageLatencyMs) }} · recovery {{ overview.geminiBrain.rebuiltSessions }} · rollover {{ overview.geminiBrain.rollovers }}</p><p v-if="overview.geminiBrain.lastError">Ошибка Brain: <b>{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</b></p><p>Последнее закрытие Live: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ closeReasonLabel(overview.streamBrain.lastCloseCode, overview.streamBrain.lastCloseReason) }}</p><details v-if="overview.streamBrain.lastCloseReason"><summary>Техническое сообщение сервера</summary><code>{{ overview.streamBrain.lastCloseReason }}</code></details><p>Последние операции Live: исходящая <b>{{ diagnosticOperationLabel(overview.streamBrain.lastOutbound) }}</b> · инструмент <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolCall) }}</b> · медиа <b>{{ diagnosticOperationLabel(overview.streamBrain.lastMediaInput) }}</b></p></div>
             <pre>{{ (overview.streamBrain.outboundTrace || []).map(item => `${formatTime(item.at)} ${diagnosticOperationLabel(item.type)}${item.bytes !== undefined ? ` (${item.bytes} байт)` : ''}`).join('\n') || 'Исходящих операций пока нет.' }}</pre>
           </section>
           <div class="section-heading reaction-trace-heading">
@@ -1440,11 +1523,10 @@ onBeforeUnmount(() => {
                     <b :class="['trace-delivery-status', reaction.status.toLowerCase()]">{{ reactionTraceMessageStatusLabel(reaction.status) }}</b>
                   </div>
                   <blockquote>«{{ reaction.message }}»</blockquote>
-                  <p class="trace-link"><strong>Почему:</strong> Gemini выбрала эту реплику как реакцию именно на описанный выше момент.</p>
+                  <p class="trace-link"><strong>Почему:</strong> Brain 3.7 связал эту реплику именно с описанным выше событием и выбрал @{{ reaction.username }}.</p>
                   <div class="trace-timing-grid">
                     <div><span>Подготовка контекста</span><strong>{{ traceContextDuration(trace) }}</strong></div>
-                    <div><span>Решение Gemini</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
-                    <div><span>Искусственная пауза</span><strong class="zero-delay">{{ formatMilliseconds(reaction.artificialDelayMs) }}</strong></div>
+                    <div><span>Решение Brain 3.7</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
                     <div><span>От решения до отправки</span><strong>{{ traceDeliveryDuration(reaction) }}</strong></div>
                     <div><span>Всего от обнаружения</span><strong>{{ traceTotalDuration(trace, reaction) }}</strong></div>
                   </div>
@@ -1458,14 +1540,14 @@ onBeforeUnmount(() => {
                 <strong>{{ reactionTraceReasonLabel(trace.terminalReason) }}</strong>
                 <div class="trace-timing-grid compact">
                   <div><span>Подготовка контекста</span><strong>{{ traceContextDuration(trace) }}</strong></div>
-                  <div><span>Решение Gemini</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
-                  <div><span>Искусственная пауза</span><strong>не применялась</strong></div>
+                  <div><span>Решение Brain 3.7</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
                   <div><span>Вся цепочка</span><strong>{{ elapsed(traceDetectedAt(trace), trace.timing?.completedAt) }}</strong></div>
                 </div>
               </div>
               <details class="trace-details">
                 <summary>Технические детали цепочки</summary>
-                <p>Доступно аккаунтов: {{ trace.eligibleBots }} · передано Gemini: {{ trace.candidateCount }} · выбрано: {{ trace.geminiSelected.length }} · принято: {{ trace.policyAccepted.length }} · отправлено: {{ trace.sent.length }}</p>
+                <p>Доступно аккаунтов: {{ trace.eligibleBots }} · передано Brain: {{ trace.candidateCount }} · выбрано: {{ trace.geminiSelected.length }} · принято: {{ trace.policyAccepted.length }} · отправлено: {{ trace.sent.length }}</p>
+                <small v-if="trace.brainInteractionId">Interaction: {{ trace.brainInteractionId }} · previous использован: {{ trace.brainPreviousInteractionUsed ? 'да' : 'нет' }}</small>
                 <small v-if="trace.directTargetUnavailable.length">Прямой адресат недоступен: {{ trace.directTargetUnavailable.map(item => `@${item.username}: ${directTargetReasonLabel(item.reason)}`).join(', ') }}</small>
                 <small v-if="trace.policyRejected.length">Защитная проверка остановила: {{ trace.policyRejected.map(item => `${item.username}: ${rejectionLabel(item.reason)}`).join(', ') }}</small>
                 <small v-if="trace.sendFailed.length">Ошибка отправки: {{ trace.sendFailed.map(item => `${item.username}: ${reactionTraceReasonLabel(item.reason)}`).join(', ') }}</small>
@@ -1481,7 +1563,7 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="activePage === 'memories'">
-          <div class="page-heading"><div><p class="eyebrow">ДОЛГОСРОЧНЫЙ КОНТЕКСТ КАНАЛА</p><h1>Память стримера</h1></div><p class="muted">Общая память канала переживает эфиры и доступна Gemini один раз в корневом контексте — она не является памятью отдельных личностей.</p></div>
+          <div class="page-heading"><div><p class="eyebrow">ДОЛГОСРОЧНЫЙ КОНТЕКСТ КАНАЛА</p><h1>Память стримера</h1></div><p class="muted">PostgreSQL хранит истину между эфирами; Brain получает компактный снимок один раз при bootstrap и предлагает только важные обновления.</p></div>
 
           <section class="memory-stat-grid" aria-label="Статистика памяти стримера">
             <article><span>Всего записей</span><strong>{{ streamerMemoryStats.total }}</strong><small>канал: {{ streamerMemoryStats.channel || overview.channel || 'не выбран' }}</small></article>

@@ -9,12 +9,11 @@ import { PersonaMemory } from '../personas/persona-memory';
 import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
 import { ContextStore } from '../stream-brain/context-store';
 import { StreamEvent } from '../stream-brain/types';
+import { BrainEventInput } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
-import { REACTION_NATURALNESS_INSTRUCTIONS } from './natural-writing-policy';
 import { ReactionPolicyGuard } from './reaction-policy-guard';
 import {
   PlannedReaction,
-  PreparedReactionContext,
   ReactionBatch,
   ReactionBatchResult,
   ReactionBotCandidate,
@@ -81,122 +80,6 @@ export class ReactionCoordinator extends EventEmitter {
     this.logger = options.logger.child('DECISION');
     this.now = options.now ?? Date.now;
     this.contextTtlMs = options.contextTtlMs ?? 45_000;
-  }
-
-  async prepare(event: StreamEvent, detectedAt = this.now()): Promise<PreparedReactionContext> {
-    if (this.stopped) throw new Error('reaction_coordinator_stopped');
-    const snapshot = this.options.contextStore.snapshot();
-    this.options.memory.recordEvent(event, snapshot);
-    const allCandidates = this.options.candidates();
-    const eligibleCandidates = allCandidates
-      .filter((candidate) => candidate.enabled && candidate.connectionState === 'CONNECTED' && candidate.chatConnected);
-    const directTargets = new Set(event.directMentions.map((username) => username.toLowerCase()));
-    const candidates = directTargets.size > 0
-      ? eligibleCandidates.filter((candidate) => directTargets.has(candidate.username.toLowerCase()))
-      : eligibleCandidates;
-    const directTargetUnavailable = [...directTargets]
-      .filter((username) => !candidates.some((candidate) => candidate.username.toLowerCase() === username))
-      .map((username) => ({ username, reason: directTargetUnavailableReason(username, allCandidates) }));
-    const trace: ReactionTraceRecord = {
-      eventId: event.id,
-      timestamp: event.timestamp,
-      updatedAt: detectedAt,
-      eventType: event.type,
-      summary: event.summary,
-      stage: 'EVENT_DETECTED',
-      outcome: 'PENDING',
-      eligibleBots: eligibleCandidates.length,
-      eligibleUsernames: eligibleCandidates.map((candidate) => candidate.username),
-      candidateCount: candidates.length,
-      directMentions: [...event.directMentions],
-      directTargetUnavailable,
-      geminiSelected: [],
-      policyAccepted: [],
-      policyRejected: [],
-      scheduled: [],
-      sent: [],
-      sendFailed: [],
-      timing: { detectedAt },
-      reactions: [],
-    };
-    this.traces.set(event.id, trace);
-    this.emitTrace(trace);
-    this.logger.info('Reaction trace: event detected', {
-      eventId: event.id,
-      eligibleBots: eligibleCandidates.length,
-      candidateCount: candidates.length,
-      directTargetUnavailable,
-    });
-    const [histories, reactionExamples, globalStreamerMemories] = await Promise.all([
-      Promise.all(candidates.map((candidate) => this.options.history.recent(candidate.username))),
-      this.options.memory.retrieve(event, snapshot, this.options.retrievalLimit),
-      this.options.globalMemory.retrieve({
-        channel: snapshot.channel,
-        query: globalMemoryQuery(event, snapshot.streamContext, snapshot.recentChat),
-        entities: event.directMentions,
-        tags: [event.type, event.category ?? snapshot.category].filter((value): value is string => Boolean(value?.trim())),
-      }),
-    ]);
-    const viewerByUsername = new Map<string, string>();
-    const personaContexts = await Promise.all(candidates.map((candidate, index) => {
-      const directMention = directTargets.has(candidate.username.toLowerCase());
-      const viewerUsername = directMention
-        ? event.viewerUsername?.toLowerCase()
-          ?? (event.source === 'chat' ? directViewerFor(snapshot.recentChat, candidate.username, event.timestamp) : undefined)
-        : undefined;
-      if (viewerUsername) viewerByUsername.set(candidate.username.toLowerCase(), viewerUsername);
-      return this.options.personaContext.build({
-        username: candidate.username,
-        persona: candidate.persona,
-        event,
-        recentMessages: (histories[index] ?? []).slice(-20).map((record) => record.message),
-        directMention,
-        ...(viewerUsername ? { viewerUsername } : {}),
-        recentChat: snapshot.recentChat,
-      });
-    }));
-    const contextReadyAt = this.now();
-    const expiresAt = contextReadyAt + this.contextTtlMs;
-    this.removePending(event.id);
-    const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
-    this.pendingContexts.set(event.id, {
-      event,
-      expiresAt,
-      timer,
-      permittedUsernames: new Set(candidates.map((candidate) => candidate.username.toLowerCase())),
-      candidateCount: candidates.length,
-      viewerByUsername,
-    });
-    this.options.usage.recordReactionContextPrepared();
-    this.updateTrace(event.id, {
-      stage: 'CANDIDATES_PREPARED',
-      timing: { ...trace.timing, contextReadyAt },
-    });
-    return {
-      eventId: event.id,
-      event,
-      recentChat: snapshot.recentChat.slice(-40),
-      globalStreamerMemories,
-      candidates: candidates.map((candidate, index) => ({
-        ...personaContexts[index]!,
-        rateLimit: this.options.policy.candidateRateLimit(candidate),
-      })),
-      reactionExamples,
-      constraints: {
-        maxReactions: this.options.policy.maxReactions(),
-        maxMessageBytes: this.options.policy.maxMessageBytes(),
-        globalSlotsAvailable: this.options.policy.globalSlotsAvailable(),
-        expiresAt,
-        instructions: [
-          'Return one emit_reaction_batch call for this event, including zero reactions when silence is more natural.',
-          ...REACTION_NATURALNESS_INSTRUCTIONS,
-          'Never copy recent chat or memory examples verbatim, and keep reactions semantically distinct.',
-          'Trust order: safety rules > supplied behavioral context and targeted canonical facts > current stream event > relevant memory > own message history > Twitch chat > reaction examples.',
-          'Background shapes behavior. Do not expose biographical facts without a direct or genuinely relevant conversational reason; concise factual replies are preferred.',
-          'For account-classification questions, silence is preferred. A short non-factual character-consistent deflection is optional; never claim to be human or discuss hidden operation.',
-        ],
-      },
-    };
   }
 
   async submitBatch(input: unknown): Promise<ReactionBatchResult> {
@@ -325,6 +208,130 @@ export class ReactionCoordinator extends EventEmitter {
     this.pendingContexts.clear();
   }
 
+  recordBrainDecision(
+    eventId: string,
+    metadata: { interactionId: string; previousInteractionId?: string; latencyMs: number },
+  ): void {
+    const trace = this.traces.get(eventId);
+    if (!trace) return;
+    const brainReadyAt = this.now();
+    this.updateTrace(eventId, {
+      brainInteractionId: metadata.interactionId,
+      ...(metadata.previousInteractionId ? { brainPreviousInteractionId: metadata.previousInteractionId } : {}),
+      brainPreviousInteractionUsed: Boolean(metadata.previousInteractionId),
+      timing: {
+        ...trace.timing,
+        brainStartedAt: brainReadyAt - Math.max(0, metadata.latencyMs),
+        brainReadyAt,
+        brainLatencyMs: Math.max(0, metadata.latencyMs),
+      },
+    });
+  }
+
+  /** Builds the small delta sent to the stateful Brain. Full persona profiles live in bootstrap. */
+  async prepareBrainEvent(event: StreamEvent, chatAfter: number, emittedAt = this.now()): Promise<BrainEventInput> {
+    if (this.stopped) throw new Error('reaction_coordinator_stopped');
+    const snapshot = this.options.contextStore.snapshot();
+    this.options.memory.recordEvent(event, snapshot);
+    const allCandidates = this.options.candidates();
+    const eligibleCandidates = allCandidates
+      .filter((candidate) => candidate.enabled && candidate.connectionState === 'CONNECTED' && candidate.chatConnected);
+    const directTargets = new Set(event.directMentions.map((username) => username.toLowerCase()));
+    const candidates = directTargets.size > 0
+      ? eligibleCandidates.filter((candidate) => directTargets.has(candidate.username.toLowerCase()))
+      : eligibleCandidates;
+    const directTargetUnavailable = [...directTargets]
+      .filter((username) => !candidates.some((candidate) => candidate.username.toLowerCase() === username))
+      .map((username) => ({ username, reason: directTargetUnavailableReason(username, allCandidates) }));
+    const trace: ReactionTraceRecord = {
+      eventId: event.id,
+      timestamp: event.timestamp,
+      updatedAt: emittedAt,
+      eventType: event.type,
+      summary: event.summary,
+      stage: 'EVENT_DETECTED',
+      outcome: 'PENDING',
+      eligibleBots: eligibleCandidates.length,
+      eligibleUsernames: eligibleCandidates.map((candidate) => candidate.username),
+      candidateCount: candidates.length,
+      directMentions: [...event.directMentions],
+      directTargetUnavailable,
+      geminiSelected: [],
+      policyAccepted: [],
+      policyRejected: [],
+      scheduled: [],
+      sent: [],
+      sendFailed: [],
+      timing: { detectedAt: emittedAt },
+      reactions: [],
+    };
+    this.traces.set(event.id, trace);
+    this.emitTrace(trace);
+
+    const targetedCandidates = directTargets.size > 0 ? candidates : [];
+    const [histories, reactionExamples] = await Promise.all([
+      Promise.all(targetedCandidates.map((candidate) => this.options.history.recent(candidate.username))),
+      this.options.memory.retrieve(event, snapshot, Math.min(3, this.options.retrievalLimit)),
+    ]);
+    const viewerByUsername = new Map<string, string>();
+    const targetedPersonaContext = await Promise.all(targetedCandidates.map(async (candidate, index) => {
+      const viewerUsername = event.viewerUsername?.toLowerCase()
+        ?? (event.source === 'chat' ? directViewerFor(snapshot.recentChat, candidate.username, event.timestamp) : undefined);
+      if (viewerUsername) viewerByUsername.set(candidate.username.toLowerCase(), viewerUsername);
+      const context = await this.options.personaContext.build({
+        username: candidate.username,
+        persona: candidate.persona,
+        event,
+        recentMessages: (histories[index] ?? []).slice(-20).map((record) => record.message),
+        directMention: true,
+        ...(viewerUsername ? { viewerUsername } : {}),
+        recentChat: snapshot.recentChat,
+      });
+      return {
+        username: context.username,
+        relevantCanon: context.relevantCanon,
+        relevantMemories: context.relevantMemories,
+        recentConversation: context.recentConversation,
+        recentMessages: context.recentMessages,
+        personalResponseGuidance: context.personalResponseGuidance,
+      };
+    }));
+    const contextReadyAt = this.now();
+    const expiresAt = contextReadyAt + this.contextTtlMs;
+    this.removePending(event.id);
+    const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
+    this.pendingContexts.set(event.id, {
+      event,
+      expiresAt,
+      timer,
+      permittedUsernames: new Set(candidates.map((candidate) => candidate.username.toLowerCase())),
+      candidateCount: candidates.length,
+      viewerByUsername,
+    });
+    this.options.usage.recordReactionContextPrepared();
+    this.updateTrace(event.id, {
+      stage: 'CANDIDATES_PREPARED',
+      timing: { ...trace.timing, contextReadyAt },
+    });
+    return {
+      event,
+      availableBots: candidates.map((candidate) => candidate.username),
+      recentChatDelta: snapshot.recentChat
+        .filter((message) => message.timestamp > chatAfter)
+        .slice(-40)
+        .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
+      targetedPersonaContext,
+      reactionExamples: reactionExamples.slice(0, 3),
+      deltas: [],
+      constraints: {
+        maxReactions: this.options.policy.maxReactions(),
+        maxMessageBytes: this.options.policy.maxMessageBytes(),
+        globalSlotsAvailable: this.options.policy.globalSlotsAvailable(),
+        expiresAt,
+      },
+    };
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
     this.clearPendingContexts();
@@ -401,16 +408,6 @@ export class ReactionCoordinator extends EventEmitter {
             viewerUsername: plan.viewerUsername,
             role: 'persona',
             message: plan.message,
-          });
-        }
-        if (plan.event.importance >= 0.7) {
-          await this.options.personaMemory.remember({
-            personaId: current.persona.id,
-            type: 'stream_event',
-            summary: `Персона отреагировала на событие: ${plan.event.summary}`,
-            importance: plan.event.importance,
-            tags: [plan.event.type, plan.event.gameContext ?? ''].filter(Boolean),
-            eventId: plan.event.id,
           });
         }
       } catch (cause) {
@@ -520,24 +517,6 @@ export class ReactionCoordinator extends EventEmitter {
       reactions: trace.reactions.map((reaction) => ({ ...reaction })),
     } satisfies ReactionTraceRecord);
   }
-}
-
-function globalMemoryQuery(
-  event: StreamEvent,
-  streamContext: string,
-  recentChat: Array<{ message: string }>,
-): string {
-  return [
-    event.summary,
-    event.speech,
-    event.visualContext,
-    event.gameContext,
-    event.category,
-    streamContext,
-    ...recentChat.slice(-12).map((message) => message.message),
-  ]
-    .filter((value): value is string => Boolean(value?.trim()))
-    .join('\n');
 }
 
 function rawUsername(value: unknown, index: number): string {

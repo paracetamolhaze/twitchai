@@ -1,4 +1,5 @@
 import { ChatMessage, StreamEvent } from '../stream-brain/types';
+import { BrainPersonaSnapshot } from '../brain/types';
 import { isAccountClassificationQuestion } from '../shared/account-classification';
 import { PersonaMemory, relevanceScore, semanticTokens } from './persona-memory';
 import { PersonaRuntimeStore } from './persona-runtime-store';
@@ -14,7 +15,7 @@ import {
 export { isAccountClassificationQuestion } from '../shared/account-classification';
 
 /**
- * This is the intentionally narrow context sent to the Live model. Administrative
+ * This is the intentionally narrow targeted context sent to the stateful Brain. Administrative
  * profile fields stay on BotPersona and never cross this boundary.
  */
 export interface RelevantCanonItem {
@@ -147,6 +148,55 @@ export class PersonaContextBuilder {
     private readonly maxCanonItems = 6,
     private readonly maxMemoryItems = 6,
   ) {}
+
+  buildBrainSnapshot(username: string, persona: BotPersona): BrainPersonaSnapshot {
+    const textFilter = modelTextFilter(persona);
+    const safeText = (value: string): string => modelSafeText(value, textFilter);
+    const safeTexts = (values: string[], limit: number): string[] => modelSafeTexts(values, limit, textFilter);
+    const speechParts = [
+      `${persona.speech.averageMessageWords} слов в среднем`,
+      persona.speech.punctuationStyle,
+      persona.speech.capitalizationStyle,
+      `лексика: ${safeTexts(persona.speech.vocabulary, 8).join(', ')}`,
+      `любимые формы: ${safeTexts(persona.speech.favoriteExpressions, 4).join(', ')}`,
+      `смех: ${safeTexts(persona.speech.laughStyles, 3).join(', ')}`,
+      `примеры только как признаки стиля: ${safeTexts(persona.speech.messageExamples, 3).join(' / ')}`,
+    ].filter(Boolean);
+    return {
+      username,
+      preferredName: safeText(persona.identity.preferredName ?? persona.identity.firstName ?? persona.name),
+      shortIdentity: safeText([persona.description, persona.identity.occupation].filter(Boolean).join('; ')),
+      character: safeText([
+        persona.character.summary,
+        `черты: ${safeTexts(persona.character.traits, 6).join(', ')}`,
+        `юмор: ${persona.character.humor}`,
+        persona.behavior.styleInstructions,
+      ].join('; ')),
+      activityPattern: {
+        chatFrequency: persona.behavior.activity.chatFrequency,
+        directReplyLikelihood: persona.behavior.activity.directReplyLikelihood,
+        eventSelectivity: persona.behavior.activity.eventSelectivity,
+        preferredEventTypes: persona.behavior.activity.preferredEventTypes.slice(0, 8),
+        ignoredEventTypes: persona.behavior.activity.ignoredEventTypes.slice(0, 8),
+      },
+      speechFingerprint: safeText(speechParts.join('; ')),
+      expertise: safeTexts(persona.knowledge.expertise, 8),
+      interests: safeTexts([
+        ...persona.interests.games, ...persona.interests.music,
+        ...persona.interests.food, ...persona.interests.other,
+      ], 12),
+      relationshipToStreamer: safeText([
+        `знакомство=${persona.streamerRelationship.familiarity}`,
+        `поддержка=${persona.streamerRelationship.supportiveness}`,
+        `подколы=${persona.streamerRelationship.teasingLevel}`,
+        ...persona.streamerRelationship.recurringReferences.slice(0, 3),
+      ].join('; ')),
+      disclosureBoundaries: safeText(
+        `по умолчанию ${persona.disclosure.defaultLevel}; `
+        + Object.entries(persona.disclosure.topics).map(([topic, level]) => `${topic}=${level}`).join(', '),
+      ),
+    };
+  }
 
   async build(input: BuildPersonaContextInput): Promise<PersonaReactionContext> {
     const eventTopic = [

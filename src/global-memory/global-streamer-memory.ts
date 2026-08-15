@@ -167,12 +167,12 @@ export class GlobalStreamerMemory extends EventEmitter {
     return clone(touched);
   }
 
-  /** Handles one `record_stream_memories` function-call batch. */
-  async recordFromGemini(input: RecordStreamerMemoriesInput): Promise<StreamerMemoryRecordResult> {
-    return this.serializeSessionMutation(() => this.recordFromGeminiInternal(input));
+  /** Validates and persists durable memory proposed by the stateful Brain. */
+  async recordFromBrain(input: RecordStreamerMemoriesInput): Promise<StreamerMemoryRecordResult> {
+    return this.serializeSessionMutation(() => this.recordFromBrainInternal(input));
   }
 
-  private async recordFromGeminiInternal(input: RecordStreamerMemoriesInput): Promise<StreamerMemoryRecordResult> {
+  private async recordFromBrainInternal(input: RecordStreamerMemoriesInput): Promise<StreamerMemoryRecordResult> {
     this.options.usage.recordMemoryToolCall();
     const candidates = Array.isArray(input?.memories) ? input.memories : [];
     const rejected: StreamerMemoryRecordRejected[] = [];

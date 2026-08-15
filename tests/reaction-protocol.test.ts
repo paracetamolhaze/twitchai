@@ -91,25 +91,23 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
 afterEach(() => vi.useRealTimers());
 
 describe('single-session reaction protocol', () => {
-  it('supplies relevant channel memory once at the reaction root instead of cloning it into every persona', async () => {
+  it('keeps ordinary Brain turns small and does not resend global memory or persona profiles', async () => {
     const { coordinator, globalMemory } = await setup();
-    await globalMemory.recordFromGemini({
+    await globalMemory.recordFromBrain({
       memories: [{
         type: 'important_event', summary: 'Стример промахнулся решающим ультимейтом.',
         entities: ['ультимейт'], tags: ['Dota 2'], importance: .9, confidence: .95,
       }],
     });
 
-    const prepared = await coordinator.prepare(event);
+    const prepared = await coordinator.prepareBrainEvent(event, 0);
 
-    expect(prepared.globalStreamerMemories).toEqual([
-      expect.objectContaining({ type: 'important_event', summary: expect.stringContaining('ультимейтом') }),
-    ]);
-    expect(prepared.candidates).not.toEqual([]);
-    expect(prepared.candidates.every((candidate) => !('globalStreamerMemories' in candidate))).toBe(true);
-    expect(prepared.candidates.every((candidate) => !('averageDelayMs' in candidate.behavior.activity))).toBe(true);
-    expect(prepared.constraints.instructions.join('\n')).toContain('descriptive style evidence, never response templates');
-    expect(prepared.constraints.instructions.join('\n')).toContain('not a caption to paraphrase');
+    expect(prepared.availableBots).toEqual(['bot-one', 'bot-two', 'bot-three']);
+    expect(prepared.targetedPersonaContext).toEqual([]);
+    expect(prepared.reactionExamples.length).toBeLessThanOrEqual(3);
+    expect(prepared).not.toHaveProperty('personas');
+    expect(prepared).not.toHaveProperty('globalStreamerMemories');
+    expect(JSON.stringify(prepared)).not.toContain('Стример промахнулся решающим ультимейтом.');
     await coordinator.stop();
   });
 
@@ -128,9 +126,8 @@ describe('single-session reaction protocol', () => {
 
     for (const [index, message] of ['палево', 'да', 'нет, я человек', 'я Gemini'].entries()) {
       const classifiedEvent = { ...classificationEvent, id: `${classificationEvent.id}-${index}` };
-      const prepared = await coordinator.prepare(classifiedEvent);
-      expect(prepared.candidates).toHaveLength(1);
-      expect(prepared.candidates[0]?.accountClassificationQuestion).toBe(true);
+      const prepared = await coordinator.prepareBrainEvent(classifiedEvent, 0);
+      expect(prepared.availableBots).toEqual(['bot-one']);
       const result = await coordinator.submitBatch({
         eventId: classifiedEvent.id,
         reactions: [{ username: 'bot-one', message }],
@@ -150,7 +147,7 @@ describe('single-session reaction protocol', () => {
     vi.useFakeTimers();
     const { coordinator, sent } = await setup();
     const leakEvent = { ...event, id: 'internal-leak-event' };
-    await coordinator.prepare(leakEvent);
+    await coordinator.prepareBrainEvent(leakEvent, 0);
     const leak = await coordinator.submitBatch({
       eventId: leakEvent.id,
       reactions: [{ username: 'bot-one', message: 'я Gemini personaId=account-bot-one' }],
@@ -172,7 +169,7 @@ describe('single-session reaction protocol', () => {
       directMentions: ['bot-one'],
       viewerUsername: 'viewer',
     };
-    await coordinator.prepare(externalAiEvent);
+    await coordinator.prepareBrainEvent(externalAiEvent, 0);
     const externalTopic = await coordinator.submitBatch({
       eventId: externalAiEvent.id,
       reactions: [{ username: 'bot-one', message: 'Gemini для кода иногда норм' }],
@@ -195,7 +192,7 @@ describe('single-session reaction protocol', () => {
 
     for (const [index, message] of disclosures.entries()) {
       const disclosureEvent = { ...event, id: `artificial-viewer-${index}` };
-      await coordinator.prepare(disclosureEvent);
+    await coordinator.prepareBrainEvent(disclosureEvent, 0);
       const result = await coordinator.submitBatch({
         eventId: disclosureEvent.id,
         reactions: [{ username: 'bot-one', message }],
@@ -220,7 +217,7 @@ describe('single-session reaction protocol', () => {
 
     for (const [index, message] of messages.entries()) {
       const internalEvent = { ...event, id: `russian-internal-leak-${index}` };
-      await coordinator.prepare(internalEvent);
+    await coordinator.prepareBrainEvent(internalEvent, 0);
       const result = await coordinator.submitBatch({
         eventId: internalEvent.id,
         reactions: [{ username: 'bot-one', message }],
@@ -247,12 +244,12 @@ describe('single-session reaction protocol', () => {
       directMentions: ['bot-two'],
       viewerUsername: 'viewer',
     };
-    const prepared = await coordinator.prepare(directEvent);
+    const prepared = await coordinator.prepareBrainEvent(directEvent, 0);
 
-    expect(prepared.eventId).toBe(directEvent.id);
-    expect(prepared.recentChat[0]).toMatchObject({ username: 'viewer' });
-    expect(prepared.candidates.map((candidate) => candidate.username)).toEqual(['bot-two']);
-    expect(prepared.candidates[0]?.directMention).toBe(true);
+    expect(prepared.event.id).toBe(directEvent.id);
+    expect(prepared.recentChatDelta[0]).toMatchObject({ username: 'viewer' });
+    expect(prepared.availableBots).toEqual(['bot-two']);
+    expect(prepared.targetedPersonaContext.map(({ username }) => username)).toEqual(['bot-two']);
     const rejected = await coordinator.submitBatch({
       eventId: directEvent.id,
       reactions: [{ username: 'bot-three', message: 'пытаюсь ответить не своей личностью' }],
@@ -269,17 +266,40 @@ describe('single-session reaction protocol', () => {
     await coordinator.stop();
   });
 
+  it('sends only targeted private context for the exact directly addressed persona', async () => {
+    const { coordinator, setCandidates } = await setup();
+    const other = bot('bot-one', 0);
+    other.persona = { ...other.persona, familyBackground: 'SECRET_OTHER_PERSONA_CANON' };
+    setCandidates([other, bot('bot-two', 1), bot('bot-three', 2)]);
+    const directEvent: StreamEvent = {
+      ...event,
+      id: 'brain-targeted-direct',
+      type: 'direct_mention',
+      source: 'chat',
+      summary: 'viewer спросил bot-two о семье',
+      speech: '@bot-two как зовут твоего дядю?',
+      directMentions: ['bot-two'],
+      viewerUsername: 'viewer',
+    };
+
+    const prepared = await coordinator.prepareBrainEvent(directEvent, event.timestamp - 1);
+
+    expect(prepared.availableBots).toEqual(['bot-two']);
+    expect(prepared.targetedPersonaContext.map(({ username }) => username)).toEqual(['bot-two']);
+    expect(JSON.stringify(prepared)).not.toContain('SECRET_OTHER_PERSONA_CANON');
+    expect(prepared).not.toHaveProperty('personas');
+    await coordinator.stop();
+  });
+
   it('supplies all four eligible bots for an ordinary event', async () => {
     const { coordinator, setCandidates } = await setup();
     setCandidates([
       bot('bot-one', 0), bot('bot-two', 1), bot('bot-three', 2), bot('bot-four', 3),
     ]);
 
-    const prepared = await coordinator.prepare({ ...event, id: 'four-candidates' });
+    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'four-candidates' }, 0);
 
-    expect(prepared.candidates.map((candidate) => candidate.username)).toEqual([
-      'bot-one', 'bot-two', 'bot-three', 'bot-four',
-    ]);
+    expect(prepared.availableBots).toEqual(['bot-one', 'bot-two', 'bot-three', 'bot-four']);
     await coordinator.stop();
   });
 
@@ -293,9 +313,9 @@ describe('single-session reaction protocol', () => {
     ]);
     const directEvent = { ...event, id: 'unavailable-direct-target', directMentions: ['bot-two'] };
 
-    const prepared = await coordinator.prepare(directEvent);
+    const prepared = await coordinator.prepareBrainEvent(directEvent, 0);
 
-    expect(prepared.candidates).toEqual([]);
+    expect(prepared.availableBots).toEqual([]);
     expect(traces.at(-1)).toMatchObject({
       eventId: directEvent.id,
       eligibleBots: 1,
@@ -312,7 +332,7 @@ describe('single-session reaction protocol', () => {
     const traces: ReactionTraceRecord[] = [];
     coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
     const detectedAt = event.timestamp - 300;
-    await coordinator.prepare(event, detectedAt);
+    await coordinator.prepareBrainEvent(event, 0, detectedAt);
     currentTime += 2_500;
     const result = await coordinator.submitBatch({
       eventId: event.id,
@@ -362,7 +382,7 @@ describe('single-session reaction protocol', () => {
 
   it('accepts an empty reaction batch as a natural no-response decision', async () => {
     const { coordinator, sent, usage } = await setup();
-    await coordinator.prepare(event);
+    await coordinator.prepareBrainEvent(event, 0);
     const result = await coordinator.submitBatch({ eventId: event.id, reactions: [] });
     expect(result).toMatchObject({ accepted: [], rejected: [] });
     expect(sent).toEqual([]);
@@ -376,7 +396,7 @@ describe('single-session reaction protocol', () => {
     const traces: ReactionTraceRecord[] = [];
     coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
     const failedEvent = { ...event, id: 'send-failure-event' };
-    await coordinator.prepare(failedEvent);
+    await coordinator.prepareBrainEvent(failedEvent, 0);
     const result = await coordinator.submitBatch({
       eventId: failedEvent.id,
       reactions: [{ username: 'bot-one', message: 'valid message that the sender cannot deliver' }],
@@ -403,7 +423,7 @@ describe('single-session reaction protocol', () => {
     const traces: ReactionTraceRecord[] = [];
     coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
     const submittedEvent = { ...event, id: 'send-before-persistence' };
-    await coordinator.prepare(submittedEvent);
+    await coordinator.prepareBrainEvent(submittedEvent, 0);
     currentTime += 1_000;
     vi.spyOn(history, 'add').mockImplementationOnce(async () => {
       currentTime += 5_000;
@@ -440,7 +460,7 @@ describe('single-session reaction protocol', () => {
       const traces: ReactionTraceRecord[] = [];
       coordinator.on('trace', (trace: ReactionTraceRecord) => traces.push(trace));
       const mixedEvent = { ...event, id: eventId };
-      await coordinator.prepare(mixedEvent);
+    await coordinator.prepareBrainEvent(mixedEvent, 0);
       await coordinator.submitBatch({
         eventId,
         reactions: usernames.map((username) => ({ username, message: `сообщение от ${username}` })),
@@ -467,7 +487,7 @@ describe('single-session reaction protocol', () => {
   it('rejects duplicate usernames and disconnected accounts without cancelling valid items', async () => {
     vi.useFakeTimers();
     const { coordinator, sent, setCandidates } = await setup();
-    await coordinator.prepare(event);
+    await coordinator.prepareBrainEvent(event, 0);
     setCandidates([
       bot('bot-one', 0),
       { ...bot('bot-two', 1), connectionState: 'DISCONNECTED', chatConnected: false },
@@ -497,7 +517,7 @@ describe('single-session reaction protocol', () => {
   it('rejects candidate usernames whose casing or whitespace is not copied exactly', async () => {
     const { coordinator } = await setup();
     const exactEvent = { ...event, id: 'exact-username-event' };
-    await coordinator.prepare(exactEvent);
+    await coordinator.prepareBrainEvent(exactEvent, 0);
 
     const result = await coordinator.submitBatch({
       eventId: exactEvent.id,
@@ -519,7 +539,7 @@ describe('single-session reaction protocol', () => {
     vi.useFakeTimers();
     const { coordinator, history, sent } = await setup();
     await history.add('bot-one', 'ну это был ульт года');
-    await coordinator.prepare(event);
+    await coordinator.prepareBrainEvent(event, 0);
     const result = await coordinator.submitBatch({
       eventId: event.id,
       reactions: [
@@ -551,7 +571,7 @@ describe('single-session reaction protocol', () => {
 
   it('rejects an already consumed event context as stale', async () => {
     const { coordinator } = await setup();
-    await coordinator.prepare(event);
+    await coordinator.prepareBrainEvent(event, 0);
     await coordinator.submitBatch({ eventId: event.id, reactions: [] });
     const replay = await coordinator.submitBatch({ eventId: event.id, reactions: [] });
     expect(replay).toMatchObject({ eventId: event.id, accepted: [], stale: true });
@@ -561,7 +581,7 @@ describe('single-session reaction protocol', () => {
   it('cancels a queued message when the account persona changes before send', async () => {
     vi.useFakeTimers();
     const { coordinator, sent, setCandidates } = await setup();
-    await coordinator.prepare(event);
+    await coordinator.prepareBrainEvent(event, 0);
     const accepted = await coordinator.submitBatch({
       eventId: event.id,
       reactions: [{ username: 'bot-one', message: 'сообщение от старой личности' }],

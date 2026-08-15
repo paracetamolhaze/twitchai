@@ -41,7 +41,9 @@ export class ContextStore {
   }
 
   addEvent(event: StreamEvent): void {
-    this.events.push(event);
+    const existing = this.events.findIndex((candidate) => candidate.id === event.id);
+    if (existing >= 0) this.events[existing] = event;
+    else this.events.push(event);
     if (this.events.length > this.maxEvents) this.events.splice(0, this.events.length - this.maxEvents);
   }
 

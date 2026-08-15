@@ -1,0 +1,458 @@
+import { describe, expect, it, vi } from 'vitest';
+import {
+  BrainInteractionClient,
+  BrainInteractionRequest,
+  GeminiBrainService,
+} from '../src/brain/gemini-brain.service';
+import { BrainBootstrap, BrainDecision } from '../src/brain/types';
+import { Logger } from '../src/logger';
+import { StreamEvent } from '../src/stream-brain/types';
+import { UsageTracker } from '../src/usage/usage-tracker';
+
+const firstEvent: StreamEvent = {
+  id: 'event-1', timestamp: 1_700_000_000_000, type: 'greeting',
+  summary: 'Стример поприветствовал чат.', speech: 'всем привет',
+  importance: 0.8, confidence: 0.99, source: 'gemini-live', directMentions: [],
+};
+
+function bootstrap(): BrainBootstrap {
+  return {
+    channel: 'streamer',
+    category: 'Counter-Strike 2',
+    streamContext: 'рейтинговая игра',
+    startedAt: firstEvent.timestamp,
+    availableBots: Array.from({ length: 30 }, (_, index) => `bot-${index + 1}`),
+    personas: Array.from({ length: 30 }, (_, index) => ({
+      username: `bot-${index + 1}`,
+      preferredName: `Имя ${index + 1}`,
+      shortIdentity: `Постоянный зритель ${index + 1}`,
+      character: `Характер ${index + 1}`,
+      activityPattern: { chatFrequency: 'low', directReplyLikelihood: 0.8, eventSelectivity: 0.7 },
+      speechFingerprint: `Стиль речи ${index + 1}`,
+      expertise: ['игры'],
+      interests: ['Counter-Strike 2'],
+      relationshipToStreamer: 'знаком со стримером',
+      disclosureBoundaries: 'личное не раскрывать без прямого вопроса',
+    })),
+    globalMemories: [],
+    recentMeaningfulEvents: [],
+    recentChat: [],
+  };
+}
+
+describe('Gemini 3.7 stateful Brain', () => {
+  it('bootstraps once and chains small event turns through previous_interaction_id', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const decisions: Array<{ event: StreamEvent; decision: BrainDecision }> = [];
+    const client: BrainInteractionClient = {
+      create: vi.fn(async (request) => {
+        requests.push(structuredClone(request));
+        const sequence = requests.length;
+        return {
+          id: String.fromCharCode(64 + sequence),
+          status: 'completed',
+          outputText: request.kind === 'bootstrap'
+            ? '{"ready":true}'
+            : '{"reactions":[],"memoryUpdates":[]}',
+          usage: {
+            inputTokens: request.kind === 'bootstrap' ? 4_000 : 180,
+            cachedInputTokens: request.kind === 'bootstrap' ? 0 : 3_800,
+            outputTokens: 12,
+            thoughtTokens: 20,
+            totalTokens: request.kind === 'bootstrap' ? 4_032 : 4_012,
+          },
+        };
+      }),
+    };
+    const service = new GeminiBrainService({
+      client,
+      model: 'gemini-3.7-flash',
+      thinkingLevel: 'low',
+      bootstrap: async () => bootstrap(),
+      prepareEvent: async (event) => ({
+        event,
+        availableBots: bootstrap().availableBots,
+        recentChatDelta: [],
+        targetedPersonaContext: [],
+        reactionExamples: [],
+        deltas: [],
+        constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 },
+      }),
+      onDecision: async (event, decision) => { decisions.push({ event, decision }); },
+      usage: new UsageTracker(),
+      logger: new Logger('TEST', 'error'),
+      eventMergeWindowMs: 0,
+      contextRolloverTokens: 800_000,
+    });
+
+    await service.startStream();
+    await service.enqueueEvent(firstEvent);
+    await service.enqueueEvent({ ...firstEvent, id: 'event-2', timestamp: firstEvent.timestamp + 5_000, summary: 'Стример выиграл раунд.', type: 'win' });
+
+    expect(requests.map((request) => request.kind)).toEqual(['bootstrap', 'decision', 'decision']);
+    expect(requests.map((request) => request.previousInteractionId)).toEqual([undefined, 'A', 'B']);
+    expect(requests[0]!.maxOutputTokens).toBe(512);
+    expect(JSON.parse(requests[0]!.input)).toMatchObject({ personas: expect.arrayContaining([expect.objectContaining({ username: 'bot-1' })]) });
+    for (const request of requests.slice(1)) {
+      const payload = JSON.parse(request.input) as Record<string, unknown>;
+      expect(payload).not.toHaveProperty('personas');
+      expect(request.input).not.toContain('shortIdentity');
+    }
+    expect(decisions).toHaveLength(2);
+    expect(service.getStatus()).toMatchObject({
+      state: 'READY', interactions: 3, decisions: 2, previousInteractionId: 'C',
+    });
+  });
+
+  it('serializes simultaneous events so each turn receives the preceding interaction id', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    let releaseFirstDecision: (() => void) | undefined;
+    const firstDecisionGate = new Promise<void>((resolve) => { releaseFirstDecision = resolve; });
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        if (request.kind === 'decision' && requests.filter((item) => item.kind === 'decision').length === 1) {
+          await firstDecisionGate;
+        }
+        return {
+          id: String.fromCharCode(64 + requests.length), status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        };
+      },
+    };
+    const service = brainService(client);
+    await service.startStream();
+
+    const first = service.enqueueEvent(firstEvent);
+    const second = service.enqueueEvent({ ...firstEvent, id: 'event-2', timestamp: firstEvent.timestamp + 1 });
+    await vi.waitFor(() => expect(requests.filter((request) => request.kind === 'decision')).toHaveLength(1));
+    expect(requests).toHaveLength(2);
+    releaseFirstDecision?.();
+    await Promise.all([first, second]);
+
+    expect(requests.map((request) => request.previousInteractionId)).toEqual([undefined, 'A', 'B']);
+  });
+
+  it('rebuilds an invalid interaction chain and then continues processing the event', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const bootstrapReasons: string[] = [];
+    let rejected = false;
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        if (request.kind === 'decision' && !rejected) {
+          rejected = true;
+          throw new Error('400 invalid previous_interaction_id');
+        }
+        const id = request.kind === 'bootstrap' && requests.length > 1 ? 'B' : request.kind === 'bootstrap' ? 'A' : 'C';
+        return {
+          id, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        };
+      },
+    };
+    const decisions = vi.fn(async () => undefined);
+    const service = brainService(client, {
+      bootstrap: async (reason) => { bootstrapReasons.push(reason); return bootstrap(); },
+      onDecision: decisions,
+    });
+    await service.startStream();
+
+    await service.enqueueEvent(firstEvent);
+
+    expect(bootstrapReasons).toEqual(['stream_start', 'recovery']);
+    expect(requests.map((request) => [request.kind, request.previousInteractionId])).toEqual([
+      ['bootstrap', undefined],
+      ['decision', 'A'],
+      ['bootstrap', undefined],
+      ['decision', 'B'],
+    ]);
+    expect(decisions).toHaveBeenCalledTimes(1);
+    expect(service.getStatus()).toMatchObject({ state: 'READY', previousInteractionId: 'C', rebuiltSessions: 1 });
+  });
+
+  it('merges a short event burst into one semantic decision while direct mentions bypass the window', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        return {
+          id: `I${requests.length}`, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        };
+      },
+    };
+    const service = brainService(client, { eventMergeWindowMs: 20 });
+    await service.startStream();
+    const burst = [
+      { ...firstEvent, id: 'burst-1', type: 'gameplay' as const, summary: 'Стример промахнулся способностью.' },
+      { ...firstEvent, id: 'burst-2', type: 'reaction' as const, summary: 'Стример вскрикнул после промаха.' },
+      { ...firstEvent, id: 'burst-3', type: 'loss' as const, summary: 'Противник убил стримера.' },
+    ];
+
+    await Promise.all(burst.map((event) => service.enqueueEvent(event)));
+    expect(requests.filter((request) => request.kind === 'decision')).toHaveLength(1);
+    const merged = JSON.parse(requests.at(-1)!.input) as { event: StreamEvent; mergedEventIds: string[] };
+    expect(merged.mergedEventIds).toEqual(['burst-1', 'burst-2', 'burst-3']);
+    expect(merged.event.summary).toContain('Противник убил стримера');
+
+    const direct = service.enqueueEvent({
+      ...firstEvent, id: 'direct-1', type: 'direct_mention',
+      summary: 'Стример обратился к bot-1.', speech: 'bot-1 ты тут?', directMentions: ['bot-1'],
+    });
+    await vi.waitFor(() => expect(requests.filter((request) => request.kind === 'decision')).toHaveLength(2));
+    await direct;
+  });
+
+  it('rolls over before the next event when the reported interaction context reaches the configured limit', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const reasons: string[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        return {
+          id: `R${requests.length}`, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: {
+            inputTokens: request.kind === 'decision' ? 800 : 100,
+            cachedInputTokens: 50, outputTokens: 5, thoughtTokens: 5, totalTokens: 810,
+          },
+        };
+      },
+    };
+    const service = brainService(client, {
+      contextRolloverTokens: 750,
+      bootstrap: async (reason) => { reasons.push(reason); return bootstrap(); },
+    });
+    await service.startStream();
+    await service.enqueueEvent(firstEvent);
+    await service.enqueueEvent({ ...firstEvent, id: 'after-rollover' });
+
+    expect(reasons).toEqual(['stream_start', 'rollover']);
+    expect(requests.map(({ kind, previousInteractionId }) => [kind, previousInteractionId])).toEqual([
+      ['bootstrap', undefined], ['decision', 'R1'], ['bootstrap', undefined], ['decision', 'R3'],
+    ]);
+    expect(service.getStatus().rollovers).toBe(1);
+  });
+
+  it('queues an initial event that arrives while the one-time bootstrap is still running', async () => {
+    let releaseBootstrap: (() => void) | undefined;
+    const bootstrapGate = new Promise<void>((resolve) => { releaseBootstrap = resolve; });
+    const requests: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        if (request.kind === 'bootstrap') await bootstrapGate;
+        return {
+          id: request.kind === 'bootstrap' ? 'A' : 'B', status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        };
+      },
+    };
+    const service = brainService(client);
+
+    const starting = service.startStream();
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    const initialEvent = service.enqueueEvent(firstEvent);
+    expect(requests.filter(({ kind }) => kind === 'decision')).toHaveLength(0);
+    releaseBootstrap?.();
+    await Promise.all([starting, initialEvent]);
+
+    expect(requests.map(({ kind }) => kind)).toEqual(['bootstrap', 'decision']);
+    expect(requests[1]?.previousInteractionId).toBe('A');
+  });
+
+  it('starts a fresh Brain session during a rapid offline to live transition', async () => {
+    let releaseOldDecision: (() => void) | undefined;
+    const oldDecisionGate = new Promise<void>((resolve) => { releaseOldDecision = resolve; });
+    const requests: BrainInteractionRequest[] = [];
+    let sequence = 0;
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        const id = `I${++sequence}`;
+        if (request.kind === 'decision' && request.previousInteractionId === 'I1') await oldDecisionGate;
+        return {
+          id, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        };
+      },
+    };
+    const service = brainService(client);
+    await service.startStream();
+    const oldEvent = service.enqueueEvent(firstEvent);
+    await vi.waitFor(() => expect(requests.filter(({ kind }) => kind === 'decision')).toHaveLength(1));
+
+    const stopping = service.stopStream();
+    const restarting = service.startStream();
+    await restarting;
+    releaseOldDecision?.();
+    await Promise.all([stopping, oldEvent]);
+
+    expect(requests.filter(({ kind }) => kind === 'bootstrap')).toHaveLength(2);
+    expect(service.getStatus()).toMatchObject({ state: 'READY', previousInteractionId: 'I3' });
+  });
+
+  it('restores dynamic deltas after a failed turn and rebuilds before the next event', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    let failDecision = true;
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        if (request.kind === 'decision' && failDecision) {
+          failDecision = false;
+          throw new Error('API error after ambiguous submission');
+        }
+        return {
+          id: `I${requests.length}`, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        };
+      },
+    };
+    const reasons: string[] = [];
+    const service = brainService(client, {
+      bootstrap: async (reason) => { reasons.push(reason); return bootstrap(); },
+    });
+    await service.startStream();
+    service.queueDelta({ type: 'CATEGORY_CHANGED', summary: 'Dota 2 → IRL' });
+
+    await expect(service.enqueueEvent(firstEvent)).rejects.toThrow('API error');
+    await service.enqueueEvent({ ...firstEvent, id: 'event-after-api-error' });
+
+    const decisions = requests.filter(({ kind }) => kind === 'decision');
+    expect(reasons).toEqual(['stream_start', 'recovery']);
+    expect(decisions).toHaveLength(2);
+    expect(decisions.map(({ input }) => JSON.parse(input).deltas)).toEqual([
+      [{ type: 'CATEGORY_CHANGED', summary: 'Dota 2 → IRL' }],
+      [{ type: 'CATEGORY_CHANGED', summary: 'Dota 2 → IRL' }],
+    ]);
+  });
+
+  it('measures Brain latency from event enqueue through context preparation and API completion', async () => {
+    let now = 1_000;
+    const onDecision = vi.fn(async () => undefined);
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        if (request.kind === 'decision') now += 700;
+        return {
+          id: request.kind === 'bootstrap' ? 'A' : 'B', status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        };
+      },
+    };
+    const service = brainService(client, {
+      now: () => now,
+      prepareEvent: async (event) => {
+        now += 300;
+        return {
+          event, availableBots: bootstrap().availableBots, recentChatDelta: [],
+          targetedPersonaContext: [], reactionExamples: [], deltas: [],
+          constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 },
+        };
+      },
+      onDecision,
+    });
+    await service.startStream();
+
+    await service.enqueueEvent(firstEvent);
+
+    expect(onDecision).toHaveBeenCalledWith(firstEvent, expect.anything(), 1_000, 'B', 'A');
+    expect(service.getStatus().lastLatencyMs).toBe(1_000);
+  });
+
+  it('makes no Interactions API call for events received while the stream session is offline', async () => {
+    const client: BrainInteractionClient = { create: vi.fn() };
+    const service = brainService(client);
+
+    const result = await service.enqueueEvent(firstEvent);
+
+    expect(result).toBeUndefined();
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
+  it('forwards greeting, visual-only, and exact direct-mention events as semantic turns', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        return {
+          id: `S${requests.length}`, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 50, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        };
+      },
+    };
+    const service = brainService(client);
+    await service.startStream();
+    await service.enqueueEvent(firstEvent);
+    await service.enqueueEvent({
+      ...firstEvent, id: 'visual-only', type: 'visual', speech: undefined,
+      summary: 'Друг стримера упал со стула.', visualContext: 'В кадре человек падает со стула.',
+    });
+    await service.enqueueEvent({
+      ...firstEvent, id: 'direct', type: 'direct_mention',
+      speech: 'bot-1 ты тут?', summary: 'Стример обратился к bot-1.', directMentions: ['bot-1'],
+    });
+
+    const events = requests.filter(({ kind }) => kind === 'decision')
+      .map((request) => (JSON.parse(request.input) as { event: StreamEvent }).event);
+    expect(events.map(({ type }) => type)).toEqual(['greeting', 'visual', 'direct_mention']);
+    expect(events[1]?.speech).toBeUndefined();
+    expect(events[2]?.directMentions).toEqual(['bot-1']);
+  });
+
+  it('sends a 30-persona bootstrap once across 100 event turns instead of resending it 100 times', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        return {
+          id: `C${requests.length}`, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 150, cachedInputTokens: 4_000, outputTokens: 5, thoughtTokens: 5, totalTokens: 4_160 },
+        };
+      },
+    };
+    const service = brainService(client, { contextRolloverTokens: 900_000 });
+    await service.startStream();
+    for (let index = 0; index < 100; index += 1) {
+      await service.enqueueEvent({ ...firstEvent, id: `cost-${index}`, timestamp: firstEvent.timestamp + index });
+    }
+
+    expect(requests.filter(({ kind }) => kind === 'bootstrap')).toHaveLength(1);
+    expect(requests.filter(({ kind }) => kind === 'decision')).toHaveLength(100);
+    expect(requests[0]?.input).toContain('shortIdentity');
+    expect(requests.slice(1).every((request) => !request.input.includes('shortIdentity'))).toBe(true);
+    expect(requests.slice(1).every((request) => !request.input.includes('personas'))).toBe(true);
+  });
+});
+
+function brainService(
+  client: BrainInteractionClient,
+  overrides: Partial<ConstructorParameters<typeof GeminiBrainService>[0]> = {},
+): GeminiBrainService {
+  return new GeminiBrainService({
+    client,
+    model: 'gemini-3.7-flash',
+    thinkingLevel: 'low',
+    bootstrap: async () => bootstrap(),
+    prepareEvent: async (event) => ({
+      event, availableBots: bootstrap().availableBots, recentChatDelta: [],
+      targetedPersonaContext: [], reactionExamples: [], deltas: [],
+      constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 },
+    }),
+    onDecision: async () => undefined,
+    usage: new UsageTracker(),
+    logger: new Logger('TEST', 'error'),
+    eventMergeWindowMs: 0,
+    contextRolloverTokens: 800_000,
+    ...overrides,
+  });
+}

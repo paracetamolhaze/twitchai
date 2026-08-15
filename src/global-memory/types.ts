@@ -62,7 +62,7 @@ export interface StreamerMemory {
   dedupeKey: string;
 }
 
-/** Payload accepted from the existing Gemini Live function call. */
+/** Durable memory candidate proposed by the stateful Brain and validated by the backend. */
 export interface StreamerMemoryCandidate {
   type: StreamerMemoryType;
   summary: string;
@@ -74,7 +74,7 @@ export interface StreamerMemoryCandidate {
   occurredAt?: number | string;
   /** Absolute time, as epoch milliseconds or an ISO string. */
   expiresAt?: number | string | null;
-  /** A simpler relative expiry hint for the Live tool. */
+  /** A simpler relative expiry hint for an operator or Brain proposal. */
   expiresInHours?: number | null;
   sourceEventId?: string;
   /** Marks an existing active memory as resolved once this one is saved. */

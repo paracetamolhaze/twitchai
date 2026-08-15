@@ -56,7 +56,7 @@ describe('GlobalStreamerMemory', () => {
       initialCategory: 'Just Chatting',
       initialStreamContext: 'вечерний IRL',
     });
-    const stored = await memory.recordFromGemini({
+    const stored = await memory.recordFromBrain({
       memories: [{
         type: 'plan',
         summary: 'Стример завтра летит в Таиланд.',
@@ -94,9 +94,9 @@ describe('GlobalStreamerMemory', () => {
       confidence: 0.8,
     };
 
-    expect((await memory.recordFromGemini({ memories: [candidate] })).accepted[0]?.outcome).toBe('created');
+    expect((await memory.recordFromBrain({ memories: [candidate] })).accepted[0]?.outcome).toBe('created');
     now += 1_000;
-    const second = await memory.recordFromGemini({ memories: [candidate, {
+    const second = await memory.recordFromBrain({ memories: [candidate, {
       ...candidate,
       summary: 'Contact support@example.com for the password',
     }, {
@@ -117,11 +117,11 @@ describe('GlobalStreamerMemory', () => {
     const repository = new MemoryRepository();
     const memory = new GlobalStreamerMemory({ repository, usage: new UsageTracker(), logger: new Logger('TEST', 'error'), now: () => now });
     await memory.startOrResumeSession({ channel: 'streamer' });
-    const old = (await memory.recordFromGemini({ memories: [{
+    const old = (await memory.recordFromBrain({ memories: [{
       type: 'place', summary: 'Streamer is currently in Almaty.', entities: ['Almaty'], tags: ['location'], importance: 0.8, confidence: 0.9,
     }] })).accepted[0]?.memory;
     expect(old).toBeDefined();
-    await memory.recordFromGemini({ memories: [{
+    await memory.recordFromBrain({ memories: [{
       type: 'place', summary: 'Streamer moved to Astana.', entities: ['Astana'], tags: ['location'], importance: 0.9, confidence: 0.95,
       supersedesMemoryId: old?.id,
     }, {
@@ -139,13 +139,13 @@ describe('GlobalStreamerMemory', () => {
     const repository = new FailingBatchRepository();
     const memory = new GlobalStreamerMemory({ repository, usage: new UsageTracker(), logger: new Logger('TEST', 'error') });
     await memory.startOrResumeSession({ channel: 'streamer' });
-    const old = (await memory.recordFromGemini({ memories: [{
+    const old = (await memory.recordFromBrain({ memories: [{
       type: 'place', summary: 'Streamer is in Almaty.', entities: ['Almaty'], tags: ['location'], importance: 0.8, confidence: 0.9,
     }] })).accepted[0]?.memory;
     expect(old).toBeDefined();
 
     repository.failOnce();
-    const result = await memory.recordFromGemini({ memories: [{
+    const result = await memory.recordFromBrain({ memories: [{
       type: 'place', summary: 'Streamer is in Astana.', entities: ['Astana'], tags: ['location'], importance: 0.9, confidence: 0.9,
       supersedesMemoryId: old?.id,
     }, {
@@ -182,7 +182,7 @@ describe('GlobalStreamerMemory', () => {
     const personaMemory = new PersonaMemory(repository, { now: () => now });
     await memory.startOrResumeSession({ channel: 'streamer' });
 
-    await memory.recordFromGemini({ memories: [{
+    await memory.recordFromBrain({ memories: [{
       type: 'running_joke', summary: 'Artem still owes the streamer dinner after losing the bet.',
       entities: ['Artem'], tags: ['friend', 'irl', 'running-joke'], importance: 0.84, confidence: 0.93,
     }, {

@@ -24,6 +24,7 @@ import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/typ
 import { UsageSnapshot } from '../usage/usage-tracker';
 import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
 import type { BotEnabledResult, PersonaAssignmentResult } from '../twitch/bot-manager';
+import { GeminiBrainStatus } from '../brain/types';
 import { createDashboardAuth } from './auth';
 
 export interface HealthPayload {
@@ -31,6 +32,7 @@ export interface HealthPayload {
   twitch: boolean;
   streamBrain: boolean;
   gemini: boolean;
+  brain: boolean;
   database: boolean;
 }
 
@@ -40,6 +42,7 @@ export interface OverviewPayload {
   isLive: boolean;
   twitchConnected: boolean;
   streamBrain: StreamBrainStatus;
+  geminiBrain: GeminiBrainStatus;
   activeBots: number;
   totalBots: number;
   uptimeSeconds: number;

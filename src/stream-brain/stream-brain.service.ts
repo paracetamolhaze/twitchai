@@ -3,6 +3,7 @@ import { Logger } from '../logger';
 import { UsageTracker } from '../usage/usage-tracker';
 import { ContextStore } from './context-store';
 import { EventDetector } from './event-detector';
+import { StreamEventDeduplicator } from './event-deduplicator';
 import { StreamBrainClient } from './stream-brain.client';
 import { MediaPipeline, MediaPipelineState } from './media-pipeline';
 import { GeminiLiveDiagnostics, StreamBrainStatus, StreamEvent, StreamEventCandidate, StreamEventSource } from './types';
@@ -23,6 +24,7 @@ export interface StreamBrainServiceOptions {
   contextRefreshMs: number;
   enabled: boolean;
   model?: string;
+  eventDeduplicationWindowMs?: number;
 }
 
 export class StreamBrainService extends EventEmitter {
@@ -33,10 +35,13 @@ export class StreamBrainService extends EventEmitter {
   private geminiDesired = false;
   private lifecycleGeneration = 0;
   private geminiStart?: Promise<void>;
+  private readonly eventDeduplicator: StreamEventDeduplicator;
+  private readonly pendingEventEmissions = new Map<string, { event: StreamEvent; timer: NodeJS.Timeout }>();
 
   constructor(private readonly options: StreamBrainServiceOptions) {
     super();
-    this.logger = options.logger.child('BRAIN');
+    this.logger = options.logger.child('PERCEPTION');
+    this.eventDeduplicator = new StreamEventDeduplicator(options.eventDeduplicationWindowMs);
     this.status = {
       state: options.enabled ? 'STOPPED' : 'DISABLED',
       mediaState: 'STOPPED',
@@ -79,6 +84,7 @@ export class StreamBrainService extends EventEmitter {
     this.lifecycleGeneration += 1;
     this.stopContextUpdates();
     this.options.gemini?.stop();
+    this.clearPendingEventEmissions();
     await this.options.media?.stop();
     this.options.usage.stopStream();
     this.options.contextStore.configure({ isLive: false });
@@ -100,8 +106,16 @@ export class StreamBrainService extends EventEmitter {
     const previousState = this.status.mediaState;
     const mediaConnected = state === 'STREAMING';
     this.options.contextStore.configure({ isLive: mediaConnected });
-    if (mediaConnected && previousState !== 'STREAMING') this.options.usage.startStream();
-    if (!mediaConnected && previousState === 'STREAMING') this.options.usage.stopStream();
+    if (mediaConnected && previousState !== 'STREAMING') {
+      this.eventDeduplicator.clear();
+      this.clearPendingEventEmissions();
+      this.options.usage.startStream();
+    }
+    if (!mediaConnected && previousState === 'STREAMING') {
+      this.eventDeduplicator.clear();
+      this.clearPendingEventEmissions();
+      this.options.usage.stopStream();
+    }
 
     if (mediaConnected) {
       this.patchStatus({
@@ -208,21 +222,22 @@ export class StreamBrainService extends EventEmitter {
       this.logger.debug('Rejected invalid or low-confidence event');
       return undefined;
     }
-    this.options.contextStore.addEvent(event);
-    this.options.usage.recordEventDetected();
-    this.patchStatus({ lastEventAt: event.timestamp });
-    this.logger.info('Normalized stream event', { type: event.type, importance: event.importance, confidence: event.confidence });
-    this.emit('event', event);
+    const deduplicated = this.eventDeduplicator.accept(event);
+    this.options.contextStore.addEvent(deduplicated.event);
+    if (deduplicated.isNew) this.options.usage.recordEventDetected();
+    this.patchStatus({ lastEventAt: deduplicated.event.timestamp });
+    this.logger.info(deduplicated.isNew ? 'Normalized stream event' : 'Merged duplicate stream event', {
+      eventId: deduplicated.event.id,
+      type: deduplicated.event.type,
+      importance: deduplicated.event.importance,
+      confidence: deduplicated.event.confidence,
+    });
+    this.queueEventEmission(deduplicated);
     if (this.options.eventSink) {
-      await this.options.eventSink.saveStreamEvent(event)
-        .catch((cause: unknown) => this.logger.warn('Stream event persistence failed', { eventId: event.id, cause }));
+      await this.options.eventSink.saveStreamEvent(deduplicated.event)
+        .catch((cause: unknown) => this.logger.warn('Stream event persistence failed', { eventId: deduplicated.event.id, cause }));
     }
-    return event;
-  }
-
-  requestReaction(candidate: StreamEventCandidate): boolean {
-    if (this.status.mediaState !== 'STREAMING' || !this.geminiDesired) return false;
-    return this.options.gemini?.requestReaction(candidate) ?? false;
+    return deduplicated.event;
   }
 
   recordSpokenMention(eligibleBots: number): void {
@@ -232,11 +247,40 @@ export class StreamBrainService extends EventEmitter {
     });
   }
 
+  private queueEventEmission(result: ReturnType<StreamEventDeduplicator['accept']>): void {
+    const pending = this.pendingEventEmissions.get(result.event.id);
+    if (pending) {
+      pending.event = structuredClone(result.event);
+      return;
+    }
+    if (result.isNew && this.eventDeduplicator.settleWindowMs() === 0) {
+      this.emit('event', structuredClone(result.event));
+      return;
+    }
+    if (!result.isNew) return;
+    const entry = {
+      event: structuredClone(result.event),
+      timer: setTimeout(() => {
+        const latest = this.pendingEventEmissions.get(result.event.id);
+        if (!latest) return;
+        this.pendingEventEmissions.delete(result.event.id);
+        this.emit('event', structuredClone(latest.event));
+      }, this.eventDeduplicator.settleWindowMs()),
+    };
+    this.pendingEventEmissions.set(result.event.id, entry);
+  }
+
+  private clearPendingEventEmissions(): void {
+    for (const pending of this.pendingEventEmissions.values()) clearTimeout(pending.timer);
+    this.pendingEventEmissions.clear();
+  }
+
   async reconfigureMedia(channel: string, visionFps: number): Promise<void> {
     this.geminiDesired = false;
     this.lifecycleGeneration += 1;
     this.stopContextUpdates();
     this.options.gemini?.stop();
+    this.clearPendingEventEmissions();
     this.options.contextStore.configure({ channel });
     await this.options.media?.reconfigure(channel, visionFps);
     if (this.running && channel) this.options.media?.start();

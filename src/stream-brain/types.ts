@@ -1,14 +1,18 @@
 export const STREAM_EVENT_TYPES = [
   'speech',
+  'conversation',
+  'greeting',
   'gameplay',
+  'irl',
+  'visual',
   'reaction',
+  'question',
+  'direct_mention',
   'funny',
   'fail',
   'win',
   'loss',
   'surprise',
-  'conversation',
-  'irl',
   'other',
 ] as const;
 

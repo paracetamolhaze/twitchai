@@ -53,4 +53,50 @@ describe('UsageTracker stream and billable media counters', () => {
       },
     });
   });
+
+  it('uses exact Live modalities and Interactions cached/thinking counters for cost observability', () => {
+    const usage = new UsageTracker();
+    usage.startStream(0);
+    usage.recordGeminiLiveUsage({
+      inputTokens: 300_000,
+      outputTokens: 50_000,
+      inputByModality: [
+        { modality: 'TEXT', tokenCount: 100_000 },
+        { modality: 'AUDIO', tokenCount: 200_000 },
+      ],
+      outputByModality: [{ modality: 'TEXT', tokenCount: 50_000 }],
+    });
+    usage.recordBrainInteraction({
+      inputTokens: 1_000_000,
+      cachedInputTokens: 400_000,
+      outputTokens: 100_000,
+      thoughtTokens: 50_000,
+      totalTokens: 1_150_000,
+    }, { decision: true, latencyMs: 1_200 });
+    usage.recordEventDetected();
+    usage.recordSentResponse();
+
+    const snapshot = usage.snapshot(3_600_000);
+    expect(snapshot.perception).toMatchObject({
+      inputTokens: 300_000,
+      outputTokens: 50_000,
+      inputTokensByModality: { text: 100_000, audio: 200_000 },
+    });
+    expect(snapshot.brain).toMatchObject({
+      interactions: 1,
+      decisions: 1,
+      cachedInputTokens: 400_000,
+      thinkingTokens: 50_000,
+      averageLatencyMs: 1_200,
+    });
+    expect(snapshot.perception.estimatedCostUsd).toBeCloseTo(0.9, 8);
+    expect(snapshot.brain.estimatedCostUsd).toBeCloseTo(1.0425, 8);
+    expect(snapshot.currentStream.totalAi).toMatchObject({
+      eventsPerHour: 1,
+      brainDecisionsPerHour: 1,
+      messagesPerHour: 1,
+    });
+    expect(snapshot.currentStream.totalAi.estimatedCostUsd).toBeCloseTo(1.9425, 8);
+    expect(snapshot.currentStream.totalAi.estimatedCostPerHourUsd).toBeCloseTo(1.9425, 8);
+  });
 });

@@ -20,7 +20,6 @@ describe('StreamBrain paid-session lifecycle', () => {
       sendAudio: vi.fn(),
       sendVideo: vi.fn(),
       updateContext: vi.fn(),
-      requestReaction: vi.fn(),
       isConnected: vi.fn(() => false),
     } satisfies StreamBrainClient;
     const media = {
@@ -69,7 +68,6 @@ describe('StreamBrain paid-session lifecycle', () => {
       sendAudio: vi.fn(),
       sendVideo: vi.fn(),
       updateContext: vi.fn(),
-      requestReaction: vi.fn(),
       isConnected: vi.fn(() => true),
     } satisfies StreamBrainClient;
     const media = {
@@ -122,7 +120,6 @@ describe('StreamBrain paid-session lifecycle', () => {
       sendAudio: vi.fn(),
       sendVideo: vi.fn(),
       updateContext: vi.fn(),
-      requestReaction: vi.fn(),
       isConnected: vi.fn(() => false),
     } satisfies StreamBrainClient;
     const media = {
@@ -164,7 +161,6 @@ describe('StreamBrain paid-session lifecycle', () => {
       sendAudio: vi.fn(() => true),
       sendVideo: vi.fn(() => true),
       updateContext: vi.fn(() => true),
-      requestReaction: vi.fn(() => true),
       isConnected: vi.fn(() => false),
     } satisfies StreamBrainClient;
     const media = { start: vi.fn(), stop: vi.fn(async () => undefined) } as unknown as MediaPipeline;

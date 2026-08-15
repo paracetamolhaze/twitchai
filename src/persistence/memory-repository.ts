@@ -186,7 +186,11 @@ export class MemoryRepository implements AppRepository {
   }
   async saveReactionExample(example: ReactionExample): Promise<void> { this.examples.push(clone(example)); }
   async listReactionExamples(limit: number): Promise<ReactionExample[]> { return this.examples.slice(-limit).reverse().map(clone); }
-  async saveStreamEvent(event: StreamEvent): Promise<void> { this.events.push(clone(event)); }
+  async saveStreamEvent(event: StreamEvent): Promise<void> {
+    const index = this.events.findIndex((candidate) => candidate.id === event.id);
+    if (index >= 0) this.events[index] = clone(event);
+    else this.events.push(clone(event));
+  }
   async listStreamEvents(limit: number): Promise<StreamEvent[]> { return this.events.slice(-limit).reverse().map(clone); }
   async getSettings(): Promise<Record<string, unknown>> { return clone(this.settings); }
   async setSettings(settings: Record<string, unknown>): Promise<void> { this.settings = { ...this.settings, ...clone(settings) }; }

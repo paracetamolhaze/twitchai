@@ -291,7 +291,10 @@ export interface PersonaRuntimeState {
   lastActiveAt?: number;
 }
 
-export type PersonaMemoryType = 'stream_event' | 'conversation' | 'viewer' | 'streamer' | 'self' | 'relationship';
+export const PERSONA_MEMORY_TYPES = [
+  'stream_event', 'conversation', 'viewer', 'streamer', 'self', 'relationship',
+] as const;
+export type PersonaMemoryType = (typeof PERSONA_MEMORY_TYPES)[number];
 
 export interface PersonaMemoryItem {
   id: string;

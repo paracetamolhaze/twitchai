@@ -391,7 +391,11 @@ export class PostgresRepository implements AppRepository {
 
   async saveStreamEvent(event: StreamEvent): Promise<void> {
     await this.pool.query(
-      'INSERT INTO stream_events (id, occurred_at, type, summary, importance, confidence, payload) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      `INSERT INTO stream_events (id, occurred_at, type, summary, importance, confidence, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (id) DO UPDATE SET
+         occurred_at=EXCLUDED.occurred_at, type=EXCLUDED.type, summary=EXCLUDED.summary,
+         importance=EXCLUDED.importance, confidence=EXCLUDED.confidence, payload=EXCLUDED.payload`,
       [event.id, new Date(event.timestamp), event.type, event.summary, event.importance, event.confidence, event],
     );
   }

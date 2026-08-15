@@ -12,17 +12,24 @@ function sourceText(directory: string): string {
     .join('\n');
 }
 
-describe('single Stream Brain architecture', () => {
-  it('does not reintroduce per-bot text generation or the legacy reaction tool', () => {
+describe('two-layer perception and stateful Brain architecture', () => {
+  it('uses one Live perception client and one Interactions Brain without per-bot generation', () => {
     const source = sourceText(join(process.cwd(), 'src'));
     expect(source).not.toContain('.generateContent(');
     expect(source).not.toContain('GeminiResponseProvider');
     expect(source).not.toContain('gemini-3.1-flash-lite');
     expect(source).not.toContain('record_stream_event');
     expect(source.match(/new GeminiLiveClient\(/g)).toHaveLength(1);
-    expect(source.match(/new GoogleGenAI\(/g)).toHaveLength(1);
-    expect(readFileSync(join(process.cwd(), 'src', 'stream-brain', 'gemini-live.client.ts'), 'utf8'))
-      .toContain('record_stream_memories');
+    expect(source.match(/new GeminiBrainService\(/g)).toHaveLength(1);
+    expect(source.match(/new GoogleGenAI\(/g)).toHaveLength(2);
+    const live = readFileSync(join(process.cwd(), 'src', 'stream-brain', 'gemini-live.client.ts'), 'utf8');
+    expect(live).toContain("EMIT_STREAM_EVENT_TOOL = 'emit_stream_event'");
+    expect(live).not.toContain("'emit_reaction_batch'");
+    expect(live).not.toContain("'prepare_reaction_context'");
+    expect(live).not.toContain("'record_stream_memories'");
+    const interactions = readFileSync(join(process.cwd(), 'src', 'brain', 'google-interactions.client.ts'), 'utf8');
+    expect(interactions).toContain('ai.interactions.create');
+    expect(interactions).toContain('previous_interaction_id');
     expect(readFileSync(join(process.cwd(), 'src', 'persistence', 'run-migrations.ts'), 'utf8'))
       .toContain('005_deep_persona_generation_v3.sql');
     expect(readFileSync(join(process.cwd(), 'src', 'persistence', 'run-migrations.ts'), 'utf8'))

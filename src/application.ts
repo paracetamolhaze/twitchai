@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { ApiServer, createApiServer } from './api/server';
+import { GeminiBrainService } from './brain/gemini-brain.service';
+import { GoogleInteractionsClient } from './brain/google-interactions.client';
+import { BrainBootstrap, BrainDecision, BrainDynamicDelta, GeminiBrainStatus } from './brain/types';
 import { AppConfig, normalizeChannel } from './config';
 import { GlobalStreamerMemory } from './global-memory/global-streamer-memory';
 import { StreamerMemory } from './global-memory/types';
@@ -10,6 +13,7 @@ import { PersonaContextBuilder } from './personas/persona-context-builder';
 import { PersonaMemory } from './personas/persona-memory';
 import { PersonaRuntimeStore } from './personas/persona-runtime-store';
 import { PersonaStore } from './personas/persona-store';
+import { BotPersona } from './personas/types';
 import { AppRepository, BotAccountRecord } from './persistence/repository';
 import { MemoryRepository } from './persistence/memory-repository';
 import { PostgresRepository } from './persistence/postgres-repository';
@@ -52,10 +56,11 @@ export class Application {
   private readonly decisions: ReactionDecisionRecord[] = [];
   private readonly reactionTraces: ReactionTraceRecord[] = [];
   private botManager!: TwitchBotManager;
-  private brain!: StreamBrainService;
+  private perception!: StreamBrainService;
   private coordinator!: ReactionCoordinator;
   private api!: ApiServer;
   private gemini?: GeminiLiveClient;
+  private geminiBrain?: GeminiBrainService;
   private transcriber?: GroqWhisperFallback;
   private twitchOAuth?: TwitchOAuthService;
   private categoryTimer?: NodeJS.Timeout;
@@ -68,12 +73,15 @@ export class Application {
   private runtimeSettings: Record<string, unknown> = {};
   /** Serializes STREAMING/OFFLINE/reconfigure/heartbeat transitions. */
   private globalMemoryLifecycle: Promise<void> = Promise.resolve();
+  /** Gates initial StreamEvents until both persistent memory and Brain bootstrap are ready. */
+  private brainSessionReady: Promise<void> = Promise.resolve();
 
   private transcriptAccumulator = '';
   private transcriptTimer?: NodeJS.Timeout;
   private mediaStreaming = false;
   private streamGeneration = 0;
   private greetedStreamGeneration = 0;
+  private lastBotAvailability = new Map<string, string>();
 
   constructor(private readonly config: AppConfig) {
     this.logger = new Logger('APP', config.app.logLevel);
@@ -150,28 +158,36 @@ export class Application {
     });
 
     if (this.config.gemini.apiKey) {
+      this.geminiBrain = new GeminiBrainService({
+        client: new GoogleInteractionsClient(this.config.gemini.apiKey),
+        model: this.config.gemini.brainModel,
+        thinkingLevel: this.config.gemini.brainThinkingLevel,
+        bootstrap: (reason) => this.buildBrainBootstrap(reason),
+        prepareEvent: (event, chatAfter, emittedAt) =>
+          this.coordinator.prepareBrainEvent(event, chatAfter, emittedAt),
+        onDecision: (event, decision, latencyMs, interactionId, previousInteractionId) =>
+          this.applyBrainDecision(event, decision, latencyMs, interactionId, previousInteractionId),
+        usage: this.usage,
+        logger: this.logger,
+        eventMergeWindowMs: this.config.gemini.brainEventMergeWindowMs,
+        contextRolloverTokens: this.config.gemini.brainContextRolloverTokens,
+      });
       this.gemini = new GeminiLiveClient({
         apiKey: this.config.gemini.apiKey,
         model: this.config.gemini.liveModel,
         logger: this.logger,
         usage: this.usage,
         handlers: {
-          onRecordStreamMemories: (batch) => this.globalMemory.recordFromGemini(batch),
-          onPrepareReactionContext: async (candidate) => {
-            const detectedAt = Date.now();
-            const event = await this.brain.acceptCandidate(candidate);
-            if (!event) throw new Error('invalid_event');
-            return this.coordinator.prepare(event, detectedAt);
+          onStreamEvent: async (candidate) => {
+            const event = await this.perception.acceptCandidate(candidate);
+            return event ? { accepted: true, eventId: event.id } : { accepted: false, reason: 'invalid_event' };
           },
-          onEmitReactionBatch: (batch) => this.coordinator.submitBatch(batch),
           onTranscript: (text) => {
             this.logger.debug('Gemini input transcription received', { characters: text.length });
             this.handleSpokenTranscript(text);
           },
           onStatus: (connected, error, diagnostics) => {
-            if (!connected) this.coordinator.clearPendingContexts();
-            this.brain.onGeminiStatus(connected, error, diagnostics);
-            if (connected) void this.refreshGlobalMemorySnapshot();
+            this.perception.onGeminiStatus(connected, error, diagnostics);
           },
         },
       });
@@ -186,8 +202,7 @@ export class Application {
           const candidate: StreamEventCandidate = {
             type: 'speech', summary: `Стример сказал: ${text}`, speech: text, importance: 0.5, confidence: 0.8,
           };
-          if (this.gemini?.isConnected()) this.gemini.requestReaction(candidate);
-          else void this.brain.acceptCandidate(candidate, 'fallback-transcription');
+          void this.perception.acceptCandidate(candidate, 'fallback-transcription');
         },
       });
     }
@@ -201,18 +216,18 @@ export class Application {
           logger: this.logger,
           handlers: {
             onAudio: (pcm, durationMs) => {
-              this.brain.sendAudio(pcm, durationMs);
+              this.perception.sendAudio(pcm, durationMs);
               const useWhisper = this.config.transcription.provider === 'groq-whisper'
                 || (this.config.transcription.fallback === 'groq-whisper' && !this.gemini?.isConnected());
               if (useWhisper) this.transcriber?.acceptPcm(pcm);
             },
-            onVideo: (jpeg, durationMs) => this.brain.sendVideo(jpeg, durationMs),
-            onState: (state, error) => this.brain.onMediaState(state, error),
+            onVideo: (jpeg, durationMs) => this.perception.sendVideo(jpeg, durationMs),
+            onState: (state, error) => this.perception.onMediaState(state, error),
           },
         })
       : undefined;
 
-    this.brain = new StreamBrainService({
+    this.perception = new StreamBrainService({
       channel: this.config.twitch.channel,
       contextStore: this.contextStore,
       eventDetector: new EventDetector({ minimumConfidence: this.config.stream.confidenceThreshold }),
@@ -236,8 +251,9 @@ export class Application {
       health: () => ({
         status: this.config.database.url && this.databaseReady ? 'ok' : 'degraded',
         twitch: this.botManager.listStatuses().some((bot) => bot.chatConnected),
-        streamBrain: this.brain.getStatus().state === 'CONNECTED',
-        gemini: this.brain.getStatus().geminiConnected,
+        streamBrain: this.perception.getStatus().state === 'CONNECTED',
+        gemini: this.perception.getStatus().geminiConnected,
+        brain: ['READY', 'THINKING'].includes(this.getGeminiBrainStatus().state),
         database: Boolean(this.config.database.url && this.databaseReady),
       }),
       overview: () => {
@@ -248,7 +264,8 @@ export class Application {
           category: snapshot.category,
           isLive: snapshot.isLive,
           twitchConnected: bots.some((bot) => bot.chatConnected),
-          streamBrain: this.brain.getStatus(),
+          streamBrain: this.perception.getStatus(),
+          geminiBrain: this.getGeminiBrainStatus(),
           activeBots: bots.filter((bot) => bot.enabled && bot.chatConnected).length,
           totalBots: bots.length,
           uptimeSeconds: this.usage.snapshot().uptimeSeconds,
@@ -256,7 +273,12 @@ export class Application {
       },
       bots: () => this.botManager.listStatuses(),
       setBotEnabled: (username, enabled) => this.botManager.setEnabled(username, enabled),
-      assignBotPersona: (username, personaId) => this.botManager.assignPersona(username, personaId),
+      assignBotPersona: async (username, personaId) => {
+        const result = await this.botManager.assignPersona(username, personaId);
+        const candidate = this.botManager.candidates().find((item) => item.username === username);
+        if (result === 'updated' && candidate) this.queuePersonaSnapshot(candidate.persona);
+        return result;
+      },
       events: (limit) => this.repository.listStreamEvents(limit),
       chat: () => this.contextStore.snapshot().recentChat,
       usage: () => this.usage.snapshot(),
@@ -275,6 +297,7 @@ export class Application {
       updatePersona: async (persona) => {
         const updated = await this.personas.update(persona);
         await this.botManager.revalidatePersona(updated.id);
+        this.queuePersonaSnapshot(updated);
         return updated;
       },
       previewPersonaRegeneration: (id) => this.personas.previewRegeneration(id),
@@ -282,11 +305,13 @@ export class Application {
       regeneratePersona: async (id, previewHash) => {
         const updated = await this.personas.regenerate(id, previewHash);
         await this.botManager.revalidatePersona(updated.id);
+        this.queuePersonaSnapshot(updated);
         return updated;
       },
       regenerateAllPersonas: async (previews) => {
         const updated = await this.personas.regenerateAll(previews);
         await Promise.all(updated.map((persona) => this.botManager.revalidatePersona(persona.id)));
+        updated.forEach((persona) => this.queuePersonaSnapshot(persona));
         return updated;
       },
       deletePersona: (id) => this.personas.delete(id),
@@ -300,7 +325,6 @@ export class Application {
         const deleted = await this.globalMemory.deleteMemory(id, this.config.twitch.channel);
         if (deleted) {
           await this.emitGlobalMemorySnapshot();
-          await this.refreshGlobalMemorySnapshot();
         }
         return deleted;
       },
@@ -321,12 +345,12 @@ export class Application {
     this.wireEvents();
     await this.api.start();
     if (!this.config.app.dashboardToken) this.logger.warn('DASHBOARD_TOKEN is missing; protected dashboard API and realtime connections are unavailable');
-    await Promise.allSettled([this.brain.start(), this.botManager.start()]);
+    await Promise.allSettled([this.perception.start(), this.botManager.start()]);
     this.startCategoryMonitor();
     this.usageTimer = setInterval(() => { void this.persistUsage(); }, 60_000);
     this.healthTimer = setInterval(() => { void this.refreshDatabaseHealth(); }, 30_000);
     this.sessionHeartbeatTimer = setInterval(() => {
-      if (!this.brain.getStatus().mediaConnected) return;
+      if (!this.perception.getStatus().mediaConnected) return;
       void this.enqueueGlobalMemoryLifecycle(async () => {
         try { await this.globalMemory.touchCurrentSession(); }
         catch (cause) { this.logger.warn('Stream session heartbeat failed', { cause }); }
@@ -358,8 +382,9 @@ export class Application {
     await this.coordinator?.stop();
     await this.memory.stop();
     await this.transcriber?.flush();
+    await this.geminiBrain?.stopStream();
     await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
-    await this.brain?.stop();
+    await this.perception?.stop();
     await this.botManager?.stop();
     await this.persistUsage();
     this.databaseReady = false;
@@ -368,32 +393,64 @@ export class Application {
   }
 
   private wireEvents(): void {
-    this.brain.on('event', (event: StreamEvent) => {
+    this.perception.on('event', (event: StreamEvent) => {
+      const emittedAt = Date.now();
       this.api.emitEvent(event);
       this.api.emitOverview();
+      if (this.mediaStreaming && this.geminiBrain) {
+        const generation = this.streamGeneration;
+        this.brainSessionReady = this.brainSessionReady.catch(async () => {
+          if (!this.mediaStreaming || generation !== this.streamGeneration) return;
+          await this.enqueueGlobalMemoryLifecycle(async () => {
+            await this.startGlobalMemorySession();
+            await this.geminiBrain?.startStream();
+          });
+        });
+        void this.brainSessionReady.then(async () => {
+          if (!this.mediaStreaming || generation !== this.streamGeneration) return;
+          await this.geminiBrain?.enqueueEvent(event, emittedAt);
+        }).catch((cause: unknown) => {
+          this.logger.warn('Stream event skipped because Gemini Brain failed', { eventId: event.id, cause });
+        });
+      }
     });
-    this.brain.on('status', (status) => {
+    this.perception.on('status', (status) => {
       this.api.emitBrain(status);
       this.api.emitOverview();
     });
-    this.brain.on('media', ({ state, mediaConnected }: { state: string; mediaConnected: boolean }) => {
+    this.perception.on('media', ({ state, mediaConnected }: { state: string; mediaConnected: boolean }) => {
       if (mediaConnected) {
         if (!this.mediaStreaming) {
           this.mediaStreaming = true;
           this.streamGeneration += 1;
+          const brainStart = this.geminiBrain?.startStream() ?? Promise.resolve();
+          this.brainSessionReady = this.enqueueGlobalMemoryLifecycle(async () => {
+            await this.startGlobalMemorySession();
+            await brainStart;
+          });
+          void this.brainSessionReady.catch((cause: unknown) => {
+            this.logger.warn('Stream AI session start failed', { cause });
+          });
         }
-        void this.enqueueGlobalMemoryLifecycle(() => this.startGlobalMemorySession());
       } else {
         if (this.mediaStreaming) this.clearTranscriptAccumulator();
         this.mediaStreaming = false;
+        this.brainSessionReady = Promise.resolve();
+        this.coordinator.clearPendingContexts();
+        void this.geminiBrain?.stopStream();
         if (state === 'OFFLINE') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
         else if (state === 'ERROR') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
       }
     });
+    this.geminiBrain?.on('status', () => this.api.emitOverview());
     this.globalMemory.on('memory', ({ memory }: { memory: StreamerMemory }) => {
       this.api.emitStreamerMemory(memory);
       void this.emitGlobalMemorySnapshot();
-      void this.refreshGlobalMemorySnapshot();
+      this.queueBrainDelta({
+        type: 'MEMORY_ADDED',
+        summary: memory.summary,
+        payload: { memoryId: memory.id, memoryType: memory.type, status: memory.status },
+      });
     });
     this.coordinator.on('decision', (decision: ReactionDecisionRecord) => {
       this.decisions.push(decision);
@@ -409,12 +466,168 @@ export class Application {
     });
     this.botManager.on('status', (bots: BotAccountRecord[]) => {
       this.contextStore.configure({ botUsernames: bots.map((bot) => bot.username) });
+      for (const bot of bots) {
+        const signature = `${bot.enabled}:${bot.connectionState}:${bot.chatConnected}:${bot.personaId}`;
+        if (this.lastBotAvailability.get(bot.username) !== signature) {
+          this.lastBotAvailability.set(bot.username, signature);
+          this.queueBrainDelta({
+            type: 'BOT_STATUS_UPDATE',
+            summary: `${bot.username}: enabled=${bot.enabled}, connected=${bot.chatConnected}, state=${bot.connectionState}`,
+            payload: {
+              username: bot.username, enabled: bot.enabled, chatConnected: bot.chatConnected,
+              connectionState: bot.connectionState, personaId: bot.personaId,
+            },
+          });
+        }
+      }
       this.api.emitBots(bots);
       this.api.emitOverview();
     });
     this.botManager.on('chat', (message: ChatMessage) => {
       void this.handleChat(message).catch((cause: unknown) => this.logger.warn('Chat context handling failed', { cause }));
     });
+  }
+
+  private async buildBrainBootstrap(reason: 'stream_start' | 'recovery' | 'rollover'): Promise<BrainBootstrap> {
+    const snapshot = this.contextStore.snapshot();
+    const candidates = this.botManager.candidates();
+    const [globalMemories, recentEvents] = await Promise.all([
+      this.globalMemory.startupSnapshot(snapshot.channel, this.config.globalMemory.snapshotLimit),
+      this.repository.listStreamEvents(50),
+    ]);
+    const bootstrap: BrainBootstrap = {
+      channel: snapshot.channel,
+      category: snapshot.category,
+      streamContext: snapshot.streamContext,
+      startedAt: this.usage.snapshot().currentStream.startedAt ?? Date.now(),
+      availableBots: candidates
+        .filter((candidate) => candidate.enabled && candidate.connectionState === 'CONNECTED' && candidate.chatConnected)
+        .map((candidate) => candidate.username),
+      personas: candidates.map((candidate) => this.personaContext.buildBrainSnapshot(candidate.username, candidate.persona)),
+      globalMemories: globalMemories.map((memory) => ({
+        type: memory.type,
+        summary: memory.summary,
+        importance: memory.importance,
+        confidence: memory.confidence,
+        entities: memory.entities,
+      })),
+      recentMeaningfulEvents: recentEvents
+        .filter((event) => event.importance >= 0.6)
+        .slice(0, 25)
+        .reverse()
+        .map(({ id, timestamp, type, summary, importance }) => ({ id, timestamp, type, summary, importance })),
+      recentChat: snapshot.recentChat.slice(-40)
+        .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
+    };
+    this.logger.info('Gemini Brain bootstrap prepared', {
+      reason,
+      personas: bootstrap.personas.length,
+      availableBots: bootstrap.availableBots.length,
+      globalMemories: bootstrap.globalMemories.length,
+      recentEvents: bootstrap.recentMeaningfulEvents.length,
+      characters: JSON.stringify(bootstrap).length,
+    });
+    return bootstrap;
+  }
+
+  private async applyBrainDecision(
+    event: StreamEvent,
+    decision: BrainDecision,
+    latencyMs: number,
+    interactionId: string,
+    previousInteractionId: string,
+  ): Promise<void> {
+    this.coordinator.recordBrainDecision(event.id, { interactionId, previousInteractionId, latencyMs });
+    await this.coordinator.submitBatch({
+      eventId: event.id,
+      reactions: decision.reactions.map(({ username, message }) => ({ username, message })),
+    });
+    if (decision.memoryUpdates.length > 0) {
+      void this.persistBrainMemoryUpdates(event, decision).catch((cause: unknown) => {
+        this.logger.warn('Brain memory updates failed after decision', { eventId: event.id, cause });
+      });
+    }
+  }
+
+  private async persistBrainMemoryUpdates(event: StreamEvent, decision: BrainDecision): Promise<void> {
+    const globalUpdates = decision.memoryUpdates.filter((update) => update.scope === 'global');
+    if (globalUpdates.length > 0) {
+      const result = await this.globalMemory.recordFromBrain({
+        memories: globalUpdates.map((update) => ({
+          type: update.type,
+          summary: update.summary,
+          importance: update.importance,
+          confidence: update.confidence,
+          entities: update.entities ?? [],
+          tags: update.tags ?? [],
+          sourceEventId: event.id,
+          occurredAt: event.timestamp,
+        })),
+      });
+      if (result.rejected.length > 0) {
+        this.logger.warn('Brain global memory proposals rejected', {
+          eventId: event.id,
+          reasons: result.rejected.map(({ reason }) => reason),
+        });
+      }
+    }
+
+    const candidates = new Map(this.botManager.candidates().map((candidate) => [candidate.username, candidate]));
+    for (const update of decision.memoryUpdates) {
+      if (update.scope !== 'persona') continue;
+      const candidate = candidates.get(update.username);
+      if (!candidate || update.confidence < 0.5) {
+        this.logger.warn('Brain persona memory proposal rejected', {
+          eventId: event.id, username: update.username, reason: candidate ? 'low_confidence' : 'unknown_candidate',
+        });
+        continue;
+      }
+      const summary = update.summary.replace(/\s+/g, ' ').trim();
+      const existing = await this.personaMemory.list(candidate.persona.id, 200);
+      if (existing.some((memory) => memory.summary.toLocaleLowerCase() === summary.toLocaleLowerCase())) continue;
+      await this.personaMemory.remember({
+        personaId: candidate.persona.id,
+        type: update.type,
+        summary,
+        importance: update.importance,
+        tags: update.tags ?? [event.type],
+        ...(update.viewerUsername ? { viewerUsername: update.viewerUsername } : {}),
+        eventId: event.id,
+      });
+    }
+  }
+
+  private queueBrainDelta(delta: BrainDynamicDelta): void {
+    if (!this.mediaStreaming) return;
+    this.geminiBrain?.queueDelta(delta);
+  }
+
+  private queuePersonaSnapshot(persona: BotPersona): void {
+    this.botManager.candidates()
+      .filter((candidate) => candidate.persona.id === persona.id)
+      .forEach((candidate) => this.queueBrainDelta({
+        type: 'PERSONA_UPDATED',
+        summary: `Профиль ${candidate.username} обновлён.`,
+        payload: { persona: this.personaContext.buildBrainSnapshot(candidate.username, persona) },
+      }));
+  }
+
+  private getGeminiBrainStatus(): GeminiBrainStatus {
+    return this.geminiBrain?.getStatus() ?? {
+      state: 'OFFLINE',
+      model: this.config.gemini.brainModel,
+      thinkingLevel: this.config.gemini.brainThinkingLevel,
+      interactions: 0,
+      decisions: 0,
+      silentDecisions: 0,
+      generatedReactions: 0,
+      averageLatencyMs: 0,
+      rebuiltSessions: 0,
+      rollovers: 0,
+      contextTokens: 0,
+      bootstrapChars: 0,
+      bootstrapInputTokens: 0,
+    };
   }
 
   private getEligibleBotAccounts(): BotAccountRecord[] {
@@ -433,7 +646,7 @@ export class Application {
   }
 
   private processAccumulatedTranscript(text: string): void {
-    if (!this.mediaStreaming || !this.brain.getStatus().geminiConnected) return;
+    if (!this.mediaStreaming || !this.perception.getStatus().geminiConnected) return;
     const eligible = this.getEligibleBotAccounts();
     const candidates = this.botManager.listStatuses().map(bot => {
       const persona = this.personas.getOptional(bot.personaId);
@@ -446,8 +659,9 @@ export class Application {
     );
     if (!signal) return;
     if (signal.kind === 'greeting') this.greetedStreamGeneration = this.streamGeneration;
-    if (signal.kind === 'direct_mention') this.brain.recordSpokenMention(eligible.length);
-    const queued = this.brain.requestReaction(signal.candidate);
+    if (signal.kind === 'direct_mention') this.perception.recordSpokenMention(eligible.length);
+    const queued = this.mediaStreaming;
+    if (queued) void this.perception.acceptCandidate(signal.candidate);
     this.logger.info('Spoken reaction signal detected', {
       kind: signal.kind,
       directMentions: signal.candidate.directMentions,
@@ -512,7 +726,7 @@ export class Application {
         });
       }
     }));
-    this.brain.requestReaction({
+    await this.perception.acceptCandidate({
       timestamp: message.timestamp,
       type: 'conversation',
       summary: viewerConversationSummary(
@@ -526,7 +740,7 @@ export class Application {
       confidence: 1,
       directMentions: targets.map(({ username }) => username),
       viewerUsername: message.username.toLowerCase(),
-    });
+    }, 'chat');
   }
 
   private async previewPersonaContext(personaId: string, query: string, requestedUsername?: string) {
@@ -574,7 +788,14 @@ export class Application {
         // Helix enriches category metadata only. MediaPipeline STREAMING/OFFLINE is the
         // sole lifecycle authority for isLive and the Gemini Live session.
         this.contextStore.configure({ category: info.category });
-        if (previous.category !== info.category) this.logger.info('Twitch category updated', { category: info.category || 'offline' });
+        if (previous.category !== info.category) {
+          this.logger.info('Twitch category updated', { category: info.category || 'offline' });
+          this.queueBrainDelta({
+            type: 'CATEGORY_CHANGED',
+            summary: `${previous.category || 'без категории'} → ${info.category || 'без категории'}`,
+            payload: { previousCategory: previous.category, category: info.category },
+          });
+        }
         this.logger.debug('Twitch Helix liveness observed (informational only)', { helixLive: info.isLive });
         this.api.emitOverview();
       } catch (cause) {
@@ -599,6 +820,7 @@ export class Application {
     if (typeof settings.streamContext === 'string') {
       this.contextStore.configure({ streamContext: settings.streamContext });
       persisted.streamContext = settings.streamContext;
+      this.queueBrainDelta({ type: 'CONTEXT_UPDATED', summary: settings.streamContext.slice(0, 500) });
     }
     const nextChannel = typeof settings.channel === 'string' ? normalizeChannel(settings.channel) : this.config.twitch.channel;
     const nextVisionFps = typeof settings.visionFps === 'number' ? settings.visionFps : this.config.stream.visionFps;
@@ -609,7 +831,7 @@ export class Application {
       this.config.twitch.channel = nextChannel;
       this.config.stream.visionFps = nextVisionFps;
       this.contextStore.configure({ channel: nextChannel });
-      await this.brain.reconfigureMedia(nextChannel, nextVisionFps);
+      await this.perception.reconfigureMedia(nextChannel, nextVisionFps);
       if (channelChanged) {
         await this.botManager.reconfigureChannel(nextChannel);
         this.startCategoryMonitor();
@@ -631,7 +853,6 @@ export class Application {
         ...(snapshot.category ? { initialCategory: snapshot.category } : {}),
         ...(snapshot.streamContext ? { initialStreamContext: snapshot.streamContext } : {}),
       });
-      await this.refreshGlobalMemorySnapshot();
     } catch (cause) {
       this.logger.warn('Stream session start failed', { cause });
     }
@@ -646,19 +867,6 @@ export class Application {
     const queued = this.globalMemoryLifecycle.then(operation, operation);
     this.globalMemoryLifecycle = queued.catch(() => undefined);
     return queued;
-  }
-
-  private async refreshGlobalMemorySnapshot(): Promise<void> {
-    if (!this.gemini || !this.config.twitch.channel || !this.mediaStreaming || !this.brain?.getStatus().geminiConnected) return;
-    try {
-      const memories = await this.globalMemory.startupSnapshot(
-        this.config.twitch.channel,
-        this.config.globalMemory.snapshotLimit,
-      );
-      this.gemini.updateGlobalMemorySnapshot(memories);
-    } catch (cause) {
-      this.logger.warn('Global memory snapshot refresh failed', { cause });
-    }
   }
 
   private async emitGlobalMemorySnapshot(): Promise<void> {
