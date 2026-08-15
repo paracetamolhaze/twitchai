@@ -65,6 +65,28 @@ describe('Gemini Live perception protocol', () => {
     client.stop();
   });
 
+  it('reaches READY when the SDK delivers setupComplete before connect() resolves', async () => {
+    // @google/genai's real Live.connect() queues incoming messages until its own internal
+    // setupComplete promise settles, then flushes them to callbacks.onmessage() BEFORE the
+    // connect() promise itself resolves (dist/node/index.mjs, class Live#connect). That means
+    // handleMessage() can run while GeminiLiveClient's state is still CONNECTING, not the
+    // SETUP_PENDING the naive mocks below assume. This test reproduces that exact ordering.
+    let parameters: LiveConnectParameters | undefined;
+    const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({
+      connect: async (value) => {
+        parameters = value;
+        value.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+        return session;
+      },
+    });
+    await client.start();
+    expect(parameters).toBeDefined();
+    expect(client.isConnected()).toBe(true);
+    expect(client.getDiagnostics()).toMatchObject({ state: 'CONNECTED', stable: false, sessionActive: true });
+    client.stop();
+  });
+
   it('returns an event error without dropping a healthy Live session', async () => {
     const sent: LiveSendToolResponseParameters[] = [];
     let parameters: LiveConnectParameters | undefined;

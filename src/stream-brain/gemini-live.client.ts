@@ -169,7 +169,7 @@ export class GeminiLiveClient implements StreamBrainClient {
     this.stable = false;
     this.lastError = undefined;
     try { session?.close(); } catch { /* the socket may already be closed */ }
-    this.state = 'STOPPED';
+    this.setState('STOPPED');
     this.notifyStatus();
   }
 
@@ -206,7 +206,7 @@ export class GeminiLiveClient implements StreamBrainClient {
 
   private async connect(generation: number): Promise<void> {
     if (!this.desiredRunning || generation !== this.generation || this.connectPromise || this.session) return this.connectPromise;
-    this.state = 'CONNECTING';
+    this.setState('CONNECTING');
     this.stable = false;
     this.notifyStatus();
     const connectionId = ++this.connectionSequence;
@@ -259,10 +259,25 @@ export class GeminiLiveClient implements StreamBrainClient {
         return;
       }
       this.session = session;
-      this.state = 'SETUP_PENDING';
       this.sessionStartedAt = Date.now();
-      this.notifyStatus();
-      this.logger.info('Gemini Live connected, awaiting setup', { model: this.options.model, resumed: Boolean(this.resumptionHandle) });
+      // @google/genai's Live.connect() only resolves after it has already received the
+      // setupComplete message internally and dispatched it to callbacks.onmessage (it queues
+      // messages until its own setup promise settles, then flushes them before returning), so
+      // handleMessage may have already moved state to READY by the time we get here. Only move
+      // to SETUP_PENDING when that has not happened yet, otherwise we would stomp READY back to
+      // SETUP_PENDING right after reaching it and hang forever, since the server sends that
+      // message only once per session.
+      if (this.state === 'READY') {
+        // getDiagnostics().sessionActive reads Boolean(this.session), which just flipped to true;
+        // notify again so status consumers (dashboard) don't keep the stale pre-session snapshot
+        // from handleMessage's earlier notifyStatus() call for up to a full stability window.
+        this.notifyStatus();
+        this.logger.info('Gemini Live session object attached after setup had already completed', { model: this.options.model, connectionId });
+      } else {
+        this.setState('SETUP_PENDING');
+        this.notifyStatus();
+        this.logger.info('Gemini Live connected, awaiting setup', { model: this.options.model, resumed: Boolean(this.resumptionHandle) });
+      }
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       this.logger.error('Gemini Live connection failed', { cause });
@@ -272,8 +287,14 @@ export class GeminiLiveClient implements StreamBrainClient {
 
   private handleMessage(message: LiveServerMessage & { setupComplete?: unknown }, connectionId: number): void {
     if (connectionId !== this.activeConnectionId || !this.desiredRunning) return;
-    if (this.state === 'SETUP_PENDING' && message.setupComplete !== undefined) {
-      this.state = 'READY';
+    if (message.setupComplete !== undefined) {
+      this.logger.info('Gemini Live setupComplete received', { connectionId, alreadyReady: this.state === 'READY' });
+    }
+    // Guard on "not already READY" rather than "exactly SETUP_PENDING": the SDK can deliver this
+    // message synchronously while openSession() is still awaiting connect(), i.e. while state is
+    // still CONNECTING (see the comment in openSession).
+    if (message.setupComplete !== undefined && this.state !== 'READY') {
+      this.setState('READY');
       this.lastError = undefined;
       this.backoff.reset();
       this.contextDirty = Boolean(this.lastContext);
@@ -418,7 +439,7 @@ export class GeminiLiveClient implements StreamBrainClient {
     this.lastCloseWasClean = details.wasClean;
     this.lastSessionAgeMs = sessionAgeMs;
     const circuitOpen = protocolError && this.protocolErrorTimes.length >= (this.options.protocolErrorLimit ?? 3);
-    this.state = circuitOpen ? 'FATAL_CONFIG_ERROR' : 'ERROR';
+    this.setState(circuitOpen ? 'FATAL_CONFIG_ERROR' : 'ERROR');
     if (circuitOpen) this.desiredRunning = false;
 
     this.logger.warn('Gemini disconnected', {
@@ -451,7 +472,7 @@ export class GeminiLiveClient implements StreamBrainClient {
       this.reconnectTimer = undefined;
       if (!this.desiredRunning || generation !== this.generation) return;
       this.options.usage.recordGeminiReconnect();
-      this.state = 'DISCONNECTED';
+      this.setState('DISCONNECTED');
       void this.connect(generation);
     }, delay);
   }
@@ -485,6 +506,13 @@ export class GeminiLiveClient implements StreamBrainClient {
     if (!this.session) return;
     this.traceOperation(type, Buffer.byteLength(text, 'utf8'));
     this.session.sendRealtimeInput({ text });
+  }
+
+  private setState(next: InternalState): void {
+    const previous = this.state;
+    if (previous === next) return;
+    this.state = next;
+    this.logger.info('Gemini Live state transition', { from: previous, to: next });
   }
 
   private canSendRealtime(): boolean {

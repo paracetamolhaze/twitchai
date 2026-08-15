@@ -39,6 +39,13 @@ import { detectSpokenReactionSignal } from './shared/bot-mention-matcher';
 
 const TWITCH_OAUTH_REFRESH_INTERVAL_MS = 60_000;
 const TWITCH_OAUTH_REFRESH_LEAD_MS = 5 * 60_000;
+/**
+ * How long a MediaPipeline drop (streamlink/ffmpeg process restart, brief CDN hiccup) is treated
+ * as a transient flap rather than the real end of the Twitch stream. Keeps the paid Brain session
+ * (previousInteractionId) and the global-memory session alive across a short blip instead of
+ * tearing down and re-bootstrapping 30 personas + memory on every reconnect.
+ */
+const MEDIA_OFFLINE_GRACE_MS = 20_000;
 
 export class Application {
   private readonly logger: Logger;
@@ -79,6 +86,8 @@ export class Application {
   private transcriptAccumulator = '';
   private transcriptTimer?: NodeJS.Timeout;
   private mediaStreaming = false;
+  private mediaOfflineGraceTimer?: NodeJS.Timeout;
+  private mediaOfflineGraceState?: string;
   private streamGeneration = 0;
   private greetedStreamGeneration = 0;
   private lastBotAvailability = new Map<string, string>();
@@ -372,12 +381,15 @@ export class Application {
     if (this.healthTimer) clearInterval(this.healthTimer);
     if (this.oauthRefreshTimer) clearInterval(this.oauthRefreshTimer);
     if (this.sessionHeartbeatTimer) clearInterval(this.sessionHeartbeatTimer);
+    if (this.mediaOfflineGraceTimer) clearTimeout(this.mediaOfflineGraceTimer);
     this.clearTranscriptAccumulator();
     this.categoryTimer = undefined;
     this.usageTimer = undefined;
     this.healthTimer = undefined;
     this.oauthRefreshTimer = undefined;
     this.sessionHeartbeatTimer = undefined;
+    this.mediaOfflineGraceTimer = undefined;
+    this.mediaOfflineGraceState = undefined;
     await this.api?.stop();
     await this.coordinator?.stop();
     await this.memory.stop();
@@ -420,6 +432,14 @@ export class Application {
     });
     this.perception.on('media', ({ state, mediaConnected }: { state: string; mediaConnected: boolean }) => {
       if (mediaConnected) {
+        if (this.mediaOfflineGraceTimer) {
+          clearTimeout(this.mediaOfflineGraceTimer);
+          this.mediaOfflineGraceTimer = undefined;
+          this.mediaOfflineGraceState = undefined;
+          this.logger.info('Media recovered within grace period; kept Brain session and bootstrap', {
+            streamGeneration: this.streamGeneration,
+          });
+        }
         if (!this.mediaStreaming) {
           this.mediaStreaming = true;
           this.streamGeneration += 1;
@@ -433,13 +453,25 @@ export class Application {
           });
         }
       } else {
-        if (this.mediaStreaming) this.clearTranscriptAccumulator();
-        this.mediaStreaming = false;
-        this.brainSessionReady = Promise.resolve();
-        this.coordinator.clearPendingContexts();
-        void this.geminiBrain?.stopStream();
-        if (state === 'OFFLINE') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
-        else if (state === 'ERROR') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
+        // A single streamlink/ffmpeg restart or short CDN hiccup reports OFFLINE/ERROR/CONNECTING
+        // here too. Don't tear down the paid Brain session (and re-bootstrap 30 personas + global
+        // memory) for a blip that recovers on its own; only commit to "stream ended" after it
+        // stays down for MEDIA_OFFLINE_GRACE_MS.
+        if (!this.mediaStreaming) return;
+        this.mediaOfflineGraceState = state;
+        if (this.mediaOfflineGraceTimer) return;
+        this.mediaOfflineGraceTimer = setTimeout(() => {
+          this.mediaOfflineGraceTimer = undefined;
+          const finalState = this.mediaOfflineGraceState;
+          this.mediaOfflineGraceState = undefined;
+          this.clearTranscriptAccumulator();
+          this.mediaStreaming = false;
+          this.brainSessionReady = Promise.resolve();
+          this.coordinator.clearPendingContexts();
+          void this.geminiBrain?.stopStream();
+          if (finalState === 'OFFLINE') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
+          else if (finalState === 'ERROR') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
+        }, MEDIA_OFFLINE_GRACE_MS);
       }
     });
     this.geminiBrain?.on('status', () => this.api.emitOverview());
