@@ -361,7 +361,7 @@ describe('PersonaDriveService', () => {
     });
   });
 
-  it('builds a compact per-candidate input: a persona profile, runtime state, recalled memories, and recent own messages — never the full targeted context', async () => {
+  it('builds a per-candidate input of changed state only — no persona profile, which the bootstrap already put in the same interaction chain', async () => {
     vi.useFakeTimers();
     let seen: BrainDriveOpportunityInput | undefined;
     const { service } = await harness({
@@ -375,12 +375,15 @@ describe('PersonaDriveService', () => {
     const candidate = seen!.candidates[0]!;
     expect(candidate).toMatchObject({
       username: expect.any(String),
-      profile: expect.objectContaining({ username: expect.any(String) }),
       mood: expect.any(String),
       engagement: expect.any(Number),
       recalledMemories: expect.any(Array),
       recentOwnMessages: expect.any(Array),
     });
+    // The profile is deliberately absent: resending it per candidate per drive call duplicated
+    // context the bootstrap already established in this same previous_interaction_id chain.
+    expect(candidate).not.toHaveProperty('profile');
+    expect(JSON.stringify(seen)).not.toContain('speechFingerprint');
     service.stop();
   });
 });

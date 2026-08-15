@@ -220,7 +220,6 @@ export class Application {
         contextStore: this.contextStore,
         personaMemory: this.personaMemory,
         personaRuntime: this.personaRuntime,
-        personaContext: this.personaContext,
         history: this.history,
         evaluateOpportunity: (input) => this.geminiBrain!.evaluateDriveOpportunity(input),
         prepareCandidates: (usernames) => this.coordinator.prepareAutonomousCandidates(usernames),

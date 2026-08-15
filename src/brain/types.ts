@@ -5,11 +5,22 @@ import { ChatMessage, StreamEvent } from '../stream-brain/types';
 
 export type BrainThinkingLevel = 'low' | 'medium' | 'high';
 
+/**
+ * The permanent "who this character is" record, sent once per session in the bootstrap and then
+ * carried by the previous_interaction_id chain — event and drive payloads never resend it.
+ *
+ * It deliberately carries the character's negative space (flaws, weakTopics, unknownTopics,
+ * avoidedExpressions) alongside the positive one: a profile listing only what someone is good at
+ * produces a voice that answers everything competently, which is the main way these read as
+ * machine-written rather than as a specific person.
+ */
 export interface BrainPersonaSnapshot {
   username: string;
   preferredName: string;
   shortIdentity: string;
   character: string;
+  /** Character's own weaknesses and rough edges — the model should let these show, not smooth them over. */
+  flaws: string[];
   activityPattern: {
     chatFrequency: 'very-low' | 'low' | 'medium' | 'high';
     directReplyLikelihood: number;
@@ -19,6 +30,16 @@ export interface BrainPersonaSnapshot {
   };
   speechFingerprint: string;
   expertise: string[];
+  /** Topics this character knows only shallowly — hedge or defer instead of sounding authoritative. */
+  weakTopics: string[];
+  /** Topics this character simply does not know — say so plainly or stay silent, never improvise expertise. */
+  unknownTopics: string[];
+  /** Phrases this specific character would never use, even when they would fit the moment. */
+  avoidedExpressions: string[];
+  /** Stances the character actually holds, as "topic: stance" — the raw material of an opinionated message. */
+  opinions: string[];
+  /** Subjects that reliably provoke a reaction from this character. */
+  emotionalTriggers: string[];
   interests: string[];
   relationshipToStreamer: string;
   disclosureBoundaries: string;
@@ -75,13 +96,16 @@ export interface BrainEventInput {
 }
 
 /**
- * One candidate's compact context for a Persona Drive opportunity — a small persona profile plus
- * runtime state and a handful of recalled memories, never the full targeted context an external
- * direct mention gets (see PersonaContextBuilder.build). Keeps a drive call cheap by construction.
+ * One candidate's compact context for a Persona Drive opportunity: purely the state that changed
+ * since the session began — mood, engagement, what this persona recalled, what it recently said.
+ *
+ * It carries no persona profile. The full BrainPersonaSnapshot for every available username was
+ * already established in this same previous_interaction_id chain by the bootstrap, so resending it
+ * per candidate per call was duplicated context; the external event path (prepareBrainEvent) has
+ * always relied on that same chain memory and sends only usernames.
  */
 export interface BrainDriveCandidate {
   username: string;
-  profile: BrainPersonaSnapshot;
   mood: string;
   engagement: number;
   sessionMessageCount: number;

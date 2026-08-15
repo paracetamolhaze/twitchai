@@ -160,18 +160,32 @@ export class PersonaContextBuilder {
       `лексика: ${safeTexts(persona.speech.vocabulary, 8).join(', ')}`,
       `любимые формы: ${safeTexts(persona.speech.favoriteExpressions, 4).join(', ')}`,
       `смех: ${safeTexts(persona.speech.laughStyles, 3).join(', ')}`,
-      `примеры только как признаки стиля: ${safeTexts(persona.speech.messageExamples, 3).join(' / ')}`,
+      `длина реплики: ${persona.behavior.verbosity.minWords}–${persona.behavior.verbosity.maxWords} слов`,
+      `сарказм ${persona.behavior.sarcasmLevel}, сленг ${persona.behavior.slangLevel}, мат ${persona.speech.profanityLevel}`,
+      `примеры только как признаки стиля: ${selectDiverseExamples(persona.speech.messageExamples, 6, textFilter).join(' / ')}`,
     ].filter(Boolean);
     return {
       username,
-      preferredName: safeText(persona.identity.preferredName ?? persona.identity.firstName ?? persona.name),
-      shortIdentity: safeText([persona.description, persona.identity.occupation].filter(Boolean).join('; ')),
+      // Deliberately NOT run through the personal-token filter: that filter is built from this
+      // persona's own name, so filtering the name with it always returned '' for any name of four
+      // characters or more (23 of 30 catalog personas). The character's own preferred name is not
+      // private canon — they use it themselves in their authored speech examples. The generic
+      // authoring-label scrub still applies.
+      preferredName: modelSafeText(persona.identity.preferredName ?? persona.identity.firstName ?? persona.name),
+      // persona.description is an authoring field ("полностью вымышленный зритель, созданный из
+      // истории ника …", plus birthplace and current city), so it must never reach the model.
+      // Occupation is the one genuinely grounding fact here, and only when this persona's own
+      // disclosure policy for work is not private.
+      shortIdentity: disclosureIsVisible(persona.disclosure.topics.work)
+        ? modelSafeText(persona.identity.occupation ?? '')
+        : '',
       character: safeText([
         persona.character.summary,
         `черты: ${safeTexts(persona.character.traits, 6).join(', ')}`,
         `юмор: ${persona.character.humor}`,
         persona.behavior.styleInstructions,
       ].join('; ')),
+      flaws: safeTexts(persona.character.flaws, 4),
       activityPattern: {
         chatFrequency: persona.behavior.activity.chatFrequency,
         directReplyLikelihood: persona.behavior.activity.directReplyLikelihood,
@@ -181,6 +195,11 @@ export class PersonaContextBuilder {
       },
       speechFingerprint: safeText(speechParts.join('; ')),
       expertise: safeTexts(persona.knowledge.expertise, 8),
+      weakTopics: safeTexts(persona.knowledge.weakTopics, 6),
+      unknownTopics: safeTexts(persona.knowledge.unknownTopics, 6),
+      avoidedExpressions: safeTexts(persona.speech.avoidedExpressions, 6),
+      opinions: safeTexts(persona.opinions.map((opinion) => `${opinion.topic}: ${opinion.stance}`), 4),
+      emotionalTriggers: safeTexts(persona.behavior.imperfections.emotionalTriggers, 4),
       interests: safeTexts([
         ...persona.interests.games, ...persona.interests.music,
         ...persona.interests.food, ...persona.interests.other,
@@ -495,6 +514,44 @@ function canonDocuments(persona: BotPersona): CanonDocument[] {
     });
   }
   return documents;
+}
+
+/**
+ * Picks style examples that differ from each other rather than the first N that survive filtering.
+ * A persona authors ~16 examples spanning distinct situations (a game read, a dry technical aside,
+ * a personal deflection, a joke), but they are grouped by situation in the source, so taking the
+ * head returned several near-identical lines and left whole registers of the voice unrepresented.
+ * Greedy: keep the first surviving example, then repeatedly take whichever remaining one shares
+ * the fewest words with everything already picked. Deterministic — no randomness.
+ */
+function selectDiverseExamples(examples: string[], limit: number, filter: ModelTextFilter): string[] {
+  const pool = examples
+    .map((example) => modelSafeText(example, filter))
+    .filter(Boolean)
+    .map((example) => ({ example, tokens: semanticTokens(example) }));
+  const picked: Array<{ example: string; tokens: Set<string> }> = [];
+  while (picked.length < limit && pool.length > 0) {
+    let bestIndex = 0;
+    if (picked.length > 0) {
+      let bestOverlap = Number.POSITIVE_INFINITY;
+      pool.forEach((candidate, index) => {
+        const overlap = Math.max(...picked.map((chosen) => sharedTokenRatio(candidate.tokens, chosen.tokens)));
+        if (overlap < bestOverlap) {
+          bestOverlap = overlap;
+          bestIndex = index;
+        }
+      });
+    }
+    picked.push(pool.splice(bestIndex, 1)[0]!);
+  }
+  return picked.map(({ example }) => example);
+}
+
+function sharedTokenRatio(left: Set<string>, right: Set<string>): number {
+  if (left.size === 0 || right.size === 0) return 0;
+  let shared = 0;
+  for (const token of left) if (right.has(token)) shared += 1;
+  return shared / Math.min(left.size, right.size);
 }
 
 function selectSpeechExamples(persona: BotPersona, query: string, limit: number, filter: ModelTextFilter): string[] {

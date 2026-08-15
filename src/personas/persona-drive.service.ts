@@ -4,7 +4,6 @@ import { ReactionBatchResult, ReactionBotCandidate } from '../reaction/types';
 import { ContextStore } from '../stream-brain/context-store';
 import { UsageTracker } from '../usage/usage-tracker';
 import { BotHistory } from './bot-history';
-import { PersonaContextBuilder } from './persona-context-builder';
 import { PersonaMemory } from './persona-memory';
 import { PersonaRuntimeStore } from './persona-runtime-store';
 import { PersonaActivityPattern } from './types';
@@ -27,7 +26,6 @@ export interface PersonaDriveServiceOptions {
   contextStore: ContextStore;
   personaMemory: PersonaMemory;
   personaRuntime: PersonaRuntimeStore;
-  personaContext: PersonaContextBuilder;
   history: BotHistory;
   evaluateOpportunity: (input: BrainDriveOpportunityInput) => Promise<BrainDecision | undefined>;
   /** ReactionCoordinator.prepareAutonomousCandidates */
@@ -296,7 +294,6 @@ export class PersonaDriveService {
       const runtime = this.options.personaRuntime.peek(candidate.persona.id);
       results.push({
         username: candidate.username,
-        profile: this.options.personaContext.buildBrainSnapshot(candidate.username, candidate.persona),
         mood: runtime.mood,
         engagement: runtime.engagement,
         sessionMessageCount: runtime.sessionMessageCount,

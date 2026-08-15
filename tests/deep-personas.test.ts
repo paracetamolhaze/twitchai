@@ -159,6 +159,90 @@ describe('deep persistent personas', () => {
     expect(context.relevantCanon.some((item) => ['family-background', 'relative', 'timeline'].includes(item.kind))).toBe(false);
   });
 
+  it('sends the character\'s negative space in the session snapshot, not only what it is good at', async () => {
+    const { builder } = await setup();
+    const karl = generatePersonaV3('karlbekner');
+    const snapshot = builder.buildBrainSnapshot('karlbekner', karl);
+
+    // A profile listing only expertise produces a voice that answers everything competently, which
+    // is the main way these read as machine-written. Each of these was authored per persona and
+    // previously reached the model through no path at all.
+    expect(snapshot.flaws.length).toBeGreaterThan(0);
+    expect(snapshot.weakTopics).toContain('актуальная Dota-мета');
+    expect(snapshot.unknownTopics.length).toBeGreaterThan(0);
+    expect(snapshot.avoidedExpressions).toContain('имба имбовая');
+    expect(snapshot.opinions.length).toBeGreaterThan(0);
+    expect(snapshot.opinions.every((opinion) => opinion.includes(':'))).toBe(true);
+    expect(snapshot.emotionalTriggers.length).toBeGreaterThan(0);
+    expect(snapshot.expertise.length).toBeGreaterThan(0);
+  });
+
+  it('keeps the character\'s own name in its snapshot instead of filtering it with a filter built from that same name', async () => {
+    const { builder } = await setup();
+    // Regression: preferredName was scrubbed by the persona's own personal-token filter, so every
+    // name of four characters or more became '' — 23 of the 30 catalog personas had no name at all,
+    // and shortIdentity was empty for all 30.
+    const karl = generatePersonaV3('karlbekner');
+    const snapshot = builder.buildBrainSnapshot('karlbekner', karl);
+    expect(snapshot.preferredName).toBe('Костя');
+    expect(snapshot.shortIdentity).toContain('системный администратор');
+  });
+
+  it('withholds occupation from the snapshot when that persona keeps work private', async () => {
+    const { builder } = await setup();
+    const karl = generatePersonaV3('karlbekner');
+    karl.disclosure.topics.work = 'private';
+    expect(builder.buildBrainSnapshot('karlbekner', karl).shortIdentity).toBe('');
+  });
+
+  it('never lets private canon or authoring labels into the session snapshot through the widened fields', async () => {
+    const { builder } = await setup();
+    const karl = generatePersonaV3('karlbekner');
+    karl.character.flaws = ['вымышленный сгенерированный профиль', 'слишком долго терпит неудобные процессы'];
+    karl.opinions = [
+      { id: 'o1', topic: 'Прага', stance: 'до Праги я трамваи недооценивал', tags: [] },
+      { id: 'o2', topic: 'компьютеры', stance: 'надёжная скучная система лучше модной', tags: [] },
+    ];
+    const serialized = JSON.stringify(builder.buildBrainSnapshot('karlbekner', karl));
+
+    // The persona description ("полностью вымышленный зритель, созданный из истории ника …",
+    // carrying birthplace and current city) must never become model-facing text.
+    expect(serialized).not.toMatch(/вымышленн|сгенерированн/iu);
+    for (const privateCanon of ['Кокшетау', 'Прага', 'Праги', 'Роман', 'Константин', '1995']) {
+      expect(serialized).not.toContain(privateCanon);
+    }
+    expect(serialized).toContain('слишком долго терпит неудобные процессы');
+    expect(serialized).toContain('надёжная скучная система лучше модной');
+  });
+
+  it('picks style examples that differ from each other rather than the first few authored', async () => {
+    const { builder } = await setup();
+    const karl = generatePersonaV3('karlbekner');
+    // Authored examples are grouped by situation, so the five near-identical lines come first and
+    // taking the head filled all six slots with the same register, leaving the rest unrepresented.
+    karl.speech.messageExamples = [
+      'там же бкб вроде оставалось',
+      'там же бкб наверное оставалось',
+      'там же бкб точно оставалось',
+      'там же бкб походу оставалось',
+      'там же бкб кажется оставалось',
+      'звук будто кабель отходит',
+      'сегодня опять сервер перезапускали',
+      'гречка закончилась внезапно',
+      'трамвай уехал прямо перед носом',
+    ];
+    const fingerprint = builder.buildBrainSnapshot('karlbekner', karl).speechFingerprint;
+    for (const distinctRegister of [
+      'звук будто кабель отходит',
+      'сегодня опять сервер перезапускали',
+      'гречка закончилась внезапно',
+      'трамвай уехал прямо перед носом',
+    ]) {
+      expect(fingerprint).toContain(distinctRegister);
+    }
+    expect((fingerprint.match(/там же бкб/gu) ?? []).length).toBeLessThanOrEqual(2);
+  });
+
   it('strips inflected Russian authoring labels from model-facing profile text', async () => {
     const { builder } = await setup();
     const karl = generatePersonaV3('karlbekner');
