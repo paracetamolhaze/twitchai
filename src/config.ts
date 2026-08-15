@@ -86,7 +86,12 @@ const envSchema = z.object({
   GEMINI_BRAIN_MODEL: z.string().trim().default('gemini-3.7-flash'),
   GEMINI_BRAIN_THINKING_LEVEL: z.enum(['low', 'medium', 'high']).default('low'),
   BRAIN_EVENT_MERGE_WINDOW_MS: z.coerce.number().int().min(0).max(2_000).default(250),
-  BRAIN_CONTEXT_ROLLOVER_TOKENS: z.coerce.number().int().min(100_000).max(1_048_576).default(786_432),
+  // The Interactions API bills each chained call for the whole reconstructed conversation, so
+  // input tokens grow with every decision in a session. 75% of the 1,048,576-token window (the
+  // old default) let a single session's per-call cost run into the hundreds of thousands of
+  // tokens before ever resetting. Roll over much sooner instead; a fresh bootstrap is cheap
+  // (~15K tokens) next to letting the chain run unchecked.
+  BRAIN_CONTEXT_ROLLOVER_TOKENS: z.coerce.number().int().min(100_000).max(1_048_576).default(150_000),
   STREAM_CONTEXT: z.string().default(''),
   VISION_FPS: z.coerce.number().min(0.05).max(1).default(1),
   VISION_FRAME_WIDTH: z.coerce.number().int().min(320).max(1280).default(640),

@@ -81,11 +81,15 @@ export class MediaPipeline {
       const delay = this.backoff.next();
       this.logger.warn('Media pipeline reconnect scheduled', { delayMs: delay, reason: result.error });
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, delay);
-        signal.addEventListener('abort', () => {
+        const onAbort = (): void => {
           clearTimeout(timer);
           resolve();
-        }, { once: true });
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        }, delay);
+        signal.addEventListener('abort', onAbort, { once: true });
       });
     }
   }
