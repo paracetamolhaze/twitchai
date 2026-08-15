@@ -14,9 +14,27 @@ export interface ReactionBotCandidate {
   lastReactionAt?: number;
 }
 
+/**
+ * What caused a reaction opportunity to exist. `stream_event` is a real observation from Gemini
+ * Live perception, chat, or spoken transcription. `persona_drive` is an internal spontaneous
+ * initiation opportunity with no external observation behind it — it is never a StreamEvent and
+ * is never persisted, deduplicated, or fed into a future Brain bootstrap as one.
+ */
+export type ReactionTrigger =
+  | { kind: 'stream_event'; event: StreamEvent }
+  | { kind: 'persona_drive'; id: string };
+
+export function triggerId(trigger: ReactionTrigger): string {
+  return trigger.kind === 'stream_event' ? trigger.event.id : trigger.id;
+}
+
+export function triggerDirectMentions(trigger: ReactionTrigger): string[] {
+  return trigger.kind === 'stream_event' ? trigger.event.directMentions : [];
+}
+
 export interface PlannedReaction {
   reservationId: string;
-  event: StreamEvent;
+  trigger: ReactionTrigger;
   bot: ReactionBotCandidate;
   delayMs: number;
   directMention: boolean;

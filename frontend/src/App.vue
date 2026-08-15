@@ -155,6 +155,9 @@ interface Usage {
     estimatedCostUsd: number; estimatedCostPerHourUsd: number
     eventsPerHour: number; brainDecisionsPerHour: number; messagesPerHour: number
   }
+  drive: DriveUsageCounters
+  driveBrain: Usage['brain']
+  driveCacheHitRatio: number
   currentStream: {
     active: boolean
     startedAt?: number
@@ -170,7 +173,16 @@ interface Usage {
     perception: Usage['perception']
     brain: Usage['brain']
     totalAi: Usage['totalAi']
+    drive: DriveUsageCounters
+    driveBrain: Usage['brain']
+    driveCacheHitRatio: number
   }
+}
+interface DriveUsageCounters {
+  ticks: number; eligibleTicks: number; localSkips: number
+  brainCalls: number; brainCallsBlockedByHourlyLimit: number
+  silentDecisions: number; messages: number; messagesBlockedByHourlyLimit: number
+  cancelledForExternalEvent: number; cancelledForCooldown: number; cancelledForNoCandidates: number
 }
 type StreamerMemoryType = 'fact' | 'preference' | 'person' | 'relationship' | 'plan' | 'promise' | 'result' | 'place' | 'trip' | 'running_joke' | 'important_event' | 'recurring_context' | 'other'
 type StreamerMemoryStatus = 'active' | 'resolved' | 'superseded' | 'expired'
@@ -384,6 +396,9 @@ const usage = reactive<Usage>({
   perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0 },
   brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
   totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
+  drive: emptyDriveUsage(),
+  driveBrain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
+  driveCacheHitRatio: 0,
   currentStream: {
     active: false, durationMinutes: 0, capturedAudioMinutes: 0, capturedVideoMinutes: 0,
     geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0, geminiReconnects: 0,
@@ -391,6 +406,9 @@ const usage = reactive<Usage>({
     perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0 },
     brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
     totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
+    drive: emptyDriveUsage(),
+    driveBrain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
+    driveCacheHitRatio: 0,
   },
 })
 const bots = ref<Bot[]>([])
@@ -1096,6 +1114,13 @@ function formatDuration(seconds: number): string {
   const minutes = Math.floor((seconds % 3600) / 60)
   return `${hours} ч ${minutes} мин`
 }
+function emptyDriveUsage(): DriveUsageCounters {
+  return {
+    ticks: 0, eligibleTicks: 0, localSkips: 0, brainCalls: 0, brainCallsBlockedByHourlyLimit: 0,
+    silentDecisions: 0, messages: 0, messagesBlockedByHourlyLimit: 0,
+    cancelledForExternalEvent: 0, cancelledForCooldown: 0, cancelledForNoCandidates: 0,
+  }
+}
 function formatSessionDuration(startedAt?: number): string {
   return startedAt ? formatDuration(Math.max(0, Math.floor((Date.now() - startedAt) / 1000))) : '—'
 }
@@ -1495,6 +1520,21 @@ onBeforeUnmount(() => {
             <div><span>Сообщений / час</span><strong>{{ usage.currentStream.totalAi.messagesPerHour.toFixed(1) }}</strong></div>
             <div><span>Brain context tokens</span><strong>{{ overview.geminiBrain.contextTokens }}</strong></div>
             <div><span>Bootstrap chars / tokens</span><strong>{{ overview.geminiBrain.bootstrapChars }} / {{ overview.geminiBrain.bootstrapInputTokens }}</strong></div>
+          </section>
+          <div class="section-heading"><div><p class="eyebrow">АВТОНОМНЫЙ СЛОЙ</p><h2>Persona Drive · текущий стрим</h2></div><p class="muted">Внутренние спонтанные реплики поверх Gemini 3.7 Brain — Gemini 3.1 Live не получает от Persona Drive ни одного дополнительного вызова.</p></div>
+          <section class="panel metric-strip">
+            <div><span>Тиков / eligible</span><strong>{{ usage.currentStream.drive.ticks }} / {{ usage.currentStream.drive.eligibleTicks }}</strong></div>
+            <div><span>Brain calls / лимит в час</span><strong>{{ usage.currentStream.drive.brainCalls }} / {{ usage.currentStream.drive.brainCallsBlockedByHourlyLimit }}</strong></div>
+            <div><span>Input / cached</span><strong>{{ usage.currentStream.driveBrain.inputTokens }} / {{ usage.currentStream.driveBrain.cachedInputTokens }}</strong></div>
+            <div><span>Output + thinking</span><strong>{{ usage.currentStream.driveBrain.outputTokens + usage.currentStream.driveBrain.thinkingTokens }}</strong></div>
+            <div><span>Cache hit</span><strong>{{ (usage.currentStream.driveCacheHitRatio * 100).toFixed(0) }}%</strong></div>
+          </section>
+          <section class="panel metric-strip">
+            <div><span>Отправлено / лимит в час</span><strong>{{ usage.currentStream.drive.messages }} / {{ usage.currentStream.drive.messagesBlockedByHourlyLimit }}</strong></div>
+            <div><span>Тишина</span><strong>{{ usage.currentStream.drive.silentDecisions }}</strong></div>
+            <div><span>Отменено: событие / cooldown / нет кандидатов</span><strong>{{ usage.currentStream.drive.cancelledForExternalEvent }} / {{ usage.currentStream.drive.cancelledForCooldown }} / {{ usage.currentStream.drive.cancelledForNoCandidates }}</strong></div>
+            <div><span>Локальных пропусков</span><strong>{{ usage.currentStream.drive.localSkips }}</strong></div>
+            <div><span>Стоимость Persona Drive</span><strong>${{ usage.currentStream.driveBrain.estimatedCostUsd.toFixed(4) }}</strong></div>
           </section>
           <section class="panel debug-context">
             <div><h3>Диагностика двух слоёв</h3><p>Perception стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · ошибок протокола: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Live-сессия: возраст <b>{{ formatSessionDuration(overview.streamBrain.sessionStartedAt) }}</b> · reconnects <b>{{ usage.geminiReconnects }}</b> · аудио отправлено в Gemini <b>{{ overview.streamBrain.audioChunksSent ?? 0 }}</b> чанков · видео отправлено <b>{{ overview.streamBrain.videoFramesSent ?? 0 }}</b> кадров · транскриптов получено <b>{{ overview.streamBrain.transcriptsReceived ?? 0 }}</b></p><p>Brain: <b>{{ stateLabel(overview.geminiBrain.state) }}</b> · последнее решение {{ formatMilliseconds(overview.geminiBrain.lastLatencyMs) }} · среднее {{ formatMilliseconds(overview.geminiBrain.averageLatencyMs) }} · recovery {{ overview.geminiBrain.rebuiltSessions }} · rollover {{ overview.geminiBrain.rollovers }}</p><p v-if="overview.geminiBrain.lastError">Ошибка Brain: <b>{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</b></p><p>Последнее закрытие Live: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ closeReasonLabel(overview.streamBrain.lastCloseCode, overview.streamBrain.lastCloseReason) }}</p><details v-if="overview.streamBrain.lastCloseReason"><summary>Техническое сообщение сервера</summary><code>{{ overview.streamBrain.lastCloseReason }}</code></details><p>Последние операции Live: исходящая <b>{{ diagnosticOperationLabel(overview.streamBrain.lastOutbound) }}</b> · инструмент <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolCall) }}</b> · медиа <b>{{ diagnosticOperationLabel(overview.streamBrain.lastMediaInput) }}</b></p></div>

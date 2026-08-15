@@ -71,6 +71,32 @@ export interface UsageSnapshot {
   brain: BrainUsageSnapshot;
   totalAi: TotalAiUsageSnapshot;
   currentStream: CurrentStreamUsageSnapshot;
+  /** Persona Drive gate/outcome counters, lifetime. See DriveUsageCounters for field meaning. */
+  drive: DriveUsageCounters;
+  /** Persona Drive's own slice of Gemini 3.7 Brain cost, lifetime — separate from `brain` above so drive cost is visible on its own. */
+  driveBrain: BrainUsageSnapshot;
+  /** cachedInputTokens / inputTokens for driveBrain, 0 when driveBrain has no input tokens yet. */
+  driveCacheHitRatio: number;
+}
+
+/**
+ * How many Persona Drive ticks happened, how many were locally skipped vs actually reached
+ * Gemini 3.7, and every distinct reason a tick or a message didn't happen — the exact breakdown
+ * needed to tell whether the hourly caps are too tight, too loose, or about right after a real
+ * stream.
+ */
+export interface DriveUsageCounters {
+  ticks: number;
+  eligibleTicks: number;
+  localSkips: number;
+  brainCalls: number;
+  brainCallsBlockedByHourlyLimit: number;
+  silentDecisions: number;
+  messages: number;
+  messagesBlockedByHourlyLimit: number;
+  cancelledForExternalEvent: number;
+  cancelledForCooldown: number;
+  cancelledForNoCandidates: number;
 }
 
 export interface CurrentStreamUsageSnapshot {
@@ -88,6 +114,9 @@ export interface CurrentStreamUsageSnapshot {
   perception: PerceptionUsageSnapshot;
   brain: BrainUsageSnapshot;
   totalAi: TotalAiUsageSnapshot;
+  drive: DriveUsageCounters;
+  driveBrain: BrainUsageSnapshot;
+  driveCacheHitRatio: number;
 }
 
 export interface BrainInteractionUsageInput {
@@ -161,6 +190,10 @@ export class UsageTracker {
   private currentLiveOutputByModality = emptyModalities();
   private readonly brainUsage = emptyBrainUsage();
   private currentBrainUsage = emptyBrainUsage();
+  private readonly driveBrainUsage = emptyBrainUsage();
+  private currentDriveBrainUsage = emptyBrainUsage();
+  private readonly driveCounters: DriveUsageCounters = emptyDriveCounters();
+  private currentDriveCounters: DriveUsageCounters = emptyDriveCounters();
 
   startStream(now = Date.now()): void {
     if (this.streamStartedAt !== undefined) return;
@@ -179,6 +212,8 @@ export class UsageTracker {
     this.currentLiveInputByModality = emptyModalities();
     this.currentLiveOutputByModality = emptyModalities();
     this.currentBrainUsage = emptyBrainUsage();
+    this.currentDriveBrainUsage = emptyBrainUsage();
+    this.currentDriveCounters = emptyDriveCounters();
   }
 
   stopStream(now = Date.now()): void {
@@ -247,6 +282,32 @@ export class UsageTracker {
     if (this.streamStartedAt !== undefined) addBrainUsage(this.currentBrainUsage, usage, metadata);
   }
 
+  /** Persona Drive's own slice of Brain cost — kept separate from recordBrainInteraction's bucket so it's independently visible after a stream. */
+  recordDriveBrainInteraction(
+    usage: BrainInteractionUsageInput,
+    metadata: { decision: boolean; latencyMs: number },
+  ): void {
+    addBrainUsage(this.driveBrainUsage, usage, metadata);
+    if (this.streamStartedAt !== undefined) addBrainUsage(this.currentDriveBrainUsage, usage, metadata);
+  }
+
+  recordDriveTick(): void { this.incrementDrive('ticks'); }
+  recordDriveEligibleTick(): void { this.incrementDrive('eligibleTicks'); }
+  recordDriveLocalSkip(): void { this.incrementDrive('localSkips'); }
+  recordDriveBrainCall(): void { this.incrementDrive('brainCalls'); }
+  recordDriveBrainCallsBlockedByHourlyLimit(): void { this.incrementDrive('brainCallsBlockedByHourlyLimit'); }
+  recordDriveSilentDecision(): void { this.incrementDrive('silentDecisions'); }
+  recordDriveMessage(): void { this.incrementDrive('messages'); }
+  recordDriveMessagesBlockedByHourlyLimit(): void { this.incrementDrive('messagesBlockedByHourlyLimit'); }
+  recordDriveCancelledForExternalEvent(): void { this.incrementDrive('cancelledForExternalEvent'); }
+  recordDriveCancelledForCooldown(): void { this.incrementDrive('cancelledForCooldown'); }
+  recordDriveCancelledForNoCandidates(): void { this.incrementDrive('cancelledForNoCandidates'); }
+
+  private incrementDrive(field: keyof DriveUsageCounters): void {
+    this.driveCounters[field] += 1;
+    if (this.streamStartedAt !== undefined) this.currentDriveCounters[field] += 1;
+  }
+
   snapshot(now = Date.now()): UsageSnapshot {
     const activeMs = this.streamStartedAt === undefined ? 0 : Math.max(0, now - this.streamStartedAt);
     const currentDurationMs = this.streamStartedAt === undefined ? this.currentStreamDurationMs : activeMs;
@@ -278,6 +339,11 @@ export class UsageTracker {
       (this.accumulatedStreamMs + activeMs) / 60_000, this.eventsDetected, this.brainUsage.decisions, this.sentResponses);
     const currentTotalAi = totalSnapshot(currentPerception.estimatedCostUsd, currentBrain.estimatedCostUsd,
       currentDurationMs / 60_000, this.currentEventsDetected, this.currentBrainUsage.decisions, this.currentSentResponses);
+    const driveBrain = brainSnapshot(this.driveBrainUsage);
+    const currentDriveBrain = brainSnapshot(this.currentDriveBrainUsage);
+    const driveCacheHitRatio = driveBrain.inputTokens > 0 ? driveBrain.cachedInputTokens / driveBrain.inputTokens : 0;
+    const currentDriveCacheHitRatio = currentDriveBrain.inputTokens > 0
+      ? currentDriveBrain.cachedInputTokens / currentDriveBrain.inputTokens : 0;
 
     return {
       startedAt: this.startedAt,
@@ -309,6 +375,9 @@ export class UsageTracker {
       perception,
       brain,
       totalAi,
+      drive: { ...this.driveCounters },
+      driveBrain,
+      driveCacheHitRatio,
       currentStream: {
         active: this.streamStartedAt !== undefined,
         ...(this.currentStreamStartedAt !== undefined ? { startedAt: this.currentStreamStartedAt } : {}),
@@ -324,6 +393,9 @@ export class UsageTracker {
         perception: currentPerception,
         brain: currentBrain,
         totalAi: currentTotalAi,
+        drive: { ...this.currentDriveCounters },
+        driveBrain: currentDriveBrain,
+        driveCacheHitRatio: currentDriveCacheHitRatio,
       },
     };
   }
@@ -347,6 +419,14 @@ function emptyBrainUsage(): MutableBrainUsage {
   return {
     interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0,
     outputTokens: 0, thoughtTokens: 0, totalTokens: 0, totalLatencyMs: 0,
+  };
+}
+
+function emptyDriveCounters(): DriveUsageCounters {
+  return {
+    ticks: 0, eligibleTicks: 0, localSkips: 0, brainCalls: 0, brainCallsBlockedByHourlyLimit: 0,
+    silentDecisions: 0, messages: 0, messagesBlockedByHourlyLimit: 0,
+    cancelledForExternalEvent: 0, cancelledForCooldown: 0, cancelledForNoCandidates: 0,
   };
 }
 

@@ -58,6 +58,7 @@ export interface BrainDynamicDelta {
 }
 
 export interface BrainEventInput {
+  triggerKind: 'external_stream_event';
   event: StreamEvent;
   availableBots: string[];
   recentChatDelta: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
@@ -71,6 +72,36 @@ export interface BrainEventInput {
     expiresAt: number;
   };
   mergedEventIds?: string[];
+}
+
+/**
+ * One candidate's compact context for a Persona Drive opportunity — a small persona profile plus
+ * runtime state and a handful of recalled memories, never the full targeted context an external
+ * direct mention gets (see PersonaContextBuilder.build). Keeps a drive call cheap by construction.
+ */
+export interface BrainDriveCandidate {
+  username: string;
+  profile: BrainPersonaSnapshot;
+  mood: string;
+  engagement: number;
+  sessionMessageCount: number;
+  recalledMemories: Array<{ type: string; summary: string; importance: number }>;
+  recentOwnMessages: string[];
+}
+
+/**
+ * Internal spontaneous-initiation opportunity — never an observed StreamEvent. Gemini 3.1 Live
+ * never sees or creates this; it only ever reaches Gemini 3.7 Brain via GeminiBrainService.
+ * evaluateDriveOpportunity.
+ */
+export interface BrainDriveOpportunityInput {
+  triggerKind: 'persona_drive';
+  channel: string;
+  category: string;
+  streamContext: string;
+  candidates: BrainDriveCandidate[];
+  recentChat: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
+  deltas: BrainDynamicDelta[];
 }
 
 export interface BrainReaction {

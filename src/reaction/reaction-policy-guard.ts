@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { isAccountClassificationQuestion } from '../shared/account-classification';
-import { StreamEvent } from '../stream-brain/types';
 import {
   PlannedReaction,
   ReactionBotCandidate,
   ReactionRejection,
+  ReactionTrigger,
   SubmittedReaction,
+  triggerDirectMentions,
 } from './types';
 
 export interface ReactionPolicyOptions {
@@ -16,7 +17,7 @@ export interface ReactionPolicyOptions {
 }
 
 export interface ValidateReactionBatchInput {
-  event: StreamEvent;
+  trigger: ReactionTrigger;
   reactions: SubmittedReaction[];
   permittedUsernames: Set<string>;
   currentCandidates: ReactionBotCandidate[];
@@ -58,7 +59,7 @@ export class ReactionPolicyGuard {
   async validateBatch(input: ValidateReactionBatchInput): Promise<PolicyBatchResult> {
     const now = this.now();
     this.prune(now);
-    if (isClassificationEvent(input.event)) {
+    if (isClassificationEvent(input.trigger)) {
       return {
         accepted: [],
         rejected: input.reactions.map((reaction) => ({
@@ -67,6 +68,7 @@ export class ReactionPolicyGuard {
         })),
       };
     }
+    const directMentions = triggerDirectMentions(input.trigger);
     const current = new Map(input.currentCandidates.map((candidate) => [candidate.username.toLowerCase(), candidate]));
     const seen = new Set<string>();
     const accepted: PlannedReaction[] = [];
@@ -108,10 +110,10 @@ export class ReactionPolicyGuard {
       this.reservations.set(reservationId, { username, scheduledAt: now });
       accepted.push({
         reservationId,
-        event: input.event,
+        trigger: input.trigger,
         bot: candidate,
         delayMs,
-        directMention: input.event.directMentions.includes(username),
+        directMention: directMentions.includes(username),
         message,
       });
     }
@@ -141,7 +143,9 @@ export class ReactionPolicyGuard {
 }
 
 function normalizeMessage(value: string): string { return value.replace(/\s+/g, ' ').trim(); }
-function isClassificationEvent(event: StreamEvent): boolean {
+function isClassificationEvent(trigger: ReactionTrigger): boolean {
+  if (trigger.kind !== 'stream_event') return false;
+  const { event } = trigger;
   return event.directMentions.length > 0
     && isAccountClassificationQuestion([event.summary, event.speech].filter(Boolean).join('\n'));
 }

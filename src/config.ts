@@ -56,6 +56,18 @@ export interface AppConfig {
     snapshotLimit: number;
     sessionStaleMinutes: number;
   };
+  personaDrive: {
+    enabled: boolean;
+    minIntervalMs: number;
+    maxIntervalMs: number;
+    minQuietMs: number;
+    globalCooldownMs: number;
+    personaCooldownMs: number;
+    maxCandidates: number;
+    maxBrainCallsPerHour: number;
+    maxMessagesPerHour: number;
+    maxBrainCallProbability: number;
+  };
   transcription: {
     provider: TranscriptionProvider;
     fallback?: 'groq-whisper';
@@ -111,7 +123,27 @@ const envSchema = z.object({
   ORIGINAL_STREAM_LANGUAGE: z.string().trim().default('ru'),
   DATABASE_URL: z.string().trim().optional(),
   DATABASE_SSL: z.string().default('true'),
-});
+  PERSONA_DRIVE_ENABLED: z.string().default('true'),
+  PERSONA_DRIVE_MIN_INTERVAL_SECONDS: z.coerce.number().int().min(10).max(3_600).default(90),
+  PERSONA_DRIVE_MAX_INTERVAL_SECONDS: z.coerce.number().int().min(10).max(7_200).default(240),
+  PERSONA_DRIVE_MIN_QUIET_SECONDS: z.coerce.number().int().min(0).max(3_600).default(45),
+  PERSONA_DRIVE_GLOBAL_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(3_600).default(90),
+  PERSONA_DRIVE_PERSONA_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(21_600).default(600),
+  PERSONA_DRIVE_MAX_CANDIDATES: z.coerce.number().int().min(1).max(10).default(3),
+  // Hard rule, not actually configurable: at most one autonomous persona speaks per opportunity
+  // (enforced in code regardless of this value). Kept as a validated env var so a misconfiguration
+  // fails loudly at startup instead of silently doing nothing.
+  PERSONA_DRIVE_MAX_REACTIONS: z.coerce.number().int().min(1).max(1).default(1),
+  PERSONA_DRIVE_MAX_BRAIN_CALLS_PER_HOUR: z.coerce.number().int().min(0).max(120).default(5),
+  PERSONA_DRIVE_MAX_MESSAGES_PER_HOUR: z.coerce.number().int().min(0).max(120).default(3),
+  PERSONA_DRIVE_MAX_BRAIN_CALL_PROBABILITY: z.coerce.number().min(0).max(1).default(0.35),
+}).refine(
+  (value) => value.PERSONA_DRIVE_MAX_INTERVAL_SECONDS >= value.PERSONA_DRIVE_MIN_INTERVAL_SECONDS,
+  {
+    message: 'PERSONA_DRIVE_MAX_INTERVAL_SECONDS must be >= PERSONA_DRIVE_MIN_INTERVAL_SECONDS',
+    path: ['PERSONA_DRIVE_MAX_INTERVAL_SECONDS'],
+  },
+);
 
 function bool(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value === '') return fallback;
@@ -194,6 +226,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       retrievalLimit: parsed.GLOBAL_MEMORY_RETRIEVAL_LIMIT,
       snapshotLimit: parsed.GLOBAL_MEMORY_SNAPSHOT_LIMIT,
       sessionStaleMinutes: parsed.GLOBAL_MEMORY_SESSION_STALE_MINUTES,
+    },
+    personaDrive: {
+      enabled: bool(parsed.PERSONA_DRIVE_ENABLED, true),
+      minIntervalMs: parsed.PERSONA_DRIVE_MIN_INTERVAL_SECONDS * 1000,
+      maxIntervalMs: parsed.PERSONA_DRIVE_MAX_INTERVAL_SECONDS * 1000,
+      minQuietMs: parsed.PERSONA_DRIVE_MIN_QUIET_SECONDS * 1000,
+      globalCooldownMs: parsed.PERSONA_DRIVE_GLOBAL_COOLDOWN_SECONDS * 1000,
+      personaCooldownMs: parsed.PERSONA_DRIVE_PERSONA_COOLDOWN_SECONDS * 1000,
+      maxCandidates: parsed.PERSONA_DRIVE_MAX_CANDIDATES,
+      maxBrainCallsPerHour: parsed.PERSONA_DRIVE_MAX_BRAIN_CALLS_PER_HOUR,
+      maxMessagesPerHour: parsed.PERSONA_DRIVE_MAX_MESSAGES_PER_HOUR,
+      maxBrainCallProbability: parsed.PERSONA_DRIVE_MAX_BRAIN_CALL_PROBABILITY,
     },
     transcription: {
       provider: parsed.TRANSCRIPTION_PROVIDER,

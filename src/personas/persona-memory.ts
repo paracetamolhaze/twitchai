@@ -8,9 +8,25 @@ export interface PersonaMemoryOptions {
   sessionThreshold?: number;
   sessionTtlMs?: number;
   conversationWindowMs?: number;
+  random?: () => number;
+}
+
+export interface RecallOptions {
+  limit?: number;
+  /** Persona Drive always sets this — a bot should never spontaneously call out a viewer who isn't part of the current moment. */
+  excludeViewerTagged?: boolean;
+  minAgeMs?: number;
 }
 
 export type NewPersonaMemory = Omit<PersonaMemoryItem, 'id' | 'createdAt'> & { id?: string; createdAt?: number };
+
+const RECALL_MIN_AGE_MS = 60_000;
+const RECALL_REPEAT_COOLDOWN_MS = 2 * 60 * 60_000;
+const RECALL_RECENCY_HALF_LIFE_MS = 6 * 60 * 60_000;
+const RECALL_WEIGHT_IMPORTANCE = 1;
+const RECALL_WEIGHT_RECENCY = 0.15;
+const RECALL_WEIGHT_REPEAT_PENALTY = 0.6;
+const RECALL_WEIGHT_JITTER = 0.1;
 
 export class PersonaMemory {
   private readonly now: () => number;
@@ -18,7 +34,10 @@ export class PersonaMemory {
   private readonly sessionThreshold: number;
   private readonly sessionTtlMs: number;
   private readonly conversationWindowMs: number;
+  private readonly random: () => number;
   private readonly conversationClocks = new Map<string, number>();
+  /** Runtime-only anti-repeat tracking for spontaneous recall — no schema change needed. */
+  private readonly lastRecalledAt = new Map<string, number>();
 
   constructor(private readonly repository: AppRepository, options: PersonaMemoryOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -26,6 +45,39 @@ export class PersonaMemory {
     this.sessionThreshold = options.sessionThreshold ?? 0.4;
     this.sessionTtlMs = options.sessionTtlMs ?? 12 * 60 * 60_000;
     this.conversationWindowMs = options.conversationWindowMs ?? 10 * 60_000;
+    this.random = options.random ?? Math.random;
+  }
+
+  /**
+   * Spontaneous-recall path for Persona Drive, separate from the query-driven `retrieve()` below.
+   * Importance dominates the ranking; recency is only a mild tie-breaker (saturating boost, not a
+   * decay) so an old but important memory can still beat a fresh but trivial one. A memory
+   * recalled recently is strongly deprioritized so the same thought doesn't resurface every tick.
+   */
+  async recall(personaId: string, options: RecallOptions = {}): Promise<PersonaMemoryItem[]> {
+    const limit = Math.max(1, Math.min(4, options.limit ?? 3));
+    const minAgeMs = options.minAgeMs ?? RECALL_MIN_AGE_MS;
+    const now = this.now();
+    const candidates = (await this.repository.listPersonaMemories(personaId, 200))
+      .filter((item) => !item.expiresAt || item.expiresAt > now)
+      .filter((item) => now - item.createdAt >= minAgeMs)
+      .filter((item) => !options.excludeViewerTagged || !item.viewerUsername);
+    const scored = candidates.map((item) => {
+      const ageMs = Math.max(0, now - item.createdAt);
+      const recencyBoost = RECALL_RECENCY_HALF_LIFE_MS / (RECALL_RECENCY_HALF_LIFE_MS + ageMs);
+      const lastRecalled = this.lastRecalledAt.get(item.id);
+      const repeatPenalty = lastRecalled ? Math.max(0, 1 - (now - lastRecalled) / RECALL_REPEAT_COOLDOWN_MS) : 0;
+      const score = item.importance * RECALL_WEIGHT_IMPORTANCE
+        + recencyBoost * RECALL_WEIGHT_RECENCY
+        - repeatPenalty * RECALL_WEIGHT_REPEAT_PENALTY
+        + this.random() * RECALL_WEIGHT_JITTER;
+      return { item, score };
+    });
+    const picked = scored
+      .sort((left, right) => right.score - left.score || right.item.createdAt - left.item.createdAt)
+      .slice(0, limit);
+    for (const { item } of picked) this.lastRecalledAt.set(item.id, now);
+    return picked.map(({ item }) => structuredClone(item));
   }
 
   async remember(input: NewPersonaMemory): Promise<PersonaMemoryItem | undefined> {

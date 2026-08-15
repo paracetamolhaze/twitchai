@@ -432,7 +432,214 @@ describe('Gemini 3.7 stateful Brain', () => {
     expect(requests.slice(1).every((request) => !request.input.includes('shortIdentity'))).toBe(true);
     expect(requests.slice(1).every((request) => !request.input.includes('personas'))).toBe(true);
   });
+
+  describe('Persona Drive opportunities', () => {
+    it('never calls the Interactions API and never bootstraps before the stream session is ready', async () => {
+      const client: BrainInteractionClient = { create: vi.fn() };
+      const service = brainService(client);
+
+      const result = await service.evaluateDriveOpportunity(driveInput());
+
+      expect(result).toBeUndefined();
+      expect(client.create).not.toHaveBeenCalled();
+    });
+
+    it('evaluates an opportunity once the Brain is READY, even with zero prior external StreamEvents', async () => {
+      const requests: BrainInteractionRequest[] = [];
+      const client: BrainInteractionClient = {
+        create: async (request) => {
+          requests.push(structuredClone(request));
+          return {
+            id: `D${requests.length}`, status: 'completed',
+            outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+            usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+          };
+        },
+      };
+      const service = brainService(client);
+      await service.startStream();
+      expect(requests.filter(({ kind }) => kind === 'decision')).toHaveLength(0);
+
+      const decision = await service.evaluateDriveOpportunity(driveInput());
+
+      expect(decision).toEqual({ reactions: [], memoryUpdates: [] });
+      expect(requests.map(({ kind }) => kind)).toEqual(['bootstrap', 'decision']);
+      expect(requests[1]?.previousInteractionId).toBe('D1');
+    });
+
+    it('caps reactions to exactly one regardless of what the model returns', async () => {
+      const client: BrainInteractionClient = {
+        create: async (request) => ({
+          id: 'E1', status: 'completed',
+          outputText: request.kind === 'bootstrap'
+            ? '{"ready":true}'
+            : JSON.stringify({
+              reactions: [
+                { username: 'bot-1', message: 'первое' },
+                { username: 'bot-2', message: 'второе' },
+                { username: 'bot-3', message: 'третье' },
+              ],
+              memoryUpdates: [],
+            }),
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        }),
+      };
+      const service = brainService(client);
+      await service.startStream();
+
+      const decision = await service.evaluateDriveOpportunity(driveInput());
+
+      expect(decision?.reactions).toEqual([{ username: 'bot-1', message: 'первое' }]);
+    });
+
+    it('serializes drive opportunities on the same queue as external events so they never race previous_interaction_id', async () => {
+      const requests: BrainInteractionRequest[] = [];
+      const client: BrainInteractionClient = {
+        create: async (request) => {
+          requests.push(structuredClone(request));
+          return {
+            id: `F${requests.length}`, status: 'completed',
+            outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+            usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+          };
+        },
+      };
+      const service = brainService(client);
+      await service.startStream();
+
+      const event = service.enqueueEvent(firstEvent);
+      const drive = service.evaluateDriveOpportunity(driveInput());
+      await Promise.all([event, drive]);
+
+      const decisionIds = requests.filter(({ kind }) => kind === 'decision').map(({ previousInteractionId }) => previousInteractionId);
+      expect(decisionIds).toEqual(['F1', 'F2']);
+    });
+
+    it('sets rolloverRequired from a drive call without rolling over itself; the next external event picks it up', async () => {
+      const requests: BrainInteractionRequest[] = [];
+      const reasons: string[] = [];
+      const client: BrainInteractionClient = {
+        create: async (request) => {
+          requests.push(structuredClone(request));
+          return {
+            id: `G${requests.length}`, status: 'completed',
+            outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+            usage: {
+              inputTokens: request.kind === 'decision' ? 800 : 100,
+              cachedInputTokens: 50, outputTokens: 5, thoughtTokens: 5, totalTokens: 810,
+            },
+          };
+        },
+      };
+      const service = brainService(client, {
+        contextRolloverTokens: 750,
+        bootstrap: async (reason) => { reasons.push(reason); return bootstrap(); },
+      });
+      await service.startStream();
+
+      await service.evaluateDriveOpportunity(driveInput());
+      expect(requests.filter(({ kind }) => kind === 'bootstrap')).toHaveLength(1);
+      expect(reasons).toEqual(['stream_start']);
+
+      await service.enqueueEvent(firstEvent);
+      expect(reasons).toEqual(['stream_start', 'rollover']);
+    });
+
+    it('does not advance chatCursor — the next external event still receives chat since the last real cursor position', async () => {
+      const client: BrainInteractionClient = {
+        create: async (request) => ({
+          id: request.kind === 'bootstrap' ? 'H0' : `H${Math.random()}`, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+        }),
+      };
+      const seenChatAfter: number[] = [];
+      const service = brainService(client, {
+        prepareEvent: async (event, chatAfter) => {
+          seenChatAfter.push(chatAfter);
+          return {
+            triggerKind: 'external_stream_event', event, availableBots: bootstrap().availableBots,
+            recentChatDelta: [], targetedPersonaContext: [], reactionExamples: [], deltas: [],
+            constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 },
+          };
+        },
+      });
+      await service.startStream();
+      await service.evaluateDriveOpportunity(driveInput());
+      await service.enqueueEvent(firstEvent);
+
+      // Bootstrap seeds chatCursor from bootstrap().startedAt (= firstEvent.timestamp here, since the
+      // fixture's recentChat is empty). If the drive call had advanced it, this would differ.
+      expect(seenChatAfter).toEqual([firstEvent.timestamp]);
+    });
+
+    it('uses the exact same system instruction for bootstrap, external decisions, and drive opportunities', async () => {
+      const requests: BrainInteractionRequest[] = [];
+      const client: BrainInteractionClient = {
+        create: async (request) => {
+          requests.push(structuredClone(request));
+          return {
+            id: `I${requests.length}`, status: 'completed',
+            outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+            usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+          };
+        },
+      };
+      const service = brainService(client);
+      await service.startStream();
+      await service.enqueueEvent(firstEvent);
+      await service.evaluateDriveOpportunity(driveInput());
+
+      const instructions = new Set(requests.map((request) => request.systemInstruction));
+      expect(instructions.size).toBe(1);
+      expect(requests[0]?.systemInstruction).toContain('external_stream_event');
+      expect(requests[0]?.systemInstruction).toContain('persona_drive');
+    });
+
+    it('tags each request body with the correct triggerKind', async () => {
+      const requests: BrainInteractionRequest[] = [];
+      const client: BrainInteractionClient = {
+        create: async (request) => {
+          requests.push(structuredClone(request));
+          return {
+            id: `J${requests.length}`, status: 'completed',
+            outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+            usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
+          };
+        },
+      };
+      const service = brainService(client);
+      await service.startStream();
+      await service.enqueueEvent(firstEvent);
+      await service.evaluateDriveOpportunity(driveInput());
+
+      const decisions = requests.filter(({ kind }) => kind === 'decision').map(({ input }) => JSON.parse(input) as { triggerKind: string });
+      expect(decisions.map((decision) => decision.triggerKind)).toEqual(['external_stream_event', 'persona_drive']);
+    });
+  });
 });
+
+function driveInput(overrides: Partial<import('../src/brain/types').BrainDriveOpportunityInput> = {}): import('../src/brain/types').BrainDriveOpportunityInput {
+  return {
+    triggerKind: 'persona_drive',
+    channel: 'streamer',
+    category: 'Dota 2',
+    streamContext: '',
+    candidates: [{
+      username: 'bot-1',
+      profile: {
+        username: 'bot-1', preferredName: 'Имя', shortIdentity: 'Зритель', character: 'Характер',
+        activityPattern: { chatFrequency: 'medium', directReplyLikelihood: 0.5, eventSelectivity: 0.5 },
+        speechFingerprint: 'Стиль', expertise: [], interests: [], relationshipToStreamer: '', disclosureBoundaries: '',
+      },
+      mood: 'neutral', engagement: 0.5, sessionMessageCount: 0,
+      recalledMemories: [], recentOwnMessages: [],
+    }],
+    recentChat: [],
+    deltas: [],
+    ...overrides,
+  };
+}
 
 function brainService(
   client: BrainInteractionClient,
@@ -444,7 +651,7 @@ function brainService(
     thinkingLevel: 'low',
     bootstrap: async () => bootstrap(),
     prepareEvent: async (event) => ({
-      event, availableBots: bootstrap().availableBots, recentChatDelta: [],
+      triggerKind: 'external_stream_event', event, availableBots: bootstrap().availableBots, recentChatDelta: [],
       targetedPersonaContext: [], reactionExamples: [], deltas: [],
       constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 },
     }),

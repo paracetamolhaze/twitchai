@@ -10,6 +10,7 @@ import { ReactionMemory } from './learning/reaction-memory';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
 import { PersonaContextBuilder } from './personas/persona-context-builder';
+import { PersonaDriveService } from './personas/persona-drive.service';
 import { PersonaMemory } from './personas/persona-memory';
 import { PersonaRuntimeStore } from './personas/persona-runtime-store';
 import { PersonaStore } from './personas/persona-store';
@@ -68,6 +69,7 @@ export class Application {
   private api!: ApiServer;
   private gemini?: GeminiLiveClient;
   private geminiBrain?: GeminiBrainService;
+  private personaDrive?: PersonaDriveService;
   private transcriber?: GroqWhisperFallback;
   private twitchOAuth?: TwitchOAuthService;
   private categoryTimer?: NodeJS.Timeout;
@@ -200,6 +202,31 @@ export class Application {
             this.perception.onGeminiStatus(connected, error, diagnostics);
           },
         },
+      });
+      this.personaDrive = new PersonaDriveService({
+        enabled: this.config.personaDrive.enabled,
+        minIntervalMs: this.config.personaDrive.minIntervalMs,
+        maxIntervalMs: this.config.personaDrive.maxIntervalMs,
+        minQuietMs: this.config.personaDrive.minQuietMs,
+        globalCooldownMs: this.config.personaDrive.globalCooldownMs,
+        personaCooldownMs: this.config.personaDrive.personaCooldownMs,
+        maxCandidates: this.config.personaDrive.maxCandidates,
+        maxBrainCallsPerHour: this.config.personaDrive.maxBrainCallsPerHour,
+        maxMessagesPerHour: this.config.personaDrive.maxMessagesPerHour,
+        maxBrainCallProbability: this.config.personaDrive.maxBrainCallProbability,
+        candidates: () => this.botManager.candidates(),
+        isStreamLive: () => this.mediaStreaming,
+        isBrainReady: () => this.geminiBrain?.getStatus().state === 'READY',
+        contextStore: this.contextStore,
+        personaMemory: this.personaMemory,
+        personaRuntime: this.personaRuntime,
+        personaContext: this.personaContext,
+        history: this.history,
+        evaluateOpportunity: (input) => this.geminiBrain!.evaluateDriveOpportunity(input),
+        prepareCandidates: (usernames) => this.coordinator.prepareAutonomousCandidates(usernames),
+        submitReaction: (requestId, reactions) => this.coordinator.submitBatch({ eventId: requestId, reactions }),
+        usage: this.usage,
+        logger: this.logger,
       });
     }
 
@@ -395,6 +422,7 @@ export class Application {
     await this.coordinator?.stop();
     await this.memory.stop();
     await this.transcriber?.flush();
+    this.personaDrive?.stop();
     await this.geminiBrain?.stopStream();
     await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
     await this.perception?.stop();
@@ -407,6 +435,7 @@ export class Application {
 
   private wireEvents(): void {
     this.perception.on('event', (event: StreamEvent) => {
+      this.personaDrive?.notifyExternalEvent();
       const emittedAt = Date.now();
       this.api.emitEvent(event);
       this.api.emitOverview();
@@ -452,6 +481,7 @@ export class Application {
           void this.brainSessionReady.catch((cause: unknown) => {
             this.logger.warn('Stream AI session start failed', { cause });
           });
+          this.personaDrive?.start();
         }
       } else {
         // A single streamlink/ffmpeg restart or short CDN hiccup reports OFFLINE/ERROR/CONNECTING
@@ -469,6 +499,7 @@ export class Application {
           this.mediaStreaming = false;
           this.brainSessionReady = Promise.resolve();
           this.coordinator.clearPendingContexts();
+          this.personaDrive?.stop();
           void this.geminiBrain?.stopStream();
           if (finalState === 'OFFLINE') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
           else if (finalState === 'ERROR') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));

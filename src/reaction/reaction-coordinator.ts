@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { z } from 'zod';
 import { Logger } from '../logger';
@@ -21,9 +22,11 @@ import {
   ReactionRejection,
   ReactionSendResult,
   ReactionTraceRecord,
+  ReactionTrigger,
   REACTION_BATCH_PROTOCOL_MAX_ITEMS,
   REACTION_MESSAGE_PROTOCOL_MAX_CHARACTERS,
   SubmittedReaction,
+  triggerId,
 } from './types';
 
 export interface ReactionSender {
@@ -49,7 +52,7 @@ export interface ReactionCoordinatorOptions {
 }
 
 interface PendingContext {
-  event: StreamEvent;
+  trigger: ReactionTrigger;
   permittedUsernames: Set<string>;
   candidateCount: number;
   viewerByUsername: Map<string, string>;
@@ -137,7 +140,7 @@ export class ReactionCoordinator extends EventEmitter {
     }
 
     const result = await this.options.policy.validateBatch({
-      event: pending.event,
+      trigger: pending.trigger,
       reactions: parsed.reactions,
       permittedUsernames: pending.permittedUsernames,
       currentCandidates: this.options.candidates(),
@@ -301,7 +304,7 @@ export class ReactionCoordinator extends EventEmitter {
     this.removePending(event.id);
     const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
     this.pendingContexts.set(event.id, {
-      event,
+      trigger: { kind: 'stream_event', event },
       expiresAt,
       timer,
       permittedUsernames: new Set(candidates.map((candidate) => candidate.username.toLowerCase())),
@@ -315,6 +318,7 @@ export class ReactionCoordinator extends EventEmitter {
     });
     return {
       event,
+      triggerKind: 'external_stream_event',
       availableBots: candidates.map((candidate) => candidate.username),
       recentChatDelta: snapshot.recentChat
         .filter((message) => message.timestamp > chatAfter)
@@ -332,51 +336,76 @@ export class ReactionCoordinator extends EventEmitter {
     };
   }
 
+  /**
+   * Registers a pending candidate set for a Persona Drive opportunity — the lean counterpart to
+   * `prepareBrainEvent` used only for internal spontaneous-initiation attempts. No StreamEvent is
+   * created or touched; the returned id exists solely to correlate the eventual `submitBatch` call
+   * against the exact usernames that were actually offered, the same anti-hallucination guard the
+   * external path gets. No trace record is created — the reaction-trace dashboard panel stays
+   * exclusively about real observed events; `updateTrace` already no-ops safely without one.
+   */
+  prepareAutonomousCandidates(usernames: string[]): string {
+    const id = `persona-drive:${randomUUID()}`;
+    const expiresAt = this.now() + this.contextTtlMs;
+    const timer = setTimeout(() => this.expirePending(id), this.contextTtlMs);
+    this.pendingContexts.set(id, {
+      trigger: { kind: 'persona_drive', id },
+      expiresAt,
+      timer,
+      permittedUsernames: new Set(usernames.map((username) => username.toLowerCase())),
+      candidateCount: usernames.length,
+      viewerByUsername: new Map(),
+    });
+    return id;
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
     this.clearPendingContexts();
     for (const [timer, plan] of this.timers) {
       clearTimeout(timer);
       this.options.policy.releaseReservation(plan.reservationId);
-      this.recordSendFailure(plan.event.id, plan.bot.username, 'coordinator_stopped');
+      this.recordSendFailure(triggerId(plan.trigger), plan.bot.username, 'coordinator_stopped');
     }
     this.timers.clear();
   }
 
   private schedule(plan: PlannedReaction): void {
+    const eventId = triggerId(plan.trigger);
     const timer = setTimeout(() => {
       this.timers.delete(timer);
       void this.execute(plan);
     }, plan.delayMs);
     this.timers.set(timer, plan);
     const scheduledAt = this.now();
-    const trace = this.traces.get(plan.event.id);
-    this.updateTrace(plan.event.id, {
+    const trace = this.traces.get(eventId);
+    this.updateTrace(eventId, {
       stage: 'SCHEDULED',
       outcome: 'SCHEDULED',
       reactions: (trace?.reactions ?? []).map((reaction) => reaction.username === plan.bot.username
         ? { ...reaction, status: 'SCHEDULED' as const, scheduledAt }
         : reaction),
     });
-    this.logger.info('Bot reaction queued', { bot: plan.bot.username, eventId: plan.event.id, delayMs: plan.delayMs });
+    this.logger.info('Bot reaction queued', { bot: plan.bot.username, eventId, delayMs: plan.delayMs });
   }
 
   private async execute(plan: PlannedReaction): Promise<void> {
-    this.logger.info('Reaction scheduler fired', { bot: plan.bot.username, eventId: plan.event.id });
+    const eventId = triggerId(plan.trigger);
+    this.logger.info('Reaction scheduler fired', { bot: plan.bot.username, eventId });
     try {
       const current = this.options.candidates().find((candidate) => candidate.username === plan.bot.username);
       if (!current?.enabled || current.connectionState !== 'CONNECTED' || !current.chatConnected) {
         this.options.usage.recordSkipped();
-        this.recordSendFailure(plan.event.id, plan.bot.username, 'account_unavailable_at_send');
+        this.recordSendFailure(eventId, plan.bot.username, 'account_unavailable_at_send');
         return;
       }
       if (current.persona.id !== plan.bot.persona.id) {
         this.options.usage.recordSkipped();
         this.options.usage.recordGuardRejection();
-        this.recordSendFailure(plan.event.id, plan.bot.username, 'persona_reassigned');
+        this.recordSendFailure(eventId, plan.bot.username, 'persona_reassigned');
         this.logger.warn('Queued reaction cancelled after persona reassignment', {
           bot: current.username,
-          eventId: plan.event.id,
+          eventId,
           plannedPersonaId: plan.bot.persona.id,
           currentPersonaId: current.persona.id,
         });
@@ -385,23 +414,23 @@ export class ReactionCoordinator extends EventEmitter {
       if (await this.options.history.isDuplicate(current.username, plan.message)) {
         this.options.usage.recordSkipped();
         this.options.usage.recordGuardRejection();
-        this.recordSendFailure(plan.event.id, plan.bot.username, 'recent_duplicate_at_send');
+        this.recordSendFailure(eventId, plan.bot.username, 'recent_duplicate_at_send');
         return;
       }
       const sendResult = await this.options.sender.send(current.username, plan.message);
       if (!sendResult.submitted) {
         this.options.usage.recordSkipped();
-        this.recordSendFailure(plan.event.id, plan.bot.username, sendResult.reason);
+        this.recordSendFailure(eventId, plan.bot.username, sendResult.reason);
         return;
       }
       const sentAt = sendResult.submittedAt;
-      this.recordSendSuccess(plan.event.id, current.username, sentAt);
-      this.logger.info('Bot reaction submitted to Twitch', { bot: current.username, eventId: plan.event.id, message: plan.message });
+      this.recordSendSuccess(eventId, current.username, sentAt);
+      this.logger.info('Bot reaction submitted to Twitch', { bot: current.username, eventId, message: plan.message });
       try {
         this.options.policy.recordSent(sentAt, plan.reservationId);
         this.options.usage.recordSentResponse();
         this.options.personaRuntime.recordSent(current.persona.id);
-        await this.options.history.add(current.username, plan.message, plan.event.id);
+        await this.options.history.add(current.username, plan.message, eventId);
         if (plan.viewerUsername) {
           await this.options.personaMemory.addConversation({
             personaId: current.persona.id,
@@ -413,14 +442,14 @@ export class ReactionCoordinator extends EventEmitter {
       } catch (cause) {
         this.logger.warn('Post-send reaction bookkeeping failed', {
           bot: current.username,
-          eventId: plan.event.id,
+          eventId,
           cause,
         });
       }
     } catch (cause) {
       this.options.usage.recordSkipped();
-      this.recordSendFailure(plan.event.id, plan.bot.username, safeErrorReason(cause));
-      this.logger.warn('Queued bot reaction failed', { bot: plan.bot.username, eventId: plan.event.id, cause });
+      this.recordSendFailure(eventId, plan.bot.username, safeErrorReason(cause));
+      this.logger.warn('Queued bot reaction failed', { bot: plan.bot.username, eventId, cause });
     } finally {
       this.options.policy.releaseReservation(plan.reservationId);
     }

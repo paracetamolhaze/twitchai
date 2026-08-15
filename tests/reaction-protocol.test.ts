@@ -559,7 +559,7 @@ describe('single-session reaction protocol', () => {
     policy.recordSent(event.timestamp - 100);
     policy.recordSent(event.timestamp - 50);
     const result = await policy.validateBatch({
-      event,
+      trigger: { kind: 'stream_event', event },
       permittedUsernames: new Set(['bot-one']),
       currentCandidates: [bot('bot-one', 0)],
       reactions: [{ username: 'bot-one', message: 'валидное уникальное сообщение' }],
