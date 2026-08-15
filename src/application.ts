@@ -91,6 +91,7 @@ export class Application {
   private streamGeneration = 0;
   private greetedStreamGeneration = 0;
   private lastBotAvailability = new Map<string, string>();
+  private readonly availableBotUsernames = new Set<string>();
 
   constructor(private readonly config: AppConfig) {
     this.logger = new Logger('APP', config.app.logLevel);
@@ -510,6 +511,15 @@ export class Application {
               connectionState: bot.connectionState, personaId: bot.personaId,
             },
           });
+          const isAvailable = bot.enabled && bot.connectionState === 'CONNECTED' && bot.chatConnected;
+          if (isAvailable && !this.availableBotUsernames.has(bot.username)) {
+            // Bootstrap only ships personas for bots available at stream start; a bot that
+            // becomes available later needs its profile pushed once so the Brain can select it.
+            const persona = this.personas.getOptional(bot.personaId);
+            if (persona) this.queuePersonaSnapshot(persona);
+          }
+          if (isAvailable) this.availableBotUsernames.add(bot.username);
+          else this.availableBotUsernames.delete(bot.username);
         }
       }
       this.api.emitBots(bots);
@@ -522,7 +532,10 @@ export class Application {
 
   private async buildBrainBootstrap(reason: 'stream_start' | 'recovery' | 'rollover'): Promise<BrainBootstrap> {
     const snapshot = this.contextStore.snapshot();
-    const candidates = this.botManager.candidates();
+    // The Brain is instructed to only ever pick a username from availableBots, so a persona for
+    // a disabled/disconnected bot can never be selected — sending its profile is pure waste.
+    const availableCandidates = this.botManager.candidates()
+      .filter((candidate) => candidate.enabled && candidate.connectionState === 'CONNECTED' && candidate.chatConnected);
     const [globalMemories, recentEvents] = await Promise.all([
       this.globalMemory.startupSnapshot(snapshot.channel, this.config.globalMemory.snapshotLimit),
       this.repository.listStreamEvents(50),
@@ -532,10 +545,8 @@ export class Application {
       category: snapshot.category,
       streamContext: snapshot.streamContext,
       startedAt: this.usage.snapshot().currentStream.startedAt ?? Date.now(),
-      availableBots: candidates
-        .filter((candidate) => candidate.enabled && candidate.connectionState === 'CONNECTED' && candidate.chatConnected)
-        .map((candidate) => candidate.username),
-      personas: candidates.map((candidate) => this.personaContext.buildBrainSnapshot(candidate.username, candidate.persona)),
+      availableBots: availableCandidates.map((candidate) => candidate.username),
+      personas: availableCandidates.map((candidate) => this.personaContext.buildBrainSnapshot(candidate.username, candidate.persona)),
       globalMemories: globalMemories.map((memory) => ({
         type: memory.type,
         summary: memory.summary,
