@@ -200,6 +200,8 @@ export interface BrainInteractionUsage {
   outputTokens: number;
   thoughtTokens: number;
   totalTokens: number;
+  /** What the call actually cost, when the transport reports it. Beats any local price table. */
+  costUsd?: number;
 }
 
 export interface GeminiBrainStatus {

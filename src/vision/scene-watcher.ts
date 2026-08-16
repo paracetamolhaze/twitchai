@@ -2,9 +2,15 @@ import { Logger } from '../logger';
 
 const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
 
+export interface SceneDescription {
+  text?: string;
+  /** What the call cost, when the service reports it. Beats any local price table. */
+  costUsd?: number;
+}
+
 export interface SceneDescriber {
   readonly name: string;
-  describe(jpeg: Buffer, hint: string): Promise<string | undefined>;
+  describe(jpeg: Buffer, hint: string): Promise<SceneDescription>;
 }
 
 export interface OpenRouterSceneDescriberOptions {
@@ -30,7 +36,7 @@ export class OpenRouterSceneDescriber implements SceneDescriber {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async describe(jpeg: Buffer, hint: string): Promise<string | undefined> {
+  async describe(jpeg: Buffer, hint: string): Promise<SceneDescription> {
     const response = await this.fetchImpl(OPENROUTER_ENDPOINT, {
       method: 'POST',
       headers: {
@@ -55,12 +61,16 @@ export class OpenRouterSceneDescriber implements SceneDescriber {
     const body = await response.json() as {
       error?: { message?: string };
       choices?: Array<{ message?: { content?: string } }>;
+      usage?: { cost?: number };
     };
     if (!response.ok || body.error) {
       throw new Error(`${response.status} ${body.error?.message ?? response.statusText}`);
     }
     const text = body.choices?.[0]?.message?.content?.trim();
-    return text && text.length >= 3 ? text.replace(/\s+/g, ' ') : undefined;
+    return {
+      ...(text && text.length >= 3 ? { text: text.replace(/\s+/g, ' ') } : {}),
+      ...(typeof body.usage?.cost === 'number' ? { costUsd: body.usage.cost } : {}),
+    };
   }
 }
 
@@ -76,6 +86,8 @@ export interface SceneWatcherOptions {
   logger: Logger;
   /** Called with each new description, whether or not it differs from the last. */
   onScene: (description: string, meta: { latencyMs: number; changed: boolean }) => void;
+  /** Every look, described or not, so the bill is counted where it is actually incurred. */
+  onUsage?: (usage: { costUsd?: number; failed: boolean }) => void;
   /** How often the scene is looked at. Every look costs a call, so this is the whole cost knob. */
   intervalMs?: number;
   now?: () => number;
@@ -149,7 +161,12 @@ export class SceneWatcher {
     const startedAt = this.now();
     try {
       const previous = this.stats.lastDescription;
-      const description = await this.options.describer.describe(frame, previous ?? '');
+      const result = await this.options.describer.describe(frame, previous ?? '');
+      this.options.onUsage?.({
+        ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+        failed: false,
+      });
+      const description = result.text;
       if (!description) return;
       const latencyMs = this.now() - startedAt;
       const changed = description !== previous;
@@ -161,6 +178,7 @@ export class SceneWatcher {
       this.options.onScene(description, { latencyMs, changed });
     } catch (cause) {
       this.stats.failures += 1;
+      this.options.onUsage?.({ failed: true });
       this.logger.warn('Scene description failed', { reason, cause });
     } finally {
       this.describing = false;

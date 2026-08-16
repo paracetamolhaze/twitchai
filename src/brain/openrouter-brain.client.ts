@@ -20,6 +20,7 @@ interface ChatCompletionResponse {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
+    cost?: number;
     prompt_tokens_details?: { cached_tokens?: number };
     completion_tokens_details?: { reasoning_tokens?: number };
   };
@@ -116,6 +117,7 @@ export class OpenRouterBrainClient implements BrainInteractionClient {
         outputTokens: Math.max(0, (usage?.completion_tokens ?? 0) - reasoning),
         thoughtTokens: reasoning,
         totalTokens: usage?.total_tokens ?? 0,
+        ...(typeof usage?.cost === 'number' ? { costUsd: usage.cost } : {}),
       },
     };
   }

@@ -155,7 +155,18 @@ export interface StreamBrainStatus {
   responseModality?: 'text' | 'audio';
   stallRecoveries?: number;
   msSincePerceptionOutput?: number;
-  /** Whisper running beside or instead of Live, so the two can be compared on one stream. */
+  /** What the watching layer has seen, when it is the one doing the looking. */
+  vision?: {
+    model: string;
+    everySeconds: number;
+    described: number;
+    failures: number;
+    framesSeen: number;
+    lastDescription?: string;
+    lastDescribedAt?: number;
+    lastLatencyMs?: number;
+  };
+  /** The transcription layer, running beside Live or instead of it. */
   transcription?: {
     mode: 'live' | 'shadow' | 'transcriber';
     model: string;

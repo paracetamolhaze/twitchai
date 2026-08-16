@@ -5,8 +5,10 @@ import { SceneWatcher } from '../src/vision/scene-watcher';
 afterEach(() => vi.useRealTimers());
 
 function watcher(describe_: (frame: Buffer, hint: string) => Promise<string | undefined>, intervalMs = 25_000) {
+  // The backend returns a result object; these fixtures speak in plain sentences.
+  const wrap = async (frame: Buffer, hint: string) => ({ text: await describe_(frame, hint) });
   const scenes: Array<{ description: string; changed: boolean }> = [];
-  const describer = vi.fn(describe_);
+  const describer = vi.fn(wrap);
   const instance = new SceneWatcher({
     describer: { name: 'test', describe: describer },
     logger: new Logger('TEST', 'error'),
@@ -78,9 +80,11 @@ describe('SceneWatcher', () => {
   it('tells the model what it last saw, so a description reads as a change rather than a restart', async () => {
     const hints: string[] = [];
     const answers = ['Мужчина ест в кафе.', 'Мужчина вышел на улицу.'];
-    const { instance } = watcher(async (_frame, hint) => { hints.push(hint); return answers.shift(); });
+    const { instance, scenes } = watcher(async (_frame, hint) => { hints.push(hint); return answers.shift(); });
     instance.acceptFrame(frame);
-    await vi.waitFor(() => expect(hints).toHaveLength(1));
+    // Waiting on the description rather than the hint: a look asked for while one is still in
+    // flight is dropped, which is deliberate — two looks at the same moment cost twice.
+    await vi.waitFor(() => expect(scenes).toHaveLength(1));
     expect(hints[0]).toBe('');
     instance.acceptFrame(frame);
     instance.lookNow();

@@ -306,6 +306,7 @@ export class Application {
           const snapshot = this.contextStore.snapshot();
           return [snapshot.channel, ...snapshot.botUsernames];
         },
+        onUsage: (usage) => this.usage.recordHearingUsage(usage),
         onTranscript: (text, meta) => {
           // In shadow mode this is a measurement, not a source: both layers hear the same stream
           // and both write down what they heard, so they can be compared on one real run before
@@ -333,6 +334,7 @@ export class Application {
             }),
             intervalMs: this.config.vision.describeIntervalMs,
             logger: this.logger,
+            onUsage: (usage) => this.usage.recordVisionUsage(usage),
             onScene: (description, meta) => this.speechEvents?.acceptScene(description, meta.changed),
           });
           this.logger.info('Scene watching enabled', {
@@ -1052,14 +1054,23 @@ export class Application {
   }
 
   /** Reported next to the Live counters so the two ways of hearing can be read side by side. */
-  private transcriptionStatus(): Pick<StreamBrainStatus, 'transcription'> {
-    if (!this.transcriber) return {};
+  private transcriptionStatus(): Pick<StreamBrainStatus, 'transcription' | 'vision'> {
+    const watcher = this.sceneWatcher?.getStats();
     return {
-      transcription: {
-        mode: this.config.transcription.mode,
-        model: this.config.transcription.model,
-        ...this.transcriber.getStats(),
-      },
+      ...(this.transcriber ? {
+        transcription: {
+          mode: this.config.transcription.mode,
+          model: this.transcriptionModel(),
+          ...this.transcriber.getStats(),
+        },
+      } : {}),
+      ...(watcher ? {
+        vision: {
+          model: this.config.vision.model,
+          everySeconds: this.config.vision.describeIntervalMs / 1000,
+          ...watcher,
+        },
+      } : {}),
     };
   }
 

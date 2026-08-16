@@ -39,6 +39,15 @@ export interface TotalAiUsageSnapshot {
   messagesPerHour: number;
 }
 
+/** A sensor's own share of the bill: what it did and what that cost. */
+export interface SensorUsageSnapshot {
+  calls: number;
+  failures: number;
+  costUsd: number;
+  /** Hearing only: speech actually uploaded. Silence never leaves the machine. */
+  audioSeconds: number;
+}
+
 export interface UsageSnapshot {
   startedAt: number;
   uptimeSeconds: number;
@@ -72,6 +81,8 @@ export interface UsageSnapshot {
   memoriesSuperseded: number;
   memoryRetrievals: number;
   perception: PerceptionUsageSnapshot;
+  hearing: SensorUsageSnapshot;
+  vision: SensorUsageSnapshot;
   brain: BrainUsageSnapshot;
   totalAi: TotalAiUsageSnapshot;
   currentStream: CurrentStreamUsageSnapshot;
@@ -118,6 +129,8 @@ export interface CurrentStreamUsageSnapshot {
   confirmedDeliveries: number;
   undeliveredMessages: number;
   perception: PerceptionUsageSnapshot;
+  hearing: SensorUsageSnapshot;
+  vision: SensorUsageSnapshot;
   brain: BrainUsageSnapshot;
   totalAi: TotalAiUsageSnapshot;
   drive: DriveUsageCounters;
@@ -126,6 +139,7 @@ export interface CurrentStreamUsageSnapshot {
 }
 
 export interface BrainInteractionUsageInput {
+  costUsd?: number;
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
@@ -207,6 +221,10 @@ export class UsageTracker {
   private readonly liveOutputByModality = emptyModalities();
   private currentLiveInputByModality = emptyModalities();
   private currentLiveOutputByModality = emptyModalities();
+  private readonly hearingUsage = emptySensorUsage();
+  private currentHearingUsage = emptySensorUsage();
+  private readonly visionUsage = emptySensorUsage();
+  private currentVisionUsage = emptySensorUsage();
   private readonly brainUsage = emptyBrainUsage();
   private currentBrainUsage = emptyBrainUsage();
   private readonly driveBrainUsage = emptyBrainUsage();
@@ -232,6 +250,8 @@ export class UsageTracker {
     this.currentEventsDetected = 0;
     this.currentLiveInputByModality = emptyModalities();
     this.currentLiveOutputByModality = emptyModalities();
+    this.currentHearingUsage = emptySensorUsage();
+    this.currentVisionUsage = emptySensorUsage();
     this.currentBrainUsage = emptyBrainUsage();
     this.currentDriveBrainUsage = emptyBrainUsage();
     this.currentDriveCounters = emptyDriveCounters();
@@ -307,6 +327,25 @@ export class UsageTracker {
 
   /** Set once at startup: the two transports bill the same model at the same rate today, but the
    * dashboard should follow whichever one is actually being paid rather than assume. */
+  /** One transcribed speech segment, priced by what the gateway charged for it. */
+  recordHearingUsage(input: { costUsd?: number; audioSeconds?: number; failed?: boolean }): void {
+    for (const bucket of [this.hearingUsage, this.currentHearingUsage]) {
+      bucket.calls += 1;
+      if (input.failed) bucket.failures += 1;
+      bucket.costUsd += Math.max(0, input.costUsd ?? 0);
+      bucket.audioSeconds += Math.max(0, input.audioSeconds ?? 0);
+    }
+  }
+
+  /** One described frame. */
+  recordVisionUsage(input: { costUsd?: number; failed?: boolean }): void {
+    for (const bucket of [this.visionUsage, this.currentVisionUsage]) {
+      bucket.calls += 1;
+      if (input.failed) bucket.failures += 1;
+      bucket.costUsd += Math.max(0, input.costUsd ?? 0);
+    }
+  }
+
   useBrainTransport(transport: 'google' | 'openrouter'): void {
     this.brainPrices = BRAIN_PRICES[transport];
   }
@@ -372,9 +411,13 @@ export class UsageTracker {
       this.currentEventsDetected,
     );
     const currentBrain = brainSnapshot(this.currentBrainUsage, this.brainPrices);
-    const totalAi = totalSnapshot(perception.estimatedCostUsd, brain.estimatedCostUsd,
+    const totalAi = totalSnapshot(
+      perception.estimatedCostUsd + this.hearingUsage.costUsd + this.visionUsage.costUsd,
+      brain.estimatedCostUsd,
       (this.accumulatedStreamMs + activeMs) / 60_000, this.eventsDetected, this.brainUsage.decisions, this.sentResponses);
-    const currentTotalAi = totalSnapshot(currentPerception.estimatedCostUsd, currentBrain.estimatedCostUsd,
+    const currentTotalAi = totalSnapshot(
+      currentPerception.estimatedCostUsd + this.currentHearingUsage.costUsd + this.currentVisionUsage.costUsd,
+      currentBrain.estimatedCostUsd,
       currentDurationMs / 60_000, this.currentEventsDetected, this.currentBrainUsage.decisions, this.currentSentResponses);
     const driveBrain = brainSnapshot(this.driveBrainUsage, this.brainPrices);
     const currentDriveBrain = brainSnapshot(this.currentDriveBrainUsage, this.brainPrices);
@@ -412,6 +455,8 @@ export class UsageTracker {
       memoriesSuperseded: this.memoriesSuperseded,
       memoryRetrievals: this.memoryRetrievals,
       perception,
+      hearing: { ...this.hearingUsage },
+      vision: { ...this.visionUsage },
       brain,
       totalAi,
       drive: { ...this.driveCounters },
@@ -432,6 +477,8 @@ export class UsageTracker {
         confirmedDeliveries: this.currentConfirmedDeliveries,
         undeliveredMessages: this.currentUndeliveredMessages,
         perception: currentPerception,
+        hearing: { ...this.currentHearingUsage },
+        vision: { ...this.currentVisionUsage },
         brain: currentBrain,
         totalAi: currentTotalAi,
         drive: { ...this.currentDriveCounters },
@@ -509,6 +556,7 @@ function addBrainUsage(
     target.totalLatencyMs += Math.max(0, metadata.latencyMs);
     target.lastLatencyMs = Math.max(0, metadata.latencyMs);
   }
+  target.costUsd = (target.costUsd ?? 0) + Math.max(0, usage.costUsd ?? 0);
   target.inputTokens += Math.max(0, usage.inputTokens);
   target.cachedInputTokens += Math.max(0, usage.cachedInputTokens);
   target.outputTokens += Math.max(0, usage.outputTokens);
@@ -549,9 +597,13 @@ function brainSnapshot(usage: MutableBrainUsage, prices: BrainTokenPrices): Brai
     totalTokens: usage.totalTokens,
     averageLatencyMs: usage.decisions > 0 ? usage.totalLatencyMs / usage.decisions : 0,
     ...(usage.lastLatencyMs !== undefined ? { lastLatencyMs: usage.lastLatencyMs } : {}),
-    estimatedCostUsd: (nonCachedInput * prices.input
-      + usage.cachedInputTokens * prices.cachedInput
-      + (usage.outputTokens + usage.thoughtTokens) * prices.output) / MILLION,
+    // The transport's own figure when it reports one — every price table in this file has been
+    // wrong at least once, and OpenRouter bills each call and says what it charged.
+    estimatedCostUsd: usage.costUsd && usage.costUsd > 0
+      ? usage.costUsd
+      : (nonCachedInput * prices.input
+        + usage.cachedInputTokens * prices.cachedInput
+        + (usage.outputTokens + usage.thoughtTokens) * prices.output) / MILLION,
   };
 }
 
@@ -578,4 +630,8 @@ function totalSnapshot(
 function modalityCost(tokens: TokenModalityUsage, prices: Record<keyof TokenModalityUsage, number>): number {
   return (Object.keys(tokens) as Array<keyof TokenModalityUsage>)
     .reduce((cost, modality) => cost + tokens[modality] * prices[modality] / MILLION, 0);
+}
+
+function emptySensorUsage(): SensorUsageSnapshot {
+  return { calls: 0, failures: 0, costUsd: 0, audioSeconds: 0 };
 }

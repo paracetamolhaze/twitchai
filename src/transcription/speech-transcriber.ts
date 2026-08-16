@@ -16,6 +16,8 @@ export interface SpeechTranscriberOptions {
    */
   vocabulary?: () => string[];
   onTranscript: (text: string, meta: { audioMs: number; latencyMs: number }) => void | Promise<void>;
+  /** Every attempt, transcript or not, so the bill is counted where it is actually incurred. */
+  onUsage?: (usage: { costUsd?: number; audioSeconds: number; failed: boolean }) => void;
   /** Loudness a frame must clear to count as speech, relative to the measured noise floor. */
   speechFloorRatio?: number;
   /** How far back the quietest moment is looked for when estimating the room. */
@@ -211,8 +213,14 @@ export class SpeechTranscriber {
     this.stats.audioSecondsSent += audioMs / 1000;
     const startedAt = Date.now();
     try {
-      const text = await this.options.backend.transcribe(wav(pcm), this.buildHint());
+      const result = await this.options.backend.transcribe(wav(pcm), this.buildHint());
       const latencyMs = Date.now() - startedAt;
+      this.options.onUsage?.({
+        ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+        audioSeconds: audioMs / 1000,
+        failed: false,
+      });
+      const text = result.text;
       if (!text) return;
       this.stats.transcriptsReceived += 1;
       this.stats.lastTranscript = text;
@@ -220,6 +228,7 @@ export class SpeechTranscriber {
       await this.options.onTranscript(text, { audioMs, latencyMs });
     } catch (cause) {
       this.stats.failures += 1;
+      this.options.onUsage?.({ audioSeconds: audioMs / 1000, failed: true });
       this.logger.warn('Speech transcription failed', { audioMs, cause });
     } finally {
       this.inFlight -= 1;

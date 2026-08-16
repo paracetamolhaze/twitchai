@@ -21,7 +21,7 @@ function transcriber(overrides: Partial<ConstructorParameters<typeof SpeechTrans
   const hints: string[] = [];
   const created = vi.fn(async (_wav: Buffer, hint: string) => {
     hints.push(hint);
-    return 'привет как дела';
+    return { text: 'привет как дела' };
   });
   const instance = new SpeechTranscriber({
     backend: { name: 'test', transcribe: created },

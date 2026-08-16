@@ -37,6 +37,17 @@ interface BrainStatus {
   transcriptsReceived?: number
   stallRecoveries?: number
   msSincePerceptionOutput?: number
+  transcription?: {
+    mode: string; model: string
+    segmentsSent: number; transcriptsReceived: number
+    audioSecondsSent: number; silenceSecondsSkipped: number
+    failures: number; lastTranscript?: string; lastLatencyMs?: number
+  }
+  vision?: {
+    model: string; everySeconds: number
+    described: number; failures: number; framesSeen: number
+    lastDescription?: string; lastDescribedAt?: number; lastLatencyMs?: number
+  }
   modelTurns?: number
   usageReports?: number
   contextWindowMode?: 'explicit' | 'service_default'
@@ -162,6 +173,8 @@ interface Usage {
     estimatedCostUsd: number; estimatedCostPerHourUsd: number
     eventsPerHour: number; brainDecisionsPerHour: number; messagesPerHour: number
   }
+  hearing: SensorUsage
+  vision: SensorUsage
   drive: DriveUsageCounters
   driveBrain: Usage['brain']
   driveCacheHitRatio: number
@@ -180,6 +193,8 @@ interface Usage {
     confirmedDeliveries: number
     undeliveredMessages: number
     perception: Usage['perception']
+    hearing: SensorUsage
+    vision: SensorUsage
     brain: Usage['brain']
     totalAi: Usage['totalAi']
     drive: DriveUsageCounters
@@ -188,6 +203,8 @@ interface Usage {
   }
 }
 interface TokenModalityUsage { text: number; audio: number; video: number; other: number }
+/** A sensor's own share of the bill, priced by what the gateway actually charged. */
+interface SensorUsage { calls: number; failures: number; costUsd: number; audioSeconds: number }
 interface DriveUsageCounters {
   ticks: number; eligibleTicks: number; localSkips: number
   brainCalls: number; brainCallsBlockedByHourlyLimit: number
@@ -405,6 +422,8 @@ const usage = reactive<Usage>({
   guardRejections: 0, eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0,
   memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0,
   perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0, inputTokensByModality: emptyModalities(), outputTokensByModality: emptyModalities() },
+  hearing: emptySensor(),
+  vision: emptySensor(),
   brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
   totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
   drive: emptyDriveUsage(),
@@ -416,6 +435,8 @@ const usage = reactive<Usage>({
     geminiInputTokens: 0, geminiOutputTokens: 0, sentResponses: 0,
     confirmedDeliveries: 0, undeliveredMessages: 0,
     perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0, inputTokensByModality: emptyModalities(), outputTokensByModality: emptyModalities() },
+    hearing: emptySensor(),
+    vision: emptySensor(),
     brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
     totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
     drive: emptyDriveUsage(),
@@ -531,17 +552,29 @@ const healthItems = computed(() => [
         : stateLabel(overview.streamBrain.mediaState),
   },
   {
-    label: 'Gemini Live',
-    tone: overview.streamBrain.geminiStable ? 'ok' : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) ? 'error' : overview.streamBrain.geminiSessionActive ? 'pending' : 'idle',
-    status: overview.streamBrain.geminiStable ? 'Стабильно' : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) ? 'Требует внимания' : overview.streamBrain.geminiSessionActive ? 'Подключение…' : 'Физически остановлена',
-    detail: overview.streamBrain.geminiStable
-      ? 'Единая Live-сессия стабильна'
-      : ['ERROR', 'FATAL_CONFIG_ERROR'].includes(overview.streamBrain.geminiState) && overview.streamBrain.lastError
-        ? operatorErrorLabel(overview.streamBrain.lastError)
-        : sessionReasonLabel(overview.streamBrain.geminiSessionReason),
+    label: 'Слух',
+    tone: !overview.streamBrain.transcription ? 'idle'
+      : overview.streamBrain.transcription.failures > 0 && overview.streamBrain.transcription.transcriptsReceived === 0 ? 'error'
+        : overview.streamBrain.transcription.transcriptsReceived > 0 ? 'ok' : 'pending',
+    status: !overview.streamBrain.transcription ? 'Выключен'
+      : overview.streamBrain.transcription.transcriptsReceived > 0 ? 'Слышит' : 'Ждёт речи',
+    detail: overview.streamBrain.transcription
+      ? `${overview.streamBrain.transcription.transcriptsReceived} реплик · тишины срезано ${((overview.streamBrain.transcription.silenceSecondsSkipped) / 60).toFixed(0)} мин`
+      : 'Речь не распознаётся',
   },
   {
-    label: 'Gemini Brain',
+    label: 'Зрение',
+    tone: !overview.streamBrain.vision ? 'idle'
+      : overview.streamBrain.vision.failures > 0 && overview.streamBrain.vision.described === 0 ? 'error'
+        : overview.streamBrain.vision.described > 0 ? 'ok' : 'pending',
+    status: !overview.streamBrain.vision ? 'Выключено'
+      : overview.streamBrain.vision.described > 0 ? 'Видит' : 'Ждёт кадр',
+    detail: overview.streamBrain.vision
+      ? `${overview.streamBrain.vision.described} описаний · раз в ${overview.streamBrain.vision.everySeconds} с`
+      : 'Кадры не описываются',
+  },
+  {
+    label: 'Brain',
     tone: ['READY', 'THINKING'].includes(overview.geminiBrain.state) ? 'ok' : overview.geminiBrain.state === 'ERROR' ? 'error' : 'idle',
     status: overview.geminiBrain.state === 'READY' ? 'Готов' : overview.geminiBrain.state === 'THINKING' ? 'Принимает решение…' : overview.geminiBrain.state === 'STARTING' ? 'Загружает контекст…' : overview.geminiBrain.state === 'ERROR' ? 'Требует внимания' : 'Остановлен вместе со стримом',
     detail: overview.geminiBrain.lastError
@@ -1168,6 +1201,9 @@ function formatDuration(seconds: number): string {
 function emptyModalities(): TokenModalityUsage {
   return { text: 0, audio: 0, video: 0, other: 0 }
 }
+function emptySensor(): SensorUsage {
+  return { calls: 0, failures: 0, costUsd: 0, audioSeconds: 0 }
+}
 function emptyDriveUsage(): DriveUsageCounters {
   return {
     ticks: 0, eligibleTicks: 0, localSkips: 0, brainCalls: 0, brainCallsBlockedByHourlyLimit: 0,
@@ -1186,13 +1222,6 @@ function stateLabel(state: ConnectionState | BrainState | BrainStatus['mediaStat
     STARTING: 'Запуск', READY: 'Готов', THINKING: 'Принимает решение',
     ERROR: 'Ошибка', FATAL_CONFIG_ERROR: 'Фатальная ошибка конфигурации', DISABLED: 'Выключено',
   } as Record<string, string>)[state] || state
-}
-function sessionReasonLabel(reason: BrainStatus['geminiSessionReason']): string {
-  return ({
-    twitch_live: 'Медиапоток подтверждает прямой эфир', twitch_offline: 'Стрим офлайн',
-    media_connecting: 'Ожидание медиапотока', media_error: 'Ошибка медиапотока',
-    fatal_error: 'Переподключения остановлены', application_stopped: 'Приложение остановлено', disabled: 'Gemini выключена',
-  })[reason]
 }
 function operatorErrorLabel(message?: string): string {
   if (!message) return 'Техническая причина не указана.'
@@ -1220,19 +1249,6 @@ function mediaErrorLabel(message?: string): string {
   if (/timed? ?out|timeout|network|econn|fetch failed|dns|connection/u.test(normalized)) return 'Соединение с медиапотоком Twitch прервалось.'
   return 'Произошла техническая ошибка медиапотока.'
 }
-function closeReasonLabel(code?: number, reason?: string): string {
-  const labels: Record<number, string> = {
-    1000: 'Соединение штатно закрыто.',
-    1001: 'Сервер завершил соединение или перезапускается.',
-    1006: 'Соединение неожиданно оборвалось.',
-    1007: 'Gemini отклонила формат переданных данных.',
-    1008: 'Gemini отклонила запрос по правилам сервиса.',
-    1011: 'На стороне Gemini произошла внутренняя ошибка.',
-    1012: 'Сервис Gemini перезапускается.',
-    1013: 'Сервис Gemini временно перегружен.',
-  }
-  return code !== undefined && labels[code] ? labels[code] : reason ? operatorErrorLabel(reason) : 'Причина отсутствует.'
-}
 function reactionTraceStageLabel(stage: ReactionTrace['stage']): string {
   return ({
     EVENT_DETECTED: 'событие найдено', CANDIDATES_PREPARED: 'кандидаты подготовлены',
@@ -1252,16 +1268,6 @@ function reactionTraceMessageStatusLabel(status: ReactionTraceMessage['status'])
     UNDELIVERED: 'Twitch не показал',
   })[status]
 }
-// Perception can hold a healthy-looking session while returning nothing at all; production ran
-// 5.8 minutes that way. The watchdog remakes the session at two minutes, so anything approaching
-// that is worth seeing on screen rather than only in the logs.
-const perceptionSilenceClass = computed(() => {
-  const silent = overview.streamBrain.msSincePerceptionOutput
-  if (silent === undefined) return ''
-  if (silent >= 90_000) return 'silence-critical'
-  return silent >= 45_000 ? 'silence-warning' : ''
-})
-
 function formatMilliseconds(value?: number): string {
   if (value === undefined || !Number.isFinite(value)) return '—'
   const milliseconds = Math.max(0, value)
@@ -1368,7 +1374,7 @@ function eventTypeLabel(type: string): string {
   return ({ speech: 'речь', gameplay: 'игровой момент', reaction: 'реакция', funny: 'смешной момент', fail: 'ошибка', win: 'победа', loss: 'поражение', surprise: 'неожиданность', conversation: 'разговор', greeting: 'приветствие', visual: 'визуальное событие', question: 'вопрос', direct_mention: 'прямое обращение', irl: 'вживую', food: 'еда', place: 'место', purchase: 'покупка', travel: 'дорога', stranger: 'посторонний', mishap: 'неловкий момент', other: 'другое' } as Record<string, string>)[type] || type
 }
 function sourceLabel(source: StreamEvent['source']): string {
-  return ({ 'gemini-live': 'Gemini Live', chat: 'чат', 'fallback-transcription': 'резервная транскрипция' })[source]
+  return ({ 'gemini-live': 'Gemini Live', chat: 'чат', transcription: 'речь', 'fallback-transcription': 'речь' })[source]
 }
 function streamerMemoryTypeLabel(type: StreamerMemoryType): string {
   return ({
@@ -1609,38 +1615,37 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="activePage === 'brain'">
-          <div class="page-heading"><div><p class="eyebrow">ДВА НЕЗАВИСИМЫХ AI-СЛОЯ</p><h1>Мозг стрима</h1></div><p class="muted">Gemini Live только видит и слышит. Stateful Gemini Brain решает, кому и что написать.</p></div>
+          <div class="page-heading"><div><p class="eyebrow">ДАТЧИКИ И РЕШЕНИЯ</p><h1>Мозг стрима</h1></div><p class="muted">Слух и зрение ничего не решают: они превращают стрим в слова и описания. Решает кому и что написать один Brain.</p></div>
           <section class="brain-summary">
-            <div><span>PERCEPTION · Gemini Live</span><strong>{{ stateLabel(overview.streamBrain.geminiState) }}</strong></div>
-            <div><span>Live-модель</span><strong>{{ overview.streamBrain.model || '—' }}</strong></div>
-            <div><span>BRAIN · Gemini Interactions</span><strong>{{ stateLabel(overview.geminiBrain.state) }}</strong></div>
+            <div><span>СЛУХ</span><strong>{{ overview.streamBrain.transcription?.model || 'выключен' }}</strong></div>
+            <div><span>ЗРЕНИЕ</span><strong>{{ overview.streamBrain.vision?.model || 'выключено' }}</strong></div>
+            <div><span>BRAIN</span><strong>{{ stateLabel(overview.geminiBrain.state) }}</strong></div>
             <div><span>Brain-модель / thinking</span><strong>{{ overview.geminiBrain.model }} / {{ overview.geminiBrain.thinkingLevel }}</strong></div>
             <div><span>Возраст Brain-сессии</span><strong>{{ formatSessionDuration(overview.geminiBrain.sessionStartedAt) }}</strong></div>
             <div><span>Последнее событие</span><strong>{{ formatTime(overview.streamBrain.lastEventAt) }}</strong></div>
           </section>
-          <section class="panel metric-strip"><div><span>Twitch media</span><strong>→</strong></div><div><span>3.1 Live · восприятие</span><strong>→</strong></div><div><span>StreamEvent</span><strong>→</strong></div><div><span>3.7 Brain · решение</span><strong>→</strong></div><div><span>Policy / Twitch</span><strong>✓</strong></div></section>
+          <section class="panel metric-strip"><div><span>Twitch media</span><strong>→</strong></div><div><span>слух · речь</span><strong>→</strong></div><div><span>зрение · сцена</span><strong>→</strong></div><div><span>Brain · решение</span><strong>→</strong></div><div><span>Policy / Twitch</span><strong>✓</strong></div></section>
           <div class="section-heading"><div><p class="eyebrow">ТЕКУЩИЙ ЭФИР</p><h2>Расход и результат</h2></div></div>
           <section class="metric-strip">
-            <div><span>3.1 Live · длительность</span><strong>{{ usage.currentStream.perception.sessionDurationMinutes.toFixed(1) }} мин</strong></div>
-            <div><span>3.1 · аудио / видео</span><strong>{{ usage.currentStream.perception.audioSentMinutes.toFixed(1) }} / {{ usage.currentStream.perception.videoSentMinutes.toFixed(1) }} мин</strong></div>
-            <div><span>3.1 · input / output</span><strong>{{ usage.currentStream.perception.inputTokens }} / {{ usage.currentStream.perception.outputTokens }}</strong></div>
-            <div><span>3.1 · стоимость</span><strong>${{ usage.currentStream.perception.estimatedCostUsd.toFixed(4) }}</strong></div>
+            <div><span>Слух · сегментов</span><strong>{{ usage.currentStream.hearing.calls }}</strong></div>
+            <div><span>Слух · речи отправлено</span><strong>{{ (usage.currentStream.hearing.audioSeconds / 60).toFixed(1) }} мин</strong></div>
+            <div><span>Слух · сбоев</span><strong>{{ usage.currentStream.hearing.failures }}</strong></div>
+            <div><span>Слух · стоимость</span><strong>${{ usage.currentStream.hearing.costUsd.toFixed(4) }}</strong></div>
           </section>
           <section class="metric-strip">
-            <div><span>3.1 input · видео</span><strong>{{ usage.currentStream.perception.inputTokensByModality.video }}</strong></div>
-            <div><span>3.1 input · аудио</span><strong>{{ usage.currentStream.perception.inputTokensByModality.audio }}</strong></div>
-            <div><span>3.1 input · текст</span><strong>{{ usage.currentStream.perception.inputTokensByModality.text }}</strong></div>
-            <div><span>3.1 output · аудио</span><strong>{{ usage.currentStream.perception.outputTokensByModality.audio }}</strong></div>
-            <div><span>3.1 output · текст</span><strong>{{ usage.currentStream.perception.outputTokensByModality.text }}</strong></div>
+            <div><span>Зрение · описаний</span><strong>{{ usage.currentStream.vision.calls }}</strong></div>
+            <div><span>Зрение · кадров получено</span><strong>{{ overview.streamBrain.vision?.framesSeen ?? 0 }}</strong></div>
+            <div><span>Зрение · сбоев</span><strong>{{ usage.currentStream.vision.failures }}</strong></div>
+            <div><span>Зрение · стоимость</span><strong>${{ usage.currentStream.vision.costUsd.toFixed(4) }}</strong></div>
           </section>
           <section class="metric-strip">
-            <div><span>3.7 · interactions / decisions</span><strong>{{ usage.currentStream.brain.interactions }} / {{ usage.currentStream.brain.decisions }}</strong></div>
-            <div><span>3.7 · input / cached</span><strong>{{ usage.currentStream.brain.inputTokens }} / {{ usage.currentStream.brain.cachedInputTokens }}</strong></div>
-            <div><span>3.7 · output / thinking</span><strong>{{ usage.currentStream.brain.outputTokens }} / {{ usage.currentStream.brain.thinkingTokens }}</strong></div>
-            <div><span>3.7 · latency / стоимость</span><strong>{{ formatMilliseconds(usage.currentStream.brain.averageLatencyMs) }} / ${{ usage.currentStream.brain.estimatedCostUsd.toFixed(4) }}</strong></div>
+            <div><span>Brain · interactions / decisions</span><strong>{{ usage.currentStream.brain.interactions }} / {{ usage.currentStream.brain.decisions }}</strong></div>
+            <div><span>Brain · input / cached</span><strong>{{ usage.currentStream.brain.inputTokens }} / {{ usage.currentStream.brain.cachedInputTokens }}</strong></div>
+            <div><span>Brain · output / thinking</span><strong>{{ usage.currentStream.brain.outputTokens }} / {{ usage.currentStream.brain.thinkingTokens }}</strong></div>
+            <div><span>Brain · latency / стоимость</span><strong>{{ formatMilliseconds(usage.currentStream.brain.averageLatencyMs) }} / ${{ usage.currentStream.brain.estimatedCostUsd.toFixed(4) }}</strong></div>
           </section>
           <section class="panel metric-strip">
-            <div><span>События Live</span><strong>{{ usage.currentStream.perception.events }}</strong></div>
+            <div><span>Событий распознано</span><strong>{{ usage.currentStream.perception.events }}</strong></div>
             <div><span>Решения Brain</span><strong>{{ overview.geminiBrain.decisions }}</strong></div>
             <div><span>Осознанная тишина</span><strong>{{ overview.geminiBrain.silentDecisions }}</strong></div>
             <div><span>Создано / отправлено</span><strong>{{ overview.geminiBrain.generatedReactions }} / {{ usage.currentStream.sentResponses }}</strong></div>
@@ -1671,7 +1676,7 @@ onBeforeUnmount(() => {
             <div><span>Стоимость Persona Drive</span><strong>${{ usage.currentStream.driveBrain.estimatedCostUsd.toFixed(4) }}</strong></div>
           </section>
           <section class="panel debug-context">
-            <div><h3>Диагностика двух слоёв</h3><p>Perception стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · ошибок протокола: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Live-сессия: возраст <b>{{ formatSessionDuration(overview.streamBrain.sessionStartedAt) }}</b> · reconnects <b>{{ usage.geminiReconnects }}</b> · аудио отправлено в Gemini <b>{{ overview.streamBrain.audioChunksSent ?? 0 }}</b> чанков · видео отправлено <b>{{ overview.streamBrain.videoFramesSent ?? 0 }}</b> кадров · транскриптов получено <b>{{ overview.streamBrain.transcriptsReceived ?? 0 }}</b> · молчит <b :class="perceptionSilenceClass">{{ formatMilliseconds(overview.streamBrain.msSincePerceptionOutput) }}</b> · пересозданий из-за тишины <b>{{ overview.streamBrain.stallRecoveries ?? 0 }}</b></p><p>Live turns: <b>{{ overview.streamBrain.modelTurns ?? 0 }}</b> · отчётов об usage <b>{{ overview.streamBrain.usageReports ?? 0 }}</b> · окно контекста <b>{{ overview.streamBrain.contextWindowMode === 'service_default' ? 'ДЕФОЛТ СЕРВИСА (дорого)' : '16k → 8k' }}</b> · вывод <b>{{ overview.streamBrain.responseModality ?? "—" }}</b></p><p>Brain: <b>{{ stateLabel(overview.geminiBrain.state) }}</b> · последнее решение {{ formatMilliseconds(overview.geminiBrain.lastLatencyMs) }} · среднее {{ formatMilliseconds(overview.geminiBrain.averageLatencyMs) }} · recovery {{ overview.geminiBrain.rebuiltSessions }} · rollover {{ overview.geminiBrain.rollovers }}</p><p v-if="overview.geminiBrain.lastError">Ошибка Brain: <b>{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</b></p><p>Последнее закрытие Live: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ closeReasonLabel(overview.streamBrain.lastCloseCode, overview.streamBrain.lastCloseReason) }}</p><details v-if="overview.streamBrain.lastCloseReason"><summary>Техническое сообщение сервера</summary><code>{{ overview.streamBrain.lastCloseReason }}</code></details><p>Последние операции Live: исходящая <b>{{ diagnosticOperationLabel(overview.streamBrain.lastOutbound) }}</b> · инструмент <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolCall) }}</b> · медиа <b>{{ diagnosticOperationLabel(overview.streamBrain.lastMediaInput) }}</b></p></div>
+            <div><h3>Диагностика слоёв</h3><p>Слух: <b>{{ overview.streamBrain.transcription?.model || 'выключен' }}</b> · сегментов <b>{{ overview.streamBrain.transcription?.segmentsSent ?? 0 }}</b> · транскриптов <b>{{ overview.streamBrain.transcription?.transcriptsReceived ?? 0 }}</b> · речи отправлено <b>{{ ((overview.streamBrain.transcription?.audioSecondsSent ?? 0) / 60).toFixed(1) }} мин</b> · тишины срезано <b>{{ ((overview.streamBrain.transcription?.silenceSecondsSkipped ?? 0) / 60).toFixed(1) }} мин</b> · сбоев <b>{{ overview.streamBrain.transcription?.failures ?? 0 }}</b> · задержка <b>{{ formatMilliseconds(overview.streamBrain.transcription?.lastLatencyMs) }}</b></p><p v-if="overview.streamBrain.transcription?.lastTranscript">Последнее услышанное: <b>{{ overview.streamBrain.transcription.lastTranscript }}</b></p><p>Зрение: <b>{{ overview.streamBrain.vision?.model || 'выключено' }}</b> · раз в <b>{{ overview.streamBrain.vision?.everySeconds ?? 0 }} с</b> · кадров получено <b>{{ overview.streamBrain.vision?.framesSeen ?? 0 }}</b> · описаний <b>{{ overview.streamBrain.vision?.described ?? 0 }}</b> · сбоев <b>{{ overview.streamBrain.vision?.failures ?? 0 }}</b> · задержка <b>{{ formatMilliseconds(overview.streamBrain.vision?.lastLatencyMs) }}</b></p><p v-if="overview.streamBrain.vision?.lastDescription">Последнее увиденное: <b>{{ overview.streamBrain.vision.lastDescription }}</b></p><p>Медиапоток: <b>{{ stateLabel(overview.streamBrain.mediaState) }}</b> · захвачено аудио <b>{{ usage.currentStream.capturedAudioMinutes.toFixed(1) }} мин</b> · видео <b>{{ usage.currentStream.capturedVideoMinutes.toFixed(1) }} мин</b></p><p>Brain: <b>{{ stateLabel(overview.geminiBrain.state) }}</b> · последнее решение {{ formatMilliseconds(overview.geminiBrain.lastLatencyMs) }} · среднее {{ formatMilliseconds(overview.geminiBrain.averageLatencyMs) }} · recovery {{ overview.geminiBrain.rebuiltSessions }} · rollover {{ overview.geminiBrain.rollovers }}</p><p v-if="overview.geminiBrain.lastError">Ошибка Brain: <b>{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</b></p><details v-if="overview.geminiBrain.lastError"><summary>Техническое сообщение сервера</summary><code>{{ overview.geminiBrain.lastError }}</code></details><p v-if="overview.streamBrain.geminiState !== 'DISABLED'">Live-сессия (устаревший слой): <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · reconnects <b>{{ usage.geminiReconnects }}</b></p></div>
             <pre>{{ (overview.streamBrain.outboundTrace || []).map(item => `${formatTime(item.at)} ${diagnosticOperationLabel(item.type)}${item.bytes !== undefined ? ` (${item.bytes} байт)` : ''}`).join('\n') || 'Исходящих операций пока нет.' }}</pre>
           </section>
           <div class="section-heading reaction-trace-heading">

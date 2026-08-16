@@ -12,10 +12,16 @@ const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
  * and the hint are the same whichever service is listening, so swapping one for the other is a
  * configuration value rather than a rewrite.
  */
+export interface TranscriptionResult {
+  text?: string;
+  /** What the call cost, when the service reports it. Beats any local price table. */
+  costUsd?: number;
+}
+
 export interface TranscriptionBackend {
   readonly name: string;
   /** `hint` carries the previous transcript and the names in play; a backend may ignore it. */
-  transcribe(wav: Buffer, hint: string): Promise<string | undefined>;
+  transcribe(wav: Buffer, hint: string): Promise<TranscriptionResult>;
 }
 
 export interface OpenRouterTranscriptionOptions {
@@ -43,7 +49,7 @@ export class OpenRouterTranscriptionBackend implements TranscriptionBackend {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async transcribe(wav: Buffer, hint: string): Promise<string | undefined> {
+  async transcribe(wav: Buffer, hint: string): Promise<TranscriptionResult> {
     const response = await this.fetchImpl(OPENROUTER_ENDPOINT, {
       method: 'POST',
       headers: {
@@ -69,11 +75,16 @@ export class OpenRouterTranscriptionBackend implements TranscriptionBackend {
     const body = await response.json() as {
       error?: { message?: string };
       choices?: Array<{ message?: { content?: string } }>;
+      usage?: { cost?: number };
     };
     if (!response.ok || body.error) {
       throw new Error(`${response.status} ${body.error?.message ?? response.statusText}`);
     }
-    return clean(body.choices?.[0]?.message?.content);
+    const text = clean(body.choices?.[0]?.message?.content);
+    return {
+      ...(text ? { text } : {}),
+      ...(typeof body.usage?.cost === 'number' ? { costUsd: body.usage.cost } : {}),
+    };
   }
 
   private instruction(hint: string): string {
@@ -102,7 +113,7 @@ export class GroqWhisperBackend implements TranscriptionBackend {
     this.groq = new Groq({ apiKey: options.apiKey });
   }
 
-  async transcribe(wav: Buffer, hint: string): Promise<string | undefined> {
+  async transcribe(wav: Buffer, hint: string): Promise<TranscriptionResult> {
     const file = path.join(os.tmpdir(), `twitch-ai-${randomUUID()}.wav`);
     try {
       await writeFile(file, wav);
@@ -115,7 +126,8 @@ export class GroqWhisperBackend implements TranscriptionBackend {
           ? { language: this.options.language }
           : {}),
       });
-      return clean(result.text);
+      const text = clean(result.text);
+      return text ? { text } : {};
     } finally {
       await unlink(file).catch(() => undefined);
     }
