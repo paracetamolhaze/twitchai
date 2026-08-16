@@ -14,7 +14,7 @@ interface ChatMessage {
 
 interface ChatCompletionResponse {
   id?: string;
-  error?: { message?: string; code?: number };
+  error?: { message?: string; code?: number; metadata?: { raw?: string; provider_name?: string } };
   choices?: Array<{ finish_reason?: string; message?: { content?: string } }>;
   usage?: {
     prompt_tokens?: number;
@@ -90,8 +90,11 @@ export class OpenRouterBrainClient implements BrainInteractionClient {
     const body = await response.json() as ChatCompletionResponse;
     if (!response.ok || body.error) {
       // Kept in the shape the service already recognises: it tells a rate limit, an empty balance
-      // and a refused prompt apart by reading the message, and each has its own handling.
-      throw new Error(`${response.status} ${body.error?.message ?? response.statusText}`);
+      // and a refused prompt apart by reading the message, and each has its own handling. The
+      // provider's own words are appended because the gateway's are generic to the point of
+      // useless — "400 Provider returned error" was the only thing reported while every decision
+      // on a live stream failed, and the reason it hid was a single unsupported keyword.
+      throw new Error(`${response.status} ${body.error?.message ?? response.statusText}${providerDetail(body)}`);
     }
     const choice = body.choices?.[0];
     const outputText = choice?.message?.content ?? undefined;
@@ -150,4 +153,17 @@ export class OpenRouterBrainClient implements BrainInteractionClient {
       this.chains.delete(oldest);
     }
   }
+}
+
+/** The upstream error text OpenRouter wraps, unwrapped far enough to name the actual problem. */
+function providerDetail(body: ChatCompletionResponse): string {
+  const raw = body.error?.metadata?.raw;
+  if (!raw) return '';
+  let detail = raw;
+  try {
+    const parsed = JSON.parse(raw) as { error?: { message?: string } };
+    detail = parsed.error?.message ?? raw;
+  } catch { /* not JSON; the text itself is the detail */ }
+  const provider = body.error?.metadata?.provider_name;
+  return ` — ${provider ? `${provider}: ` : ''}${detail.slice(0, 300)}`;
 }

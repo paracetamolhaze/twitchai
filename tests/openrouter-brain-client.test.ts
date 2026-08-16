@@ -143,6 +143,31 @@ describe('OpenRouterBrainClient', () => {
     await expect(instance.create(bootstrap)).rejects.toThrow(/429 Insufficient credits/);
   });
 
+  it('repeats what the provider itself said, since the gateway wording is useless alone', async () => {
+    // "400 Provider returned error" was all that reached the logs while every decision on a live
+    // stream failed, and the reason it hid was one unsupported keyword in a schema.
+    const raw = JSON.stringify({
+      error: { code: 400, message: "schema at top-level requires unspecified property 'ready'" },
+    });
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      json: async () => ({
+        error: {
+          message: 'Provider returned error',
+          metadata: { provider_name: 'Google AI Studio', raw },
+        },
+      }),
+    } as unknown as Response));
+    const instance = new OpenRouterBrainClient({
+      apiKey: 'test-key',
+      logger: new Logger('TEST', 'error'),
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(instance.create(bootstrap)).rejects.toThrow(/Google AI Studio: schema at top-level/);
+  });
+
   it('refuses to answer from a conversation it no longer holds, so the session is rebuilt', async () => {
     const { instance } = client(() => completion('turn-1', '{"ready":true}'));
     await expect(instance.create({

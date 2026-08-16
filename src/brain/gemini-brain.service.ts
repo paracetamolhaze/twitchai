@@ -132,9 +132,16 @@ export const BRAIN_DECISION_RESPONSE_SCHEMA = {
   },
 } as const;
 
+/**
+ * No `enum: [true]` on the boolean, however much it documents the intent. Google's structured
+ * output drops a boolean carrying an enum, which leaves `required` naming a property the schema no
+ * longer defines — the whole request comes back as "schema at top-level requires unspecified
+ * property 'ready'", the bootstrap never completes, and with it no decision is ever made. The value
+ * is still pinned by readySchema on the way back in.
+ */
 const READY_RESPONSE_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['ready'],
-  properties: { ready: { type: 'boolean', enum: [true] } },
+  properties: { ready: { type: 'boolean' } },
 } as const;
 
 /**
