@@ -134,27 +134,50 @@ export class OpenRouterBrainClient implements BrainInteractionClient {
       });
       throw new Error('previous interaction not found');
     }
-    if (previous) return [...previous, { role: 'user', content: request.input }];
+    // The breakpoint goes on the last turn of the conversation so far, not on the opening one.
+    // Only what precedes it is cached, so marking the opening turn cached the persona block and
+    // left the whole growing chain to be re-read at full price on every call: a measured stream
+    // billed 18.9k tokens per decision at a 35% cache hit, against 75-85% on the stateful API
+    // this replaced. Moving the mark forward each time leaves only the new event uncached.
+    if (previous) {
+      const settled = previous.slice(0, -1);
+      const last = previous[previous.length - 1];
+      return [
+        ...settled,
+        ...(last ? [markCacheBreakpoint(last)] : []),
+        { role: 'user', content: request.input },
+      ];
+    }
 
     return [
       { role: 'system', content: request.systemInstruction },
-      {
-        role: 'user',
-        // The breakpoint sits on the opening turn because that is the only content guaranteed
-        // identical for the rest of the stream — every later turn differs by definition.
-        content: [{ type: 'text', text: request.input, cache_control: { type: 'ephemeral' } }],
-      },
+      { role: 'user', content: [{ type: 'text', text: request.input, cache_control: { type: 'ephemeral' } }] },
     ];
   }
 
   private remember(id: string, messages: ChatMessage[], outputText: string): void {
-    this.chains.set(id, [...messages, { role: 'assistant', content: outputText }]);
+    // Stored plain: the breakpoint is a property of one request, and letting the marks accumulate
+    // would send a growing pile of them, most of which the service ignores anyway.
+    const plain = messages.map(stripCacheBreakpoint);
+    this.chains.set(id, [...plain, { role: 'assistant', content: outputText }]);
     while (this.chains.size > this.maxRetainedChains) {
       const oldest = this.chains.keys().next().value;
       if (oldest === undefined) break;
       this.chains.delete(oldest);
     }
   }
+}
+
+function markCacheBreakpoint(message: ChatMessage): ChatMessage {
+  const text = typeof message.content === 'string'
+    ? message.content
+    : message.content.map((part) => part.text).join('');
+  return { role: message.role, content: [{ type: 'text', text, cache_control: { type: 'ephemeral' } }] };
+}
+
+function stripCacheBreakpoint(message: ChatMessage): ChatMessage {
+  if (typeof message.content === 'string') return message;
+  return { role: message.role, content: message.content.map((part) => part.text).join('') };
 }
 
 /** The upstream error text OpenRouter wraps, unwrapped far enough to name the actual problem. */

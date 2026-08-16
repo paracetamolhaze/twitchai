@@ -86,11 +86,43 @@ describe('OpenRouterBrainClient', () => {
     expect(JSON.stringify(sent[2]?.messages)).not.toContain('{"event":"a"}');
   });
 
-  it('marks the opening turn for caching, which is what makes per-event decisions affordable', async () => {
-    const { instance, sent } = client(() => completion('turn-1', '{"ready":true}'));
-    await instance.create(bootstrap);
-    const opening = sent[0]?.messages[1]?.content as Array<{ cache_control?: { type: string } }>;
-    expect(opening[0]?.cache_control).toEqual({ type: 'ephemeral' });
+  it('moves the cache mark forward with the conversation, not leaving it on the opening turn', async () => {
+    // Only what precedes the mark is cached. Left on the opening turn it cached the persona block
+    // and re-read the whole growing chain at full price every call: a measured stream billed 18.9k
+    // tokens per decision at a 35% cache hit, against 75-85% on the API this replaced.
+    const { instance, sent } = client((_body, call) => completion(`turn-${call}`, '{"ready":true}'));
+    const first = await instance.create(bootstrap);
+    const second = await instance.create({
+      ...bootstrap, kind: 'decision', input: '{"event":"a"}', previousInteractionId: first.id,
+    });
+    await instance.create({
+      ...bootstrap, kind: 'decision', input: '{"event":"b"}', previousInteractionId: second.id,
+    });
+
+    const marked = (body: typeof sent[number]): number[] => body.messages
+      .map((message, index) => Array.isArray(message.content)
+        && (message.content as Array<{ cache_control?: unknown }>).some((part) => part.cache_control)
+        ? index : -1)
+      .filter((index) => index >= 0);
+
+    expect(marked(sent[0]!)).toEqual([1]);
+    // The last settled turn carries it, and the new event stays outside the cached prefix.
+    expect(marked(sent[2]!)).toEqual([sent[2]!.messages.length - 2]);
+    expect(sent[2]?.messages.at(-1)?.content).toBe('{"event":"b"}');
+  });
+
+  it('keeps the stored conversation free of marks, so they cannot pile up', async () => {
+    const { instance, sent } = client((_body, call) => completion(`turn-${call}`, '{"ready":true}'));
+    const first = await instance.create(bootstrap);
+    const second = await instance.create({
+      ...bootstrap, kind: 'decision', input: '{"event":"a"}', previousInteractionId: first.id,
+    });
+    await instance.create({
+      ...bootstrap, kind: 'decision', input: '{"event":"b"}', previousInteractionId: second.id,
+    });
+    const marks = sent[2]!.messages.filter((message) => Array.isArray(message.content)
+      && (message.content as Array<{ cache_control?: unknown }>).some((part) => part.cache_control));
+    expect(marks).toHaveLength(1);
   });
 
   it('asks for a strictly enforced schema and refuses endpoints that would ignore it', async () => {

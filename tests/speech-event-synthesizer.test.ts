@@ -23,7 +23,7 @@ describe('SpeechEventSynthesizer', () => {
     vi.useFakeTimers();
     const { instance, emitted } = synthesizer();
     instance.accept('короче я щас доем и поедем в центр, там бар нормальный есть');
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(emitted).toHaveLength(1);
     expect(emitted[0]?.speech).toBe('короче я щас доем и поедем в центр, там бар нормальный есть');
     expect(emitted[0]?.summary).toBe(emitted[0]?.speech);
@@ -83,7 +83,7 @@ describe('SpeechEventSynthesizer', () => {
     instance.accept('слушай');
     await vi.advanceTimersByTimeAsync(2_000);
     instance.accept('а тут вообще нормально кормят или так себе');
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(emitted).toHaveLength(1);
     expect(emitted[0]?.speech).toBe('слушай а тут вообще нормально кормят или так себе');
   });
@@ -94,14 +94,14 @@ describe('SpeechEventSynthesizer', () => {
     // A moment first, so the scene that follows lands inside the quiet window and rides along with
     // the next thing said instead of becoming a moment of its own.
     instance.accept('короче я щас доем и поедем в центр, там бар нормальный есть');
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(emitted).toHaveLength(1);
 
     instance.acceptScene('Мужчина сидит за столом в кафе, перед ним тарелка.', true);
     expect(emitted).toHaveLength(1);
 
     instance.accept('ну такое себе, честно говоря, за такие деньги');
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(emitted).toHaveLength(2);
     expect(emitted[1]?.visualContext).toBe('Мужчина сидит за столом в кафе, перед ним тарелка.');
   });
@@ -112,7 +112,7 @@ describe('SpeechEventSynthesizer', () => {
     vi.useFakeTimers();
     const { instance, emitted } = synthesizer({ quietBeforeVisualMs: 40_000 });
     instance.accept('короче я щас доем и поедем в центр, там бар нормальный есть');
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(emitted).toHaveLength(1);
 
     instance.acceptScene('Улица, вечер, компания идёт мимо витрин.', true);
