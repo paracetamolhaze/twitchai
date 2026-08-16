@@ -98,10 +98,12 @@ const envSchema = z.object({
   TWITCH_CATEGORY_REFRESH_SECONDS: z.coerce.number().min(30).max(3600).default(120),
   GEMINI_API_KEY: z.string().trim().optional(),
   GEMINI_LIVE_MODEL: z.string().trim().default('gemini-3.1-flash-live-preview'),
-  // Perception is instructed never to speak and its audio output is discarded on arrival, so text
-  // is both cheaper and closer to what the layer actually does. Some Live models only support
-  // audio output — set this to `audio` if the session refuses to start.
-  GEMINI_LIVE_RESPONSE_MODALITY: z.enum(['text', 'audio']).default('text'),
+  // Text output would be both cheaper ($4.5/M against $12/M) and closer to what this layer does,
+  // since perception is instructed never to speak and its audio is discarded on arrival — but
+  // gemini-3.1-flash-live-preview rejects the session outright with 1007: "The requested
+  // combination of response modalities (TEXT) is not supported by the model." Kept configurable
+  // for a model that does support it; on this one, audio is the only working value.
+  GEMINI_LIVE_RESPONSE_MODALITY: z.enum(['text', 'audio']).default('audio'),
   GEMINI_BRAIN_MODEL: z.string().trim().default('gemini-3.7-flash'),
   GEMINI_BRAIN_THINKING_LEVEL: z.enum(['low', 'medium', 'high']).default('low'),
   BRAIN_EVENT_MERGE_WINDOW_MS: z.coerce.number().int().min(0).max(2_000).default(250),

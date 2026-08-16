@@ -107,7 +107,7 @@ export class GeminiLiveClient implements StreamBrainClient {
   private useExplicitContextWindow = true;
 
   constructor(private readonly options: GeminiLiveClientOptions) {
-    this.effectiveResponseModality = options.responseModality ?? 'text';
+    this.effectiveResponseModality = options.responseModality ?? 'audio';
     this.ai = new GoogleGenAI({ apiKey: options.apiKey });
     this.logger = options.logger.child('PERCEPTION');
     this.backoff = new ExponentialBackoff(

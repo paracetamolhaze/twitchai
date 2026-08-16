@@ -188,14 +188,15 @@ describe('Gemini Live perception protocol', () => {
     client.stop();
   });
 
-  it('asks for text output by default and keeps a bounded retained context', async () => {
+  it('asks for the only output this model accepts and keeps a bounded retained context', async () => {
     let parameters: LiveConnectParameters | undefined;
     const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
     const client = createClient({ connect: async (value) => { parameters = value; return session; } });
     await client.start();
-    // Perception is told never to speak and its audio parts are discarded on arrival, so asking
-    // for spoken output was paying $12/M for tokens that were thrown away.
-    expect(parameters?.config?.responseModalities).toEqual(['TEXT']);
+    // Text would be cheaper and closer to what this layer does — it is told never to speak and its
+    // audio parts are discarded on arrival — but gemini-3.1-flash-live-preview refuses the session
+    // with 1007: "The requested combination of response modalities (TEXT) is not supported".
+    expect(parameters?.config?.responseModalities).toEqual(['AUDIO']);
     // Every model turn re-reads the retained window; leaving its size to the service default made
     // a 4.6-minute session report 308k input tokens against roughly 27k of media actually sent.
     expect(parameters?.config?.contextWindowCompression?.slidingWindow).toBeDefined();
@@ -240,6 +241,8 @@ describe('Gemini Live perception protocol', () => {
     const client = createClient({
       connect: async (parameters) => { connections.push(parameters); return session; },
       reconnectMinimumMs: 1, reconnectMaximumMs: 1,
+      // Explicit, since the shipped default is already the fallback value for the current model.
+      responseModality: 'text',
     });
     await client.start();
     expect(connections[0]?.config?.responseModalities).toEqual(['TEXT']);
