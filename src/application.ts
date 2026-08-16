@@ -728,6 +728,9 @@ export class Application {
 
   private handleSpokenTranscript(text: string): void {
     if (!text.trim()) return;
+    // Kept verbatim for the decision layer, separately from the spoken-mention detection below,
+    // which only ever looked for a bot name and discarded everything else that was said.
+    this.contextStore.addSpeech(text);
     this.transcriptAccumulator = (this.transcriptAccumulator + ' ' + text).trim();
     if (this.transcriptTimer) clearTimeout(this.transcriptTimer);
     this.transcriptTimer = setTimeout(() => {

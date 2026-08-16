@@ -47,6 +47,12 @@ export interface ChatMessage {
   kind: 'viewer' | 'bot' | 'system';
 }
 
+/** One transcribed utterance, as words rather than as perception's description of them. */
+export interface SpokenLine {
+  timestamp: number;
+  text: string;
+}
+
 export interface StreamContextSnapshot {
   channel: string;
   category: string;
@@ -54,6 +60,7 @@ export interface StreamContextSnapshot {
   isLive: boolean;
   recentChat: ChatMessage[];
   recentEvents: StreamEvent[];
+  recentSpeech: SpokenLine[];
   botUsernames: string[];
   updatedAt: number;
 }

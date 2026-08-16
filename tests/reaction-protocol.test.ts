@@ -94,6 +94,7 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
     coordinator, globalMemory, history, policy, sent, usage,
     setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; },
     setObservesChat: (value: boolean) => { observesChat = value; },
+    contextStore,
   };
 }
 
@@ -503,6 +504,18 @@ describe('single-session reaction protocol', () => {
     });
     // The first account still answers immediately — this is transport spacing, not a typing delay.
     expect(result.accepted.map((item) => item.delayMs)).toEqual([0, 900]);
+    await coordinator.stop();
+  });
+
+  it('sends what was actually said alongside perception\'s retelling of it', async () => {
+    const { coordinator, contextStore } = await setup();
+    // Perception already transcribes the stream, and those words were read only to spot a spoken
+    // bot name and then dropped — leaving the decision layer with a retelling that turns "we are
+    // trying to drag him along for drinks" into "proposes some sort of plan".
+    contextStore.addSpeech('мы пытаемся его взять с собой бухать', event.timestamp - 1_000);
+    contextStore.addSpeech('слишком старое', event.timestamp - 600_000);
+    const prepared = await coordinator.prepareBrainEvent(event, event.timestamp - 5_000);
+    expect(prepared.recentSpeech?.map((line) => line.text)).toEqual(['мы пытаемся его взять с собой бухать']);
     await coordinator.stop();
   });
 

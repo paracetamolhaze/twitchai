@@ -88,6 +88,12 @@ export interface BrainEventInput {
    * which left the anti-repetition rule with nothing to compare against on an ordinary event.
    */
   recentAccountMessages?: Array<{ username: string; messages: string[] }>;
+  /**
+   * What was actually said, transcribed, rather than perception's retelling of it. The event
+   * summary is one model describing a moment in its own words — "proposes some sort of plan" where
+   * the words were "we are trying to drag him along for drinks". These are the words.
+   */
+  recentSpeech?: Array<{ timestamp: number; text: string }>;
   recentChatDelta: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
   targetedPersonaContext: BrainTargetedPersonaContext[];
   reactionExamples: ReactionExample[];

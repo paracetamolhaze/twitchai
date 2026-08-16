@@ -391,6 +391,9 @@ export class ReactionCoordinator extends EventEmitter {
       triggerKind: 'external_stream_event',
       availableBots: candidates.map((candidate) => candidate.username),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
+      // Only what was said around this moment: older lines belong to a part of the stream the
+      // event is not about, and the chain already carries them from earlier turns.
+      recentSpeech: snapshot.recentSpeech.filter((line) => line.timestamp > chatAfter).slice(-8),
       recentChatDelta: snapshot.recentChat
         .filter((message) => message.timestamp > chatAfter)
         .slice(-40)
