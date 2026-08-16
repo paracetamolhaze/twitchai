@@ -45,6 +45,13 @@ export interface AppConfig {
     brainContextRolloverTokens: number;
     brainInteractionTimeoutMs: number;
   };
+  openRouter: {
+    /** Set to route the Brain through OpenRouter instead of Gemini's stateful Interactions API. */
+    apiKey?: string;
+    brainModel: string;
+    appUrl?: string;
+    appName: string;
+  };
   stream: {
     context: string;
     visionFps: number;
@@ -107,6 +114,9 @@ const envSchema = z.object({
   TWITCH_TOKEN_ENCRYPTION_KEY: z.string().min(32).optional(),
   TWITCH_CATEGORY_REFRESH_SECONDS: z.coerce.number().min(30).max(3600).default(120),
   GEMINI_API_KEY: z.string().trim().optional(),
+  OPENROUTER_API_KEY: z.string().trim().optional(),
+  OPENROUTER_BRAIN_MODEL: z.string().trim().default('google/gemini-3.7-flash'),
+  OPENROUTER_APP_NAME: z.string().trim().default('twitch-ai'),
   GEMINI_LIVE_MODEL: z.string().trim().default('gemini-3.1-flash-live-preview'),
   // Text output would be both cheaper ($4.5/M against $12/M) and closer to what this layer does,
   // since perception is instructed never to speak and its audio is discarded on arrival — but
@@ -262,6 +272,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       brainEventMergeWindowMs: parsed.BRAIN_EVENT_MERGE_WINDOW_MS,
       brainContextRolloverTokens: parsed.BRAIN_CONTEXT_ROLLOVER_TOKENS,
       brainInteractionTimeoutMs: parsed.BRAIN_INTERACTION_TIMEOUT_SECONDS * 1000,
+    },
+    openRouter: {
+      apiKey: parsed.OPENROUTER_API_KEY,
+      brainModel: parsed.OPENROUTER_BRAIN_MODEL,
+      ...(parsed.FRONTEND_URL ? { appUrl: parsed.FRONTEND_URL.split(',')[0] } : {}),
+      appName: parsed.OPENROUTER_APP_NAME,
     },
     stream: {
       context: parsed.STREAM_CONTEXT.trim(),

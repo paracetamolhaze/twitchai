@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { ApiServer, createApiServer } from './api/server';
 import { GeminiBrainService } from './brain/gemini-brain.service';
 import { GoogleInteractionsClient } from './brain/google-interactions.client';
+import { OpenRouterBrainClient } from './brain/openrouter-brain.client';
 import { BrainBootstrap, BrainDecision, BrainDynamicDelta, GeminiBrainStatus } from './brain/types';
 import { accumulatesMemory, AppConfig, normalizeChannel } from './config';
 import { GlobalStreamerMemory } from './global-memory/global-streamer-memory';
@@ -184,10 +185,30 @@ export class Application {
       observesChat: () => this.botManager.hasChatReader(),
     });
 
-    if (this.config.gemini.apiKey) {
+    // OpenRouter wins when both are configured: it is the deliberate choice, and a leftover Gemini
+    // key should not quietly keep billing an account the operator has moved off.
+    const brainClient = this.config.openRouter.apiKey
+      ? new OpenRouterBrainClient({
+          apiKey: this.config.openRouter.apiKey,
+          logger: this.logger,
+          appName: this.config.openRouter.appName,
+          ...(this.config.openRouter.appUrl ? { appUrl: this.config.openRouter.appUrl } : {}),
+        })
+      : this.config.gemini.apiKey
+        ? new GoogleInteractionsClient(this.config.gemini.apiKey)
+        : undefined;
+    const brainModel = this.config.openRouter.apiKey
+      ? this.config.openRouter.brainModel
+      : this.config.gemini.brainModel;
+
+    if (brainClient) {
+      this.usage.useBrainTransport(this.config.openRouter.apiKey ? 'openrouter' : 'google');
+      this.logger.info('Brain transport selected', {
+        via: this.config.openRouter.apiKey ? 'openrouter' : 'google-interactions', model: brainModel,
+      });
       this.geminiBrain = new GeminiBrainService({
-        client: new GoogleInteractionsClient(this.config.gemini.apiKey),
-        model: this.config.gemini.brainModel,
+        client: brainClient,
+        model: brainModel,
         thinkingLevel: this.config.gemini.brainThinkingLevel,
         bootstrap: (reason) => this.buildBrainBootstrap(reason),
         prepareEvent: (event, chatAfter, emittedAt) =>
@@ -200,6 +221,11 @@ export class Application {
         contextRolloverTokens: this.config.gemini.brainContextRolloverTokens,
         interactionTimeoutMs: this.config.gemini.brainInteractionTimeoutMs,
       });
+    }
+
+    // Live needs Gemini's own key and nothing else does any more. Once hearing and seeing move
+    // off it entirely this block, and the client behind it, go away.
+    if (this.config.gemini.apiKey) {
       this.gemini = new GeminiLiveClient({
         apiKey: this.config.gemini.apiKey,
         model: this.config.gemini.liveModel,
@@ -223,6 +249,9 @@ export class Application {
           },
         },
       });
+    }
+
+    if (this.geminiBrain) {
       this.personaDrive = new PersonaDriveService({
         enabled: this.config.personaDrive.enabled,
         minIntervalMs: this.config.personaDrive.minIntervalMs,

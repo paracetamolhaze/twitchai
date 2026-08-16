@@ -90,13 +90,15 @@ describe('UsageTracker stream and billable media counters', () => {
       averageLatencyMs: 1_200,
     });
     expect(snapshot.perception.estimatedCostUsd).toBeCloseTo(0.9, 8);
-    expect(snapshot.brain.estimatedCostUsd).toBeCloseTo(1.0425, 8);
+    // 600k fresh input at 0.375, 400k cached at 0.0375, 150k written and thought at 1.875 — all
+    // per million. These were double for months, which overstated the Brain's share of the bill.
+    expect(snapshot.brain.estimatedCostUsd).toBeCloseTo(0.52125, 8);
     expect(snapshot.currentStream.totalAi).toMatchObject({
       eventsPerHour: 1,
       brainDecisionsPerHour: 1,
       messagesPerHour: 1,
     });
-    expect(snapshot.currentStream.totalAi.estimatedCostUsd).toBeCloseTo(1.9425, 8);
-    expect(snapshot.currentStream.totalAi.estimatedCostPerHourUsd).toBeCloseTo(1.9425, 8);
+    expect(snapshot.currentStream.totalAi.estimatedCostUsd).toBeCloseTo(1.42125, 8);
+    expect(snapshot.currentStream.totalAi.estimatedCostPerHourUsd).toBeCloseTo(1.42125, 8);
   });
 });

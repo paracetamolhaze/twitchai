@@ -143,9 +143,17 @@ export interface GeminiLiveUsageInput {
 const MILLION = 1_000_000;
 const LIVE_INPUT_PRICE = { text: 0.75, audio: 3, video: 1, other: 0.75 } as const;
 const LIVE_OUTPUT_PRICE = { text: 4.5, audio: 12, video: 4.5, other: 4.5 } as const;
-const BRAIN_INPUT_PRICE = 0.75;
-const BRAIN_CACHED_INPUT_PRICE = 0.075;
-const BRAIN_OUTPUT_PRICE = 3.75;
+/**
+ * Per million tokens, and worth keeping honest: every cost decision in this project has been made
+ * by reading these numbers off the dashboard. The Google direct figures were double the real ones,
+ * which quietly overstated the Brain's share of the bill for weeks.
+ */
+export interface BrainTokenPrices { input: number; cachedInput: number; output: number }
+
+const BRAIN_PRICES: Record<'google' | 'openrouter', BrainTokenPrices> = {
+  google: { input: 0.375, cachedInput: 0.0375, output: 1.875 },
+  openrouter: { input: 0.375, cachedInput: 0.0375, output: 1.875 },
+};
 
 interface MutableBrainUsage extends BrainInteractionUsageInput {
   interactions: number;
@@ -155,6 +163,7 @@ interface MutableBrainUsage extends BrainInteractionUsageInput {
 }
 
 export class UsageTracker {
+  private brainPrices: BrainTokenPrices = BRAIN_PRICES.google;
   private readonly startedAt = Date.now();
   private streamStartedAt?: number;
   private accumulatedStreamMs = 0;
@@ -296,6 +305,12 @@ export class UsageTracker {
   recordMemorySuperseded(count = 1): void { this.memoriesSuperseded += Math.max(0, count); }
   recordMemoryRetrieval(): void { this.memoryRetrievals += 1; }
 
+  /** Set once at startup: the two transports bill the same model at the same rate today, but the
+   * dashboard should follow whichever one is actually being paid rather than assume. */
+  useBrainTransport(transport: 'google' | 'openrouter'): void {
+    this.brainPrices = BRAIN_PRICES[transport];
+  }
+
   recordBrainInteraction(
     usage: BrainInteractionUsageInput,
     metadata: { decision: boolean; latencyMs: number },
@@ -344,7 +359,7 @@ export class UsageTracker {
       this.geminiToolCalls,
       this.eventsDetected,
     );
-    const brain = brainSnapshot(this.brainUsage);
+    const brain = brainSnapshot(this.brainUsage, this.brainPrices);
     const currentPerception = perceptionSnapshot(
       currentDurationMs / 60_000,
       this.currentGeminiAudioSentMs / 60_000,
@@ -356,13 +371,13 @@ export class UsageTracker {
       0,
       this.currentEventsDetected,
     );
-    const currentBrain = brainSnapshot(this.currentBrainUsage);
+    const currentBrain = brainSnapshot(this.currentBrainUsage, this.brainPrices);
     const totalAi = totalSnapshot(perception.estimatedCostUsd, brain.estimatedCostUsd,
       (this.accumulatedStreamMs + activeMs) / 60_000, this.eventsDetected, this.brainUsage.decisions, this.sentResponses);
     const currentTotalAi = totalSnapshot(currentPerception.estimatedCostUsd, currentBrain.estimatedCostUsd,
       currentDurationMs / 60_000, this.currentEventsDetected, this.currentBrainUsage.decisions, this.currentSentResponses);
-    const driveBrain = brainSnapshot(this.driveBrainUsage);
-    const currentDriveBrain = brainSnapshot(this.currentDriveBrainUsage);
+    const driveBrain = brainSnapshot(this.driveBrainUsage, this.brainPrices);
+    const currentDriveBrain = brainSnapshot(this.currentDriveBrainUsage, this.brainPrices);
     const driveCacheHitRatio = driveBrain.inputTokens > 0 ? driveBrain.cachedInputTokens / driveBrain.inputTokens : 0;
     const currentDriveCacheHitRatio = currentDriveBrain.inputTokens > 0
       ? currentDriveBrain.cachedInputTokens / currentDriveBrain.inputTokens : 0;
@@ -522,7 +537,7 @@ function perceptionSnapshot(
   };
 }
 
-function brainSnapshot(usage: MutableBrainUsage): BrainUsageSnapshot {
+function brainSnapshot(usage: MutableBrainUsage, prices: BrainTokenPrices): BrainUsageSnapshot {
   const nonCachedInput = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
   return {
     interactions: usage.interactions,
@@ -534,9 +549,9 @@ function brainSnapshot(usage: MutableBrainUsage): BrainUsageSnapshot {
     totalTokens: usage.totalTokens,
     averageLatencyMs: usage.decisions > 0 ? usage.totalLatencyMs / usage.decisions : 0,
     ...(usage.lastLatencyMs !== undefined ? { lastLatencyMs: usage.lastLatencyMs } : {}),
-    estimatedCostUsd: (nonCachedInput * BRAIN_INPUT_PRICE
-      + usage.cachedInputTokens * BRAIN_CACHED_INPUT_PRICE
-      + (usage.outputTokens + usage.thoughtTokens) * BRAIN_OUTPUT_PRICE) / MILLION,
+    estimatedCostUsd: (nonCachedInput * prices.input
+      + usage.cachedInputTokens * prices.cachedInput
+      + (usage.outputTokens + usage.thoughtTokens) * prices.output) / MILLION,
   };
 }
 
