@@ -145,6 +145,7 @@ interface Usage {
   perception: {
     sessionDurationMinutes: number; audioSentMinutes: number; videoSentMinutes: number
     inputTokens: number; outputTokens: number; toolCalls: number; events: number; estimatedCostUsd: number
+    inputTokensByModality: TokenModalityUsage; outputTokensByModality: TokenModalityUsage
   }
   brain: {
     interactions: number; decisions: number; inputTokens: number; cachedInputTokens: number
@@ -180,6 +181,7 @@ interface Usage {
     driveCacheHitRatio: number
   }
 }
+interface TokenModalityUsage { text: number; audio: number; video: number; other: number }
 interface DriveUsageCounters {
   ticks: number; eligibleTicks: number; localSkips: number
   brainCalls: number; brainCallsBlockedByHourlyLimit: number
@@ -396,7 +398,7 @@ const usage = reactive<Usage>({
   preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0,
   guardRejections: 0, eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0,
   memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0,
-  perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0 },
+  perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0, inputTokensByModality: emptyModalities(), outputTokensByModality: emptyModalities() },
   brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
   totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
   drive: emptyDriveUsage(),
@@ -407,7 +409,7 @@ const usage = reactive<Usage>({
     geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0, geminiReconnects: 0,
     geminiInputTokens: 0, geminiOutputTokens: 0, sentResponses: 0,
     confirmedDeliveries: 0, undeliveredMessages: 0,
-    perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0 },
+    perception: { sessionDurationMinutes: 0, audioSentMinutes: 0, videoSentMinutes: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, events: 0, estimatedCostUsd: 0, inputTokensByModality: emptyModalities(), outputTokensByModality: emptyModalities() },
     brain: { interactions: 0, decisions: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, averageLatencyMs: 0, estimatedCostUsd: 0 },
     totalAi: { estimatedCostUsd: 0, estimatedCostPerHourUsd: 0, eventsPerHour: 0, brainDecisionsPerHour: 0, messagesPerHour: 0 },
     drive: emptyDriveUsage(),
@@ -1118,6 +1120,9 @@ function formatDuration(seconds: number): string {
   const minutes = Math.floor((seconds % 3600) / 60)
   return `${hours} ч ${minutes} мин`
 }
+function emptyModalities(): TokenModalityUsage {
+  return { text: 0, audio: 0, video: 0, other: 0 }
+}
 function emptyDriveUsage(): DriveUsageCounters {
   return {
     ticks: 0, eligibleTicks: 0, localSkips: 0, brainCalls: 0, brainCallsBlockedByHourlyLimit: 0,
@@ -1533,6 +1538,13 @@ onBeforeUnmount(() => {
             <div><span>3.1 · аудио / видео</span><strong>{{ usage.currentStream.perception.audioSentMinutes.toFixed(1) }} / {{ usage.currentStream.perception.videoSentMinutes.toFixed(1) }} мин</strong></div>
             <div><span>3.1 · input / output</span><strong>{{ usage.currentStream.perception.inputTokens }} / {{ usage.currentStream.perception.outputTokens }}</strong></div>
             <div><span>3.1 · стоимость</span><strong>${{ usage.currentStream.perception.estimatedCostUsd.toFixed(4) }}</strong></div>
+          </section>
+          <section class="metric-strip">
+            <div><span>3.1 input · видео</span><strong>{{ usage.currentStream.perception.inputTokensByModality.video }}</strong></div>
+            <div><span>3.1 input · аудио</span><strong>{{ usage.currentStream.perception.inputTokensByModality.audio }}</strong></div>
+            <div><span>3.1 input · текст</span><strong>{{ usage.currentStream.perception.inputTokensByModality.text }}</strong></div>
+            <div><span>3.1 output · аудио</span><strong>{{ usage.currentStream.perception.outputTokensByModality.audio }}</strong></div>
+            <div><span>3.1 output · текст</span><strong>{{ usage.currentStream.perception.outputTokensByModality.text }}</strong></div>
           </section>
           <section class="metric-strip">
             <div><span>3.7 · interactions / decisions</span><strong>{{ usage.currentStream.brain.interactions }} / {{ usage.currentStream.brain.decisions }}</strong></div>

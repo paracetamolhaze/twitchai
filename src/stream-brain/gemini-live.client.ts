@@ -38,6 +38,9 @@ export interface GeminiLiveClientOptions {
   stabilityWindowMs?: number;
   protocolErrorLimit?: number;
   protocolErrorWindowMs?: number;
+  /** Retained-context size that triggers compression, and the size compression reduces it to. */
+  contextWindowTriggerTokens?: number;
+  contextWindowTargetTokens?: number;
   connect?: (parameters: LiveConnectParameters) => Promise<Session>;
 }
 
@@ -247,7 +250,14 @@ export class GeminiLiveClient implements StreamBrainClient {
           inputAudioTranscription: {},
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           sessionResumption: this.resumptionHandle ? { handle: this.resumptionHandle } : {},
-          contextWindowCompression: { slidingWindow: {} },
+          // Every model turn re-reads the retained window, so an unbounded one makes cost grow with
+          // session length rather than with what is happening on stream: a 4.6-minute session
+          // reported 308k input tokens while the media actually sent was worth roughly 27k. An
+          // explicit trigger keeps the retained context bounded and the per-minute cost flat.
+          contextWindowCompression: {
+            triggerTokens: String(this.options.contextWindowTriggerTokens ?? 16_000),
+            slidingWindow: { targetTokens: String(this.options.contextWindowTargetTokens ?? 8_000) },
+          },
           systemInstruction: STREAM_BRAIN_INSTRUCTION,
           tools: [{ functionDeclarations: [EMIT_STREAM_EVENT_DECLARATION] }],
         },
