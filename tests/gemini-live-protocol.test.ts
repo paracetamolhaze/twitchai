@@ -247,20 +247,90 @@ describe('Gemini Live perception protocol', () => {
     await client.start();
     expect(connections[0]?.config?.responseModalities).toEqual(['TEXT']);
 
-    const reject = async (index: number): Promise<void> => {
-      const parameters = connections[index]!;
-      parameters.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
-      parameters.callbacks?.onclose?.({ code: 1007, reason: 'Request contains an invalid argument', wasClean: true } as never);
+    // A refused configuration closes the socket during setup, so setupComplete never arrives —
+    // that is precisely what separates it from a fault in a session the service already accepted.
+    const reject = async (index: number, reason: string): Promise<void> => {
+      connections[index]?.callbacks?.onclose?.({ code: 1007, reason, wasClean: true } as never);
       await vi.advanceTimersByTimeAsync(1);
     };
 
-    await reject(0);
+    await reject(0, 'The requested combination of response modalities (TEXT) is not supported by the model');
     expect(connections[1]?.config?.responseModalities).toEqual(['AUDIO']);
 
-    await reject(1);
+    await reject(1, 'context window compression is not supported');
     // Second and last degradation: hand retention back to the service instead of bounding it here.
     expect(connections[2]?.config?.contextWindowCompression).toEqual({ slidingWindow: {} });
 
+    client.stop();
+  });
+
+  it('keeps the bounded context window when 1007 comes from a running session, not a refused setup', async () => {
+    // The dangerous case: 1007 covers far more than a rejected config — this client raises it
+    // itself for a tool call missing its id. Dropping the retention bounds on any of those hands
+    // the window back to the service default (roughly 105k/52k against our 16k/8k), which is the
+    // exact cost this bounding exists to prevent, disabled by an unrelated fault.
+    vi.useFakeTimers();
+    const connections: LiveConnectParameters[] = [];
+    const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({
+      connect: async (parameters) => { connections.push(parameters); return session; },
+      reconnectMinimumMs: 1, reconnectMaximumMs: 1,
+    });
+    await client.start();
+    // Setup completed, so the service accepted this configuration.
+    connections[0]?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    connections[0]?.callbacks?.onclose?.({ code: 1007, reason: 'Request contains an invalid argument', wasClean: true } as never);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(connections[1]?.config?.contextWindowCompression?.triggerTokens).toBe('16000');
+    expect(client.getDiagnostics().contextWindowMode).toBe('explicit');
+    client.stop();
+  });
+
+  it('retries the configured setup on a new stream instead of inheriting the last degradation', async () => {
+    vi.useFakeTimers();
+    const connections: LiveConnectParameters[] = [];
+    const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({
+      connect: async (parameters) => { connections.push(parameters); return session; },
+      reconnectMinimumMs: 1, reconnectMaximumMs: 1,
+      responseModality: 'audio',
+    });
+    await client.start();
+    connections[0]?.callbacks?.onclose?.({
+      code: 1007, reason: 'context window compression is not supported', wasClean: true,
+    } as never);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.getDiagnostics().contextWindowMode).toBe('service_default');
+
+    client.stop();
+    await client.start();
+    // A degradation belonged to that session, not to the process.
+    expect(client.getDiagnostics().contextWindowMode).toBe('explicit');
+    client.stop();
+  });
+
+  it('sends a context update only when it differs from the one already given', async () => {
+    let parameters: LiveConnectParameters | undefined;
+    const sendRealtimeInput = vi.fn();
+    const session = { sendRealtimeInput, sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({ connect: async (value) => { parameters = value; return session; } });
+    await client.start();
+    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    const snapshot = {
+      channel: 'streamer', category: 'Dota 2', streamContext: '', isLive: true,
+      recentChat: [], recentEvents: [], botUsernames: ['bot-one'], updatedAt: 1,
+    };
+
+    sendRealtimeInput.mockClear();
+    client.updateContext({ ...snapshot });
+    // The refresh runs on a timer and most ticks carry nothing new. Realtime text counts as
+    // activity and can provoke a turn, and every turn re-bills the retained context.
+    client.updateContext({ ...snapshot, updatedAt: 2 });
+    expect(sendRealtimeInput.mock.calls.filter((entry) => typeof entry[0]?.text === 'string')).toHaveLength(1);
+
+    client.updateContext({ ...snapshot, category: 'Counter-Strike 2' });
+    expect(sendRealtimeInput.mock.calls.filter((entry) => typeof entry[0]?.text === 'string')).toHaveLength(2);
     client.stop();
   });
 

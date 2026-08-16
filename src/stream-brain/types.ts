@@ -87,6 +87,13 @@ export interface GeminiLiveDiagnostics {
   videoFramesSent: number;
   transcriptsReceived: number;
   protocolErrorsInWindow: number;
+  /** Model turns completed. Each one re-bills the retained context, so this drives Live cost. */
+  modelTurns: number;
+  /** Usage reports received. Far above modelTurns means the token total is double-counted. */
+  usageReports: number;
+  /** Whether retention is bounded by our values or left to the much larger service default. */
+  contextWindowMode: 'explicit' | 'service_default';
+  responseModality: 'text' | 'audio';
 }
 
 export interface StreamBrainStatus {
@@ -117,6 +124,10 @@ export interface StreamBrainStatus {
   audioChunksSent?: number;
   videoFramesSent?: number;
   transcriptsReceived?: number;
+  modelTurns?: number;
+  usageReports?: number;
+  contextWindowMode?: 'explicit' | 'service_default';
+  responseModality?: 'text' | 'audio';
   spokenMentionsDetected?: number;
   eligibleBots?: number;
 }

@@ -2,8 +2,10 @@ import {
   GoogleGenAI,
   LiveConnectParameters,
   LiveServerMessage,
+  EndSensitivity,
   MediaResolution,
   Modality,
+  StartSensitivity,
   Session,
   ThinkingLevel,
 } from '@google/genai';
@@ -43,6 +45,10 @@ export interface GeminiLiveClientOptions {
   contextWindowTargetTokens?: number;
   /** Perception output modality. 'text' is the cheap default; 'audio' exists as a fallback. */
   responseModality?: 'text' | 'audio';
+  /** How eagerly speech starts and ends a turn. 'low' merges pauses into fewer, cheaper turns. */
+  speechSensitivity?: 'low' | 'high';
+  /** Silence needed before a turn ends. Longer keeps a thinking-out-loud speaker in one turn. */
+  speechSilenceMs?: number;
   connect?: (parameters: LiveConnectParameters) => Promise<Session>;
 }
 
@@ -105,6 +111,13 @@ export class GeminiLiveClient implements StreamBrainClient {
   private effectiveResponseModality: 'text' | 'audio';
   /** Cleared if the service refuses explicit retention bounds, leaving it to pick its own. */
   private useExplicitContextWindow = true;
+  /** Whether the current connection ever completed setup — a refused config never does. */
+  private connectionReachedReady = false;
+  /** Suppresses re-sending a context block the model has already been given verbatim. */
+  private lastSentContextText?: string;
+  /** How many times the service reported usage, and how many model turns completed. */
+  private usageReports = 0;
+  private modelTurns = 0;
 
   constructor(private readonly options: GeminiLiveClientOptions) {
     this.effectiveResponseModality = options.responseModality ?? 'audio';
@@ -141,6 +154,10 @@ export class GeminiLiveClient implements StreamBrainClient {
       resumeAttempts: this.resumeAttempts,
       freshReconnects: this.freshReconnects,
       protocolErrorsInWindow: this.protocolErrorTimes.length,
+      modelTurns: this.modelTurns,
+      usageReports: this.usageReports,
+      contextWindowMode: this.useExplicitContextWindow ? 'explicit' : 'service_default',
+      responseModality: this.effectiveResponseModality,
     };
   }
 
@@ -160,6 +177,11 @@ export class GeminiLiveClient implements StreamBrainClient {
     this.lastError = undefined;
     this.pendingToolBatches = 0;
     this.toolQueue = Promise.resolve();
+    // A new stream retries the configured setup rather than inheriting a degradation from the last
+    // one, which otherwise persisted for the lifetime of the process.
+    this.effectiveResponseModality = this.options.responseModality ?? 'audio';
+    this.useExplicitContextWindow = true;
+    this.lastSentContextText = undefined;
     await this.connect(this.generation);
   }
 
@@ -221,6 +243,7 @@ export class GeminiLiveClient implements StreamBrainClient {
     this.notifyStatus();
     const connectionId = ++this.connectionSequence;
     this.activeConnectionId = connectionId;
+    this.connectionReachedReady = false;
     const connecting = this.openSession(generation, connectionId);
     this.connectPromise = connecting;
     await connecting.finally(() => {
@@ -259,6 +282,22 @@ export class GeminiLiveClient implements StreamBrainClient {
           responseModalities: [this.effectiveResponseModality === 'audio' ? Modality.AUDIO : Modality.TEXT],
           mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
           inputAudioTranscription: {},
+          // Live defaults to HIGH start/end sensitivity, tuned for a conversation where replying
+          // fast matters. Watching a stream is the opposite: natural pauses mid-sentence end a turn,
+          // and each turn re-bills the whole retained context, so a speaker thinking out loud is
+          // billed several times for one thought. Merging speech into fewer, longer turns costs
+          // about a second of latency, which is irrelevant when nobody is waiting on an answer.
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              startOfSpeechSensitivity: this.options.speechSensitivity === 'high'
+                ? StartSensitivity.START_SENSITIVITY_HIGH
+                : StartSensitivity.START_SENSITIVITY_LOW,
+              endOfSpeechSensitivity: this.options.speechSensitivity === 'high'
+                ? EndSensitivity.END_SENSITIVITY_HIGH
+                : EndSensitivity.END_SENSITIVITY_LOW,
+              silenceDurationMs: this.options.speechSilenceMs ?? 1_200,
+            },
+          },
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           sessionResumption: this.resumptionHandle ? { handle: this.resumptionHandle } : {},
           // Every model turn re-reads the retained window, so an unbounded one makes cost grow with
@@ -318,6 +357,9 @@ export class GeminiLiveClient implements StreamBrainClient {
     // still CONNECTING (see the comment in openSession).
     if (message.setupComplete !== undefined && this.state !== 'READY') {
       this.setState('READY');
+      // Reaching setup means the service accepted this configuration, so a later failure is a
+      // fault rather than a rejected setting and must not change the config.
+      this.connectionReachedReady = true;
       this.lastError = undefined;
       this.backoff.reset();
       this.contextDirty = Boolean(this.lastContext);
@@ -332,7 +374,12 @@ export class GeminiLiveClient implements StreamBrainClient {
     } else if (message.sessionResumptionUpdate?.resumable === false) {
       this.resumptionHandle = undefined;
     }
+    if (message.serverContent?.turnComplete) this.modelTurns += 1;
     if (message.usageMetadata) {
+      // Counted so the reported token total can be sanity-checked: each report is added to the
+      // running total, so if the service sends usage more than once per turn the dashboard figure
+      // is inflated relative to the real bill. usageReports well above modelTurns means exactly that.
+      this.usageReports += 1;
       this.options.usage.recordGeminiLiveUsage({
         inputTokens: message.usageMetadata.promptTokenCount ?? 0,
         outputTokens: message.usageMetadata.responseTokenCount ?? 0,
@@ -450,23 +497,7 @@ export class GeminiLiveClient implements StreamBrainClient {
       // session outright with 1007 rather than negotiating. Perception is the layer everything else
       // depends on, so an output format the model will not take must degrade to the one it will
       // instead of retrying the same rejected setup until the circuit opens.
-      // Both of these are settings the service may simply refuse, and perception is what everything
-      // else depends on, so each one degrades to the previously known-good form rather than retrying
-      // a rejected setup until the circuit opens. Modality first, since only some models accept
-      // text output; then the explicit retention bounds.
-      if (this.effectiveResponseModality === 'text') {
-        this.effectiveResponseModality = 'audio';
-        this.protocolErrorTimes.splice(0);
-        this.logger.warn('Live rejected text output; falling back to audio for this session', {
-          code: details.code, reason,
-        });
-      } else if (this.useExplicitContextWindow) {
-        this.useExplicitContextWindow = false;
-        this.protocolErrorTimes.splice(0);
-        this.logger.warn('Live rejected the explicit context window; falling back to service defaults', {
-          code: details.code, reason,
-        });
-      }
+      this.degradeRejectedSessionConfig(details, reason);
     } else if (details.source !== 'go_away') {
       this.protocolErrorTimes.splice(0);
     }
@@ -533,10 +564,52 @@ export class GeminiLiveClient implements StreamBrainClient {
     }, delay);
   }
 
+  /**
+   * Steps back from a session setting the service refused — but only from one it actually refused.
+   *
+   * The trigger is deliberately narrow. 1007 covers far more than a bad config: a tool call missing
+   * its id makes this client raise 1007 itself, and a mid-session protocol fault carries the same
+   * code. Treating any of those as "the config is wrong" silently dropped the retained-context
+   * bounds and handed retention back to the service default, which for this model is roughly
+   * 105k/52k against our 16k/8k — six times more context re-read on every turn, i.e. the exact cost
+   * this bounding exists to prevent, disabled by an unrelated error.
+   *
+   * A refused config is recognisable: the service closes the socket during setup, before the
+   * session ever reaches READY. Anything after that is a real fault and must not change the config.
+   */
+  private degradeRejectedSessionConfig(details: DisconnectDetails, reason?: string): void {
+    if (details.source !== 'close' || this.connectionReachedReady) return;
+    const said = `${details.reason ?? ''} ${details.message}`.toLowerCase();
+    const blamesModality = said.includes('modalit');
+    const blamesContextWindow = said.includes('context window') || said.includes('compression');
+
+    if (this.effectiveResponseModality === 'text' && (blamesModality || !blamesContextWindow)) {
+      this.effectiveResponseModality = 'audio';
+      this.protocolErrorTimes.splice(0);
+      this.logger.warn('Live rejected text output; falling back to audio for this session', {
+        code: details.code, reason,
+      });
+      return;
+    }
+    if (this.useExplicitContextWindow && (blamesContextWindow || !blamesModality)) {
+      this.useExplicitContextWindow = false;
+      this.protocolErrorTimes.splice(0);
+      this.logger.warn('Live rejected the explicit context window; retention now follows the service default', {
+        code: details.code, reason,
+      });
+    }
+  }
+
   private sendContextSnapshot(): boolean {
     if (!this.canSendRealtime() || !this.lastContext) return false;
     const text = buildContextUpdate(this.lastContext);
     this.contextDirty = false;
+    // The refresh runs on a timer, but most ticks carry nothing new — same category, same context
+    // note, same connected accounts, no new human chat. Realtime text counts as activity and can
+    // provoke a model turn, and every turn re-bills the retained context, so resending an identical
+    // block is pure cost for zero information.
+    if (text === this.lastSentContextText) return false;
+    this.lastSentContextText = text;
     this.sendTextInput(text, 'context_update');
     return true;
   }

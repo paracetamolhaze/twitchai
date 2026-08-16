@@ -200,6 +200,8 @@ export class Application {
         logger: this.logger,
         usage: this.usage,
         responseModality: this.config.gemini.liveResponseModality,
+        speechSensitivity: this.config.gemini.liveSpeechSensitivity,
+        speechSilenceMs: this.config.gemini.liveSpeechSilenceMs,
         handlers: {
           onStreamEvent: async (candidate) => {
             const event = await this.perception.acceptCandidate(candidate);

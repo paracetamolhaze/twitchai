@@ -208,6 +208,10 @@ export class StreamBrainService extends EventEmitter {
       audioChunksSent: client?.audioChunksSent,
       videoFramesSent: client?.videoFramesSent,
       transcriptsReceived: client?.transcriptsReceived,
+      modelTurns: client?.modelTurns,
+      usageReports: client?.usageReports,
+      contextWindowMode: client?.contextWindowMode,
+      responseModality: client?.responseModality,
     });
   }
 
