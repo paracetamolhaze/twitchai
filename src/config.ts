@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
-export type TranscriptionProvider = 'gemini' | 'groq-whisper';
+/**
+ * How the system hears. `gemini` is the Live session transcribing as a side effect of holding a
+ * conversation; `shadow` runs Whisper alongside it and only records what it heard, so the two can
+ * be compared on one stream; `whisper` makes Whisper the only source.
+ */
+export type TranscriptionMode = 'gemini' | 'shadow' | 'whisper';
 
 export interface BotAccountConfig {
   username: string;
@@ -77,9 +82,9 @@ export interface AppConfig {
     maxBrainCallProbability: number;
   };
   transcription: {
-    provider: TranscriptionProvider;
-    fallback?: 'groq-whisper';
+    mode: TranscriptionMode;
     groqApiKey?: string;
+    model: string;
     language: string;
   };
   database: {
@@ -150,8 +155,8 @@ const envSchema = z.object({
   GLOBAL_MEMORY_SNAPSHOT_LIMIT: z.coerce.number().int().min(1).max(15).default(10),
   GLOBAL_MEMORY_SESSION_STALE_MINUTES: z.coerce.number().int().min(5).max(240).default(30),
   GLOBAL_MEMORY_CHANNEL: z.string().default(''),
-  TRANSCRIPTION_PROVIDER: z.enum(['gemini', 'groq-whisper']).default('gemini'),
-  TRANSCRIPTION_FALLBACK: z.enum(['groq-whisper']).optional(),
+  TRANSCRIPTION_MODE: z.enum(['gemini', 'shadow', 'whisper']).default('gemini'),
+  TRANSCRIPTION_MODEL: z.string().default('whisper-large-v3-turbo'),
   GROQ_API_KEY: z.string().trim().optional(),
   ORIGINAL_STREAM_LANGUAGE: z.string().trim().default('ru'),
   DATABASE_URL: z.string().trim().optional(),
@@ -294,8 +299,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxBrainCallProbability: parsed.PERSONA_DRIVE_MAX_BRAIN_CALL_PROBABILITY,
     },
     transcription: {
-      provider: parsed.TRANSCRIPTION_PROVIDER,
-      fallback: parsed.TRANSCRIPTION_FALLBACK,
+      mode: parsed.TRANSCRIPTION_MODE,
+      model: parsed.TRANSCRIPTION_MODEL,
       groqApiKey: parsed.GROQ_API_KEY,
       language: parsed.ORIGINAL_STREAM_LANGUAGE,
     },

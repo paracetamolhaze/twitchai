@@ -149,6 +149,18 @@ export interface StreamBrainStatus {
   responseModality?: 'text' | 'audio';
   stallRecoveries?: number;
   msSincePerceptionOutput?: number;
+  /** Whisper running beside or instead of Live, so the two can be compared on one stream. */
+  transcription?: {
+    mode: 'gemini' | 'shadow' | 'whisper';
+    model: string;
+    segmentsSent: number;
+    transcriptsReceived: number;
+    audioSecondsSent: number;
+    silenceSecondsSkipped: number;
+    failures: number;
+    lastTranscript?: string;
+    lastLatencyMs?: number;
+  };
   spokenMentionsDetected?: number;
   eligibleBots?: number;
 }

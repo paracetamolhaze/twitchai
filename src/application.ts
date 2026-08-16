@@ -26,8 +26,8 @@ import { EventDetector } from './stream-brain/event-detector';
 import { GeminiLiveClient } from './stream-brain/gemini-live.client';
 import { MediaPipeline } from './stream-brain/media-pipeline';
 import { StreamBrainService } from './stream-brain/stream-brain.service';
-import { ChatMessage, StreamEvent, StreamEventCandidate } from './stream-brain/types';
-import { GroqWhisperFallback } from './transcription/groq-whisper-fallback';
+import { ChatMessage, StreamBrainStatus, StreamEvent } from './stream-brain/types';
+import { SpeechTranscriber } from './transcription/speech-transcriber';
 import { TwitchBotManager } from './twitch/bot-manager';
 import { DeliveryProbe } from './twitch/delivery-probe';
 import { TwitchHelixClient } from './twitch/helix-client';
@@ -72,7 +72,7 @@ export class Application {
   private geminiBrain?: GeminiBrainService;
   private personaDrive?: PersonaDriveService;
   private deliveryProbe!: DeliveryProbe;
-  private transcriber?: GroqWhisperFallback;
+  private transcriber?: SpeechTranscriber;
   private twitchOAuth?: TwitchOAuthService;
   private categoryTimer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
@@ -215,7 +215,7 @@ export class Application {
             return event ? { accepted: true, eventId: event.id } : { accepted: false, reason: 'invalid_event' };
           },
           onTranscript: (text) => {
-            this.logger.debug('Gemini input transcription received', { characters: text.length });
+            this.logger.info('Live heard', { text });
             this.handleSpokenTranscript(text);
           },
           onStatus: (connected, error, diagnostics) => {
@@ -252,18 +252,26 @@ export class Application {
       });
     }
 
-    if ((this.config.transcription.provider === 'groq-whisper' || this.config.transcription.fallback) && this.config.transcription.groqApiKey) {
-      this.transcriber = new GroqWhisperFallback({
+    const transcriptionMode = this.config.transcription.mode;
+    if (transcriptionMode !== 'gemini' && this.config.transcription.groqApiKey) {
+      this.transcriber = new SpeechTranscriber({
         apiKey: this.config.transcription.groqApiKey,
         language: this.config.transcription.language,
+        model: this.config.transcription.model,
         logger: this.logger,
-        onTranscript: (text) => {
-          const candidate: StreamEventCandidate = {
-            type: 'speech', summary: `Стример сказал: ${text}`, speech: text, importance: 0.5, confidence: 0.8,
-          };
-          void this.perception.acceptCandidate(candidate, 'fallback-transcription');
+        onTranscript: (text, meta) => {
+          // Shadow mode is a measurement, not a source: both layers hear the same stream and both
+          // write down what they heard, so they can be compared on one run before anything depends
+          // on the answer.
+          this.logger.info('Whisper heard', { text, audioMs: meta.audioMs, latencyMs: meta.latencyMs });
+          if (transcriptionMode === 'whisper') this.handleSpokenTranscript(text);
         },
       });
+      this.logger.info('Speech transcription enabled', {
+        mode: transcriptionMode, model: this.config.transcription.model,
+      });
+    } else if (transcriptionMode !== 'gemini') {
+      this.logger.warn('Speech transcription requested without GROQ_API_KEY; falling back to Live transcription');
     }
 
     const hasStreamAnalyzer = Boolean(this.gemini || this.transcriber);
@@ -276,9 +284,7 @@ export class Application {
           handlers: {
             onAudio: (pcm, durationMs) => {
               this.perception.sendAudio(pcm, durationMs);
-              const useWhisper = this.config.transcription.provider === 'groq-whisper'
-                || (this.config.transcription.fallback === 'groq-whisper' && !this.gemini?.isConnected());
-              if (useWhisper) this.transcriber?.acceptPcm(pcm);
+              this.transcriber?.acceptPcm(pcm);
             },
             onVideo: (jpeg, durationMs) => this.perception.sendVideo(jpeg, durationMs),
             onState: (state, error) => this.perception.onMediaState(state, error),
@@ -323,7 +329,7 @@ export class Application {
           category: snapshot.category,
           isLive: snapshot.isLive,
           twitchConnected: bots.some((bot) => bot.chatConnected),
-          streamBrain: this.perception.getStatus(),
+          streamBrain: { ...this.perception.getStatus(), ...this.transcriptionStatus() },
           geminiBrain: this.getGeminiBrainStatus(),
           activeBots: bots.filter((bot) => bot.enabled && bot.chatConnected).length,
           totalBots: bots.length,
@@ -452,7 +458,7 @@ export class Application {
     await this.api?.stop();
     await this.coordinator?.stop();
     await this.memory.stop();
-    await this.transcriber?.flush();
+    this.transcriber?.flush();
     this.personaDrive?.stop();
     await this.geminiBrain?.stopStream();
     await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
@@ -930,6 +936,18 @@ export class Application {
     };
     void refresh();
     this.categoryTimer = setInterval(() => { void refresh(); }, this.config.twitch.categoryRefreshMs);
+  }
+
+  /** Reported next to the Live counters so the two ways of hearing can be read side by side. */
+  private transcriptionStatus(): Pick<StreamBrainStatus, 'transcription'> {
+    if (!this.transcriber) return {};
+    return {
+      transcription: {
+        mode: this.config.transcription.mode,
+        model: this.config.transcription.model,
+        ...this.transcriber.getStats(),
+      },
+    };
   }
 
   private async getSettings(): Promise<Record<string, unknown>> {
