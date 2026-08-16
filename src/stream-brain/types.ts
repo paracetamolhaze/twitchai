@@ -157,7 +157,7 @@ export interface StreamBrainStatus {
   msSincePerceptionOutput?: number;
   /** Whisper running beside or instead of Live, so the two can be compared on one stream. */
   transcription?: {
-    mode: 'gemini' | 'shadow' | 'whisper';
+    mode: 'live' | 'shadow' | 'transcriber';
     model: string;
     segmentsSent: number;
     transcriptsReceived: number;

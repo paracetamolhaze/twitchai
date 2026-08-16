@@ -1,11 +1,14 @@
 import { z } from 'zod';
 
 /**
- * How the system hears. `gemini` is the Live session transcribing as a side effect of holding a
- * conversation; `shadow` runs Whisper alongside it and only records what it heard, so the two can
- * be compared on one stream; `whisper` makes Whisper the only source.
+ * Where speech comes from. `live` is the Gemini Live session transcribing as a side effect of
+ * holding a conversation; `shadow` runs the transcription layer alongside it and only records what
+ * it heard, so the two can be compared on one stream; `transcriber` makes it the only source.
+ *
+ * Named for the role, not for a model: which service actually listens is TRANSCRIPTION_PROVIDER,
+ * and it has already changed once.
  */
-export type TranscriptionMode = 'gemini' | 'shadow' | 'whisper';
+export type TranscriptionMode = 'live' | 'shadow' | 'transcriber';
 
 export interface BotAccountConfig {
   username: string;
@@ -168,7 +171,7 @@ const envSchema = z.object({
   GLOBAL_MEMORY_SNAPSHOT_LIMIT: z.coerce.number().int().min(1).max(15).default(10),
   GLOBAL_MEMORY_SESSION_STALE_MINUTES: z.coerce.number().int().min(5).max(240).default(30),
   GLOBAL_MEMORY_CHANNEL: z.string().default(''),
-  TRANSCRIPTION_MODE: z.enum(['gemini', 'shadow', 'whisper']).default('gemini'),
+  TRANSCRIPTION_MODE: z.enum(['live', 'shadow', 'transcriber']).default('live'),
   TRANSCRIPTION_PROVIDER: z.enum(['openrouter', 'groq']).default('openrouter'),
   TRANSCRIPTION_MODEL: z.string().default('google/gemini-2.5-flash-lite'),
   TRANSCRIPTION_GROQ_MODEL: z.string().default('whisper-large-v3-turbo'),

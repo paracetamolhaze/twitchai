@@ -234,7 +234,7 @@ export class Application {
     // Live needs Gemini's own key and nothing else does any more. Once hearing moves off it there
     // is nothing left for it to do that is worth a session: it would sit reconnecting against an
     // account that may not even be funded, reporting a red state for a layer nobody is using.
-    const liveRetired = transcriptionMode === 'whisper';
+    const liveRetired = transcriptionMode === 'transcriber';
     if (this.config.gemini.apiKey && !liveRetired) {
       this.gemini = new GeminiLiveClient({
         apiKey: this.config.gemini.apiKey,
@@ -292,7 +292,7 @@ export class Application {
     }
 
     const backend = this.buildTranscriptionBackend();
-    if (transcriptionMode !== 'gemini' && backend) {
+    if (transcriptionMode !== 'live' && backend) {
       this.transcriber = new SpeechTranscriber({
         backend,
         logger: this.logger,
@@ -307,10 +307,10 @@ export class Application {
           this.logger.info('Transcriber heard', {
             text, audioMs: meta.audioMs, latencyMs: meta.latencyMs, via: backend.name,
           });
-          if (transcriptionMode === 'whisper') this.handleSpokenTranscript(text);
+          if (transcriptionMode === 'transcriber') this.handleSpokenTranscript(text);
         },
       });
-      if (transcriptionMode === 'whisper') {
+      if (transcriptionMode === 'transcriber') {
         this.speechEvents = new SpeechEventSynthesizer({
           botUsernames: () => this.contextStore.snapshot().botUsernames,
           emit: (candidate) => { void this.perception.acceptCandidate(candidate, 'transcription'); },
@@ -320,7 +320,7 @@ export class Application {
       this.logger.info('Speech transcription enabled', {
         mode: transcriptionMode, via: backend.name, model: this.transcriptionModel(),
       });
-    } else if (transcriptionMode !== 'gemini') {
+    } else if (transcriptionMode !== 'live') {
       this.logger.warn('Speech transcription requested without a key for the chosen provider', {
         provider: this.config.transcription.provider,
       });
