@@ -82,6 +82,12 @@ export interface BrainEventInput {
   triggerKind: 'external_stream_event';
   event: StreamEvent;
   availableBots: string[];
+  /**
+   * The last few messages each available account actually sent, so a draft can be checked against
+   * what that account already said. Previously this reached the model only for direct mentions,
+   * which left the anti-repetition rule with nothing to compare against on an ordinary event.
+   */
+  recentAccountMessages?: Array<{ username: string; messages: string[] }>;
   recentChatDelta: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
   targetedPersonaContext: BrainTargetedPersonaContext[];
   reactionExamples: ReactionExample[];

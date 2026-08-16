@@ -376,10 +376,21 @@ export class ReactionCoordinator extends EventEmitter {
       stage: 'CANDIDATES_PREPARED',
       timing: { ...trace.timing, contextReadyAt },
     });
+    // What each available account said recently, for every event rather than only direct mentions.
+    // The anti-repetition rule tells the model to compare a draft against that account's own recent
+    // messages — but those only ever arrived inside targetedPersonaContext, which is built for
+    // direct mentions alone. On an ordinary event the model had nothing to compare against, so one
+    // account opened three messages in a row with the same word. A few lines each is enough.
+    const recentAccountMessages = await Promise.all(candidates.map(async (candidate) => ({
+      username: candidate.username,
+      messages: (await this.options.history.recent(candidate.username)).slice(-3).map((record) => record.message),
+    })));
+
     return {
       event,
       triggerKind: 'external_stream_event',
       availableBots: candidates.map((candidate) => candidate.username),
+      recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
       recentChatDelta: snapshot.recentChat
         .filter((message) => message.timestamp > chatAfter)
         .slice(-40)
