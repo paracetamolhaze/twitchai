@@ -129,6 +129,7 @@ const settingsSchema = z.object({
   visionFps: z.number().min(0.05).max(1).optional(),
   /** Operator stop switch. Stops media, perception and autonomous messages without losing the session. */
   paused: z.boolean().optional(),
+  memoryChannel: z.string().max(64).optional(),
 }).strict();
 
 const streamerMemoryListSchema = z.object({

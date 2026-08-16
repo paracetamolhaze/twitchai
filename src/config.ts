@@ -61,6 +61,8 @@ export interface AppConfig {
     retrievalLimit: number;
     snapshotLimit: number;
     sessionStaleMinutes: number;
+    /** Only this channel's streams accumulate durable memory. Empty means every channel does. */
+    channel: string;
   };
   personaDrive: {
     enabled: boolean;
@@ -147,6 +149,7 @@ const envSchema = z.object({
   GLOBAL_MEMORY_RETRIEVAL_LIMIT: z.coerce.number().int().min(1).max(15).default(6),
   GLOBAL_MEMORY_SNAPSHOT_LIMIT: z.coerce.number().int().min(1).max(15).default(10),
   GLOBAL_MEMORY_SESSION_STALE_MINUTES: z.coerce.number().int().min(5).max(240).default(30),
+  GLOBAL_MEMORY_CHANNEL: z.string().default(''),
   TRANSCRIPTION_PROVIDER: z.enum(['gemini', 'groq-whisper']).default('gemini'),
   TRANSCRIPTION_FALLBACK: z.enum(['groq-whisper']).optional(),
   GROQ_API_KEY: z.string().trim().optional(),
@@ -178,6 +181,20 @@ const envSchema = z.object({
 function bool(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+}
+
+/**
+ * Whether what happens on a channel is worth remembering permanently.
+ *
+ * The pipeline is regularly exercised against a throwaway channel, and those streams are not the
+ * streamer the characters are supposed to know. Memory is stored per channel, so a test stream
+ * could never surface on the real one, but it still opened sessions and wrote rows about a person
+ * nobody is watching. With memoryChannel set, only that channel accumulates anything; empty keeps
+ * the old behaviour of every channel counting.
+ */
+export function accumulatesMemory(channel: string, memoryChannel: string): boolean {
+  if (!memoryChannel) return true;
+  return normalizeChannel(channel) === normalizeChannel(memoryChannel);
 }
 
 export function normalizeChannel(value: string): string {
@@ -262,6 +279,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       retrievalLimit: parsed.GLOBAL_MEMORY_RETRIEVAL_LIMIT,
       snapshotLimit: parsed.GLOBAL_MEMORY_SNAPSHOT_LIMIT,
       sessionStaleMinutes: parsed.GLOBAL_MEMORY_SESSION_STALE_MINUTES,
+      channel: normalizeChannel(parsed.GLOBAL_MEMORY_CHANNEL),
     },
     personaDrive: {
       enabled: bool(parsed.PERSONA_DRIVE_ENABLED, true),

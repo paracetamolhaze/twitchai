@@ -462,7 +462,7 @@ const streamerMemoryEditDraft = reactive({
   status: 'active' as Exclude<StreamerMemoryStatus, 'superseded'>,
 })
 const twitchOAuth = reactive<TwitchOAuthStatus>({ configured: false, accounts: [] })
-const settings = reactive({ channel: '', streamContext: '', visionFps: 1, paused: false })
+const settings = reactive({ channel: '', streamContext: '', visionFps: 1, paused: false, memoryChannel: '' })
 let socket: Socket | undefined
 let pollTimer: number | undefined
 
@@ -622,6 +622,7 @@ async function loadDashboard(): Promise<void> {
     settings.streamContext = String(settingsData.streamContext || '')
     settings.visionFps = Number(settingsData.visionFps || 1)
     settings.paused = settingsData.paused === true
+    settings.memoryChannel = String(settingsData.memoryChannel || '')
     backendOnline.value = true
     errorMessage.value = ''
     connectRealtime()
@@ -1799,6 +1800,8 @@ onBeforeUnmount(() => {
               <label>Канал Twitch<input v-model="settings.channel" autocomplete="off" placeholder="gudini_younger" /></label>
               <label>Контекст стрима<textarea v-model="settings.streamContext" rows="4" placeholder="Стример играет рейтинговую Dota 2 с друзьями"></textarea></label>
               <label>Частота видеокадров <span>{{ settings.visionFps }} FPS</span><input v-model.number="settings.visionFps" type="range" min="0.05" max="1" step="0.05" /></label>
+              <label>Канал, для которого копится память<input v-model="settings.memoryChannel" autocomplete="off" placeholder="gudini_younger" /></label>
+              <small class="muted">Стримы на других каналах ничего не запоминают: сессия памяти не открывается, факты о стримере не пишутся. Пусто — копится на любом канале.</small>
               <button class="primary" type="submit">Сохранить и применить</button>
               <small class="muted">Канал хранится в PostgreSQL и переключается сразу. В Railway переменную TWITCH_CHANNEL можно оставить пустой.</small>
             </form>

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { accumulatesMemory } from '../src/config';
 import { GlobalStreamerMemory } from '../src/global-memory/global-streamer-memory';
 import { Logger } from '../src/logger';
 import { MemoryRepository } from '../src/persistence/memory-repository';
@@ -80,6 +81,37 @@ describe('GlobalStreamerMemory', () => {
       expect.objectContaining({ type: 'plan', summary: 'Стример завтра летит в Таиланд.' }),
     ]));
   });
+  it('remembers nothing at all from a channel used only to exercise the pipeline', async () => {
+    // The channel field gets pointed at a throwaway stream for testing several times a day. Those
+    // streams are not the streamer these characters are supposed to know, and while per-channel
+    // storage already kept them apart, each one still opened a session and wrote rows about a
+    // person nobody is watching.
+    expect(accumulatesMemory('gudini_younger', 'gudini_younger')).toBe(true);
+    expect(accumulatesMemory('https://twitch.tv/GUDINI_younger', 'gudini_younger')).toBe(true);
+    expect(accumulatesMemory('tiktokevelone888', 'gudini_younger')).toBe(false);
+    // Unset keeps the original behaviour: every channel counts.
+    expect(accumulatesMemory('tiktokevelone888', '')).toBe(true);
+
+    // The gate works by never opening a session, and without one nothing can be written — so a
+    // Brain that proposes memory anyway on a test stream is refused rather than trusted.
+    const repository = new MemoryRepository();
+    const memory = new GlobalStreamerMemory({
+      repository, usage: new UsageTracker(), logger: new Logger('TEST', 'error'), now: () => Date.now(),
+    });
+    const attempted = await memory.recordFromBrain({
+      memories: [{
+        type: 'preference' as const,
+        summary: 'Streamer likes padel.',
+        entities: ['padel'],
+        tags: ['sport'],
+        importance: 0.8,
+        confidence: 0.8,
+      }],
+    });
+    expect(attempted.accepted).toEqual([]);
+    expect(attempted.rejected).toEqual([{ index: 0, reason: 'no_active_stream_session' }]);
+  });
+
   it('merges reconfirmed facts and rejects sensitive memory proposals', async () => {
     let now = Date.UTC(2026, 7, 14, 18, 0, 0);
     const repository = new MemoryRepository();

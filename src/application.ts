@@ -3,7 +3,7 @@ import { ApiServer, createApiServer } from './api/server';
 import { GeminiBrainService } from './brain/gemini-brain.service';
 import { GoogleInteractionsClient } from './brain/google-interactions.client';
 import { BrainBootstrap, BrainDecision, BrainDynamicDelta, GeminiBrainStatus } from './brain/types';
-import { AppConfig, normalizeChannel } from './config';
+import { accumulatesMemory, AppConfig, normalizeChannel } from './config';
 import { GlobalStreamerMemory } from './global-memory/global-streamer-memory';
 import { StreamerMemory } from './global-memory/types';
 import { ReactionMemory } from './learning/reaction-memory';
@@ -142,6 +142,9 @@ export class Application {
     this.config.twitch.channel = normalizeChannel(stringSetting(this.runtimeSettings.channel, this.config.twitch.channel));
     this.config.stream.visionFps = boundedNumberSetting(this.runtimeSettings.visionFps, this.config.stream.visionFps, 0.05, 1);
     this.paused = this.runtimeSettings.paused === true;
+    this.config.globalMemory.channel = normalizeChannel(
+      stringSetting(this.runtimeSettings.memoryChannel, this.config.globalMemory.channel),
+    );
     const streamContext = stringSetting(this.runtimeSettings.streamContext, this.config.stream.context);
     this.contextStore.configure({
       channel: this.config.twitch.channel,
@@ -922,6 +925,7 @@ export class Application {
       visionFps: this.config.stream.visionFps,
       learnEnabled: this.config.learning.enabled,
       paused: this.paused,
+      memoryChannel: this.config.globalMemory.channel,
     };
   }
 
@@ -960,6 +964,19 @@ export class Application {
         this.logger.info('Resumed by operator');
       }
     }
+    if (typeof settings.memoryChannel === 'string') {
+      const nextMemoryChannel = normalizeChannel(settings.memoryChannel);
+      if (nextMemoryChannel !== this.config.globalMemory.channel) {
+        // A stream already running on a channel that just stopped counting keeps its open session
+        // closed rather than left live, so nothing further is attributed to it.
+        this.config.globalMemory.channel = nextMemoryChannel;
+        persisted.memoryChannel = nextMemoryChannel;
+        if (!this.memoryChannelActive(this.config.twitch.channel)) {
+          await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
+        }
+        this.logger.info('Memory channel changed', { memoryChannel: nextMemoryChannel || '(любой)' });
+      }
+    }
     const nextChannel = typeof settings.channel === 'string' ? normalizeChannel(settings.channel) : this.config.twitch.channel;
     const nextVisionFps = typeof settings.visionFps === 'number' ? settings.visionFps : this.config.stream.visionFps;
     const mediaChanged = nextChannel !== this.config.twitch.channel || nextVisionFps !== this.config.stream.visionFps;
@@ -987,9 +1004,20 @@ export class Application {
     return { restartRequired: [] };
   }
 
+  private memoryChannelActive(channel: string): boolean {
+    return accumulatesMemory(channel, this.config.globalMemory.channel);
+  }
+
   private async startGlobalMemorySession(): Promise<void> {
     const snapshot = this.contextStore.snapshot();
     if (!snapshot.channel) return;
+    if (!this.memoryChannelActive(snapshot.channel)) {
+      this.logger.info('Stream session not started: this channel does not accumulate memory', {
+        channel: snapshot.channel,
+        memoryChannel: this.config.globalMemory.channel,
+      });
+      return;
+    }
     try {
       await this.globalMemory.startOrResumeSession({
         channel: snapshot.channel,
