@@ -29,6 +29,11 @@ import { MediaPipeline } from './stream-brain/media-pipeline';
 import { StreamBrainService } from './stream-brain/stream-brain.service';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from './stream-brain/types';
 import { SpeechTranscriber } from './transcription/speech-transcriber';
+import {
+  GroqWhisperBackend,
+  OpenRouterTranscriptionBackend,
+  TranscriptionBackend,
+} from './transcription/transcription-backend';
 import { TwitchBotManager } from './twitch/bot-manager';
 import { DeliveryProbe } from './twitch/delivery-probe';
 import { TwitchHelixClient } from './twitch/helix-client';
@@ -282,25 +287,32 @@ export class Application {
     }
 
     const transcriptionMode = this.config.transcription.mode;
-    if (transcriptionMode !== 'gemini' && this.config.transcription.groqApiKey) {
+    const backend = this.buildTranscriptionBackend();
+    if (transcriptionMode !== 'gemini' && backend) {
       this.transcriber = new SpeechTranscriber({
-        apiKey: this.config.transcription.groqApiKey,
-        language: this.config.transcription.language,
-        model: this.config.transcription.model,
+        backend,
         logger: this.logger,
+        vocabulary: () => {
+          const snapshot = this.contextStore.snapshot();
+          return [snapshot.channel, ...snapshot.botUsernames];
+        },
         onTranscript: (text, meta) => {
-          // Shadow mode is a measurement, not a source: both layers hear the same stream and both
-          // write down what they heard, so they can be compared on one run before anything depends
-          // on the answer.
-          this.logger.info('Whisper heard', { text, audioMs: meta.audioMs, latencyMs: meta.latencyMs });
+          // In shadow mode this is a measurement, not a source: both layers hear the same stream
+          // and both write down what they heard, so they can be compared on one real run before
+          // anything depends on the answer.
+          this.logger.info('Transcriber heard', {
+            text, audioMs: meta.audioMs, latencyMs: meta.latencyMs, via: backend.name,
+          });
           if (transcriptionMode === 'whisper') this.handleSpokenTranscript(text);
         },
       });
       this.logger.info('Speech transcription enabled', {
-        mode: transcriptionMode, model: this.config.transcription.model,
+        mode: transcriptionMode, via: backend.name, model: this.transcriptionModel(),
       });
     } else if (transcriptionMode !== 'gemini') {
-      this.logger.warn('Speech transcription requested without GROQ_API_KEY; falling back to Live transcription');
+      this.logger.warn('Speech transcription requested without a key for the chosen provider', {
+        provider: this.config.transcription.provider,
+      });
     }
 
     const hasStreamAnalyzer = Boolean(this.gemini || this.transcriber);
@@ -965,6 +977,32 @@ export class Application {
     };
     void refresh();
     this.categoryTimer = setInterval(() => { void refresh(); }, this.config.twitch.categoryRefreshMs);
+  }
+
+  private transcriptionModel(): string {
+    return this.config.transcription.provider === 'groq'
+      ? this.config.transcription.groqModel
+      : this.config.transcription.model;
+  }
+
+  private buildTranscriptionBackend(): TranscriptionBackend | undefined {
+    const { provider, language } = this.config.transcription;
+    if (provider === 'groq') {
+      const apiKey = this.config.transcription.groqApiKey;
+      return apiKey
+        ? new GroqWhisperBackend({ apiKey, model: this.config.transcription.groqModel, language })
+        : undefined;
+    }
+    const apiKey = this.config.openRouter.apiKey;
+    return apiKey
+      ? new OpenRouterTranscriptionBackend({
+          apiKey,
+          model: this.config.transcription.model,
+          language,
+          appName: this.config.openRouter.appName,
+          ...(this.config.openRouter.appUrl ? { appUrl: this.config.openRouter.appUrl } : {}),
+        })
+      : undefined;
   }
 
   /** Reported next to the Live counters so the two ways of hearing can be read side by side. */

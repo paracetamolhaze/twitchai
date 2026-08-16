@@ -18,19 +18,18 @@ function pcm(ms: number, amplitude: number): Buffer {
 
 function transcriber(overrides: Partial<ConstructorParameters<typeof SpeechTranscriber>[0]> = {}) {
   const heard: Array<{ text: string; audioMs: number }> = [];
-  const created = vi.fn(async () => ({ text: 'привет как дела' }));
+  const hints: string[] = [];
+  const created = vi.fn(async (_wav: Buffer, hint: string) => {
+    hints.push(hint);
+    return 'привет как дела';
+  });
   const instance = new SpeechTranscriber({
-    apiKey: 'test-key',
-    language: 'ru',
+    backend: { name: 'test', transcribe: created },
     logger: new Logger('TEST', 'error'),
     onTranscript: (text, meta) => { heard.push({ text, audioMs: meta.audioMs }); },
     ...overrides,
   });
-  // The SDK client is constructed internally; the test replaces only its transcription call.
-  (instance as unknown as { groq: { audio: { transcriptions: { create: unknown } } } }).groq = {
-    audio: { transcriptions: { create: created } },
-  };
-  return { instance, heard, created };
+  return { instance, heard, created, hints };
 }
 
 describe('SpeechTranscriber', () => {
@@ -87,6 +86,23 @@ describe('SpeechTranscriber', () => {
     instance.acceptPcm(pcm(700, 0));
     instance.acceptPcm(pcm(5_000, 0.2));
     await vi.waitFor(() => expect(created.mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
+  it('tells the listener which names are in play and what was said a moment ago', async () => {
+    // A segment heard on its own has no idea a stream is called gudini_younger. Continuous
+    // listening got that for free; this is what buys it back.
+    const { instance, hints } = transcriber({ vocabulary: () => ['gudini_younger', 'karlbekner'] });
+    instance.acceptPcm(pcm(700, 0));
+    instance.acceptPcm(pcm(1_500, 0.2));
+    instance.acceptPcm(pcm(1_200, 0));
+    await vi.waitFor(() => expect(hints).toHaveLength(1));
+    expect(hints[0]).toContain('gudini_younger');
+    expect(hints[0]).toContain('karlbekner');
+
+    instance.acceptPcm(pcm(1_500, 0.2));
+    instance.acceptPcm(pcm(1_200, 0));
+    await vi.waitFor(() => expect(hints).toHaveLength(2));
+    expect(hints[1]).toContain('привет как дела');
   });
 
   it('hears quiet speech over loud background by measuring the room rather than a fixed level', async () => {

@@ -90,8 +90,11 @@ export interface AppConfig {
   };
   transcription: {
     mode: TranscriptionMode;
+    /** Which service listens. Both take the same segments; only accuracy and price differ. */
+    provider: 'openrouter' | 'groq';
     groqApiKey?: string;
     model: string;
+    groqModel: string;
     language: string;
   };
   database: {
@@ -166,7 +169,9 @@ const envSchema = z.object({
   GLOBAL_MEMORY_SESSION_STALE_MINUTES: z.coerce.number().int().min(5).max(240).default(30),
   GLOBAL_MEMORY_CHANNEL: z.string().default(''),
   TRANSCRIPTION_MODE: z.enum(['gemini', 'shadow', 'whisper']).default('gemini'),
-  TRANSCRIPTION_MODEL: z.string().default('whisper-large-v3-turbo'),
+  TRANSCRIPTION_PROVIDER: z.enum(['openrouter', 'groq']).default('openrouter'),
+  TRANSCRIPTION_MODEL: z.string().default('google/gemini-2.5-flash-lite'),
+  TRANSCRIPTION_GROQ_MODEL: z.string().default('whisper-large-v3-turbo'),
   GROQ_API_KEY: z.string().trim().optional(),
   ORIGINAL_STREAM_LANGUAGE: z.string().trim().default('ru'),
   DATABASE_URL: z.string().trim().optional(),
@@ -316,7 +321,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     transcription: {
       mode: parsed.TRANSCRIPTION_MODE,
+      provider: parsed.TRANSCRIPTION_PROVIDER,
       model: parsed.TRANSCRIPTION_MODEL,
+      groqModel: parsed.TRANSCRIPTION_GROQ_MODEL,
       groqApiKey: parsed.GROQ_API_KEY,
       language: parsed.ORIGINAL_STREAM_LANGUAGE,
     },

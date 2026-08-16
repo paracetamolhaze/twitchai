@@ -1,10 +1,5 @@
-import { createReadStream } from 'node:fs';
-import { unlink, writeFile } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
-import { randomUUID } from 'node:crypto';
-import Groq from 'groq-sdk';
 import { Logger } from '../logger';
+import { TranscriptionBackend } from './transcription-backend';
 
 const SAMPLE_RATE = 16_000;
 const BYTES_PER_SAMPLE = 2;
@@ -12,10 +7,14 @@ const FRAME_MS = 20;
 const FRAME_BYTES = (SAMPLE_RATE / 1000) * FRAME_MS * BYTES_PER_SAMPLE;
 
 export interface SpeechTranscriberOptions {
-  apiKey: string;
-  language: string;
-  model?: string;
+  backend: TranscriptionBackend;
   logger: Logger;
+  /**
+   * Names in play — the streamer, the accounts, whatever the stream keeps coming back to. Sent
+   * with every segment so proper nouns stop drifting, which is the one thing a segment heard on
+   * its own loses against a session that listens continuously.
+   */
+  vocabulary?: () => string[];
   onTranscript: (text: string, meta: { audioMs: number; latencyMs: number }) => void | Promise<void>;
   /** Loudness a frame must clear to count as speech, relative to the measured noise floor. */
   speechFloorRatio?: number;
@@ -57,9 +56,7 @@ export interface SpeechTranscriberStats {
  * also removes the failure Whisper is known for: given silence, it invents plausible sentences.
  */
 export class SpeechTranscriber {
-  private readonly groq: Groq;
   private readonly logger: Logger;
-  private readonly model: string;
   private readonly speechFloorRatio: number;
   private readonly minimumSpeechRms: number;
   private readonly hangoverMs: number;
@@ -87,9 +84,7 @@ export class SpeechTranscriber {
   };
 
   constructor(private readonly options: SpeechTranscriberOptions) {
-    this.groq = new Groq({ apiKey: options.apiKey });
     this.logger = options.logger.child('TRANSCRIPTION');
-    this.model = options.model ?? 'whisper-large-v3-turbo';
     this.speechFloorRatio = options.speechFloorRatio ?? 2.5;
     this.minimumSpeechRms = options.minimumSpeechRms ?? 0.012;
     this.hangoverMs = options.hangoverMs ?? 900;
@@ -173,6 +168,15 @@ export class SpeechTranscriber {
     }
   }
 
+  private buildHint(): string {
+    const names = (this.options.vocabulary?.() ?? []).filter(Boolean).slice(0, 40);
+    const previous = this.stats.lastTranscript?.slice(-200);
+    return [
+      names.length > 0 ? `Names: ${names.join(', ')}` : '',
+      previous ? `Previous line: ${previous}` : '',
+    ].filter(Boolean).join('. ');
+  }
+
   private rememberPreRoll(frame: Buffer): void {
     this.preRoll.push(Buffer.from(frame));
     const maxFrames = Math.max(1, Math.round(this.preRollMs / FRAME_MS));
@@ -206,19 +210,10 @@ export class SpeechTranscriber {
     this.stats.segmentsSent += 1;
     this.stats.audioSecondsSent += audioMs / 1000;
     const startedAt = Date.now();
-    const file = path.join(os.tmpdir(), `twitch-ai-${randomUUID()}.wav`);
     try {
-      await writeFile(file, wav(pcm));
-      const request: Parameters<typeof this.groq.audio.transcriptions.create>[0] = {
-        file: createReadStream(file),
-        model: this.model,
-        response_format: 'json',
-        ...(this.options.language && this.options.language !== 'auto' ? { language: this.options.language } : {}),
-      };
-      const result = await this.groq.audio.transcriptions.create(request);
-      const text = result.text?.trim();
+      const text = await this.options.backend.transcribe(wav(pcm), this.buildHint());
       const latencyMs = Date.now() - startedAt;
-      if (!text || text.length < 3) return;
+      if (!text) return;
       this.stats.transcriptsReceived += 1;
       this.stats.lastTranscript = text;
       this.stats.lastLatencyMs = latencyMs;
@@ -227,7 +222,6 @@ export class SpeechTranscriber {
       this.stats.failures += 1;
       this.logger.warn('Speech transcription failed', { audioMs, cause });
     } finally {
-      await unlink(file).catch(() => undefined);
       this.inFlight -= 1;
     }
   }
