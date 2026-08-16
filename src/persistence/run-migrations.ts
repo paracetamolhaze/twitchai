@@ -9,6 +9,7 @@ const MIGRATIONS = [
   '004_deep_personas.sql',
   '005_deep_persona_generation_v3.sql',
   '006_global_streamer_memory.sql',
+  '007_bot_message_event_id_text.sql',
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

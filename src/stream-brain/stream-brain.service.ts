@@ -212,6 +212,8 @@ export class StreamBrainService extends EventEmitter {
       usageReports: client?.usageReports,
       contextWindowMode: client?.contextWindowMode,
       responseModality: client?.responseModality,
+      stallRecoveries: client?.stallRecoveries,
+      msSincePerceptionOutput: client?.msSincePerceptionOutput,
     });
   }
 

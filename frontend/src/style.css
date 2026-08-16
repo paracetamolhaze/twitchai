@@ -202,6 +202,8 @@ meter { width: 100%; height: 4px; accent-color: var(--green); }
 .streamer-memory-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 13px; }
 .streamer-memory-actions .danger-button { margin-left: auto; }
 .text-button.warning { color: var(--amber); }
+.silence-warning { color: var(--amber); }
+.silence-critical { color: var(--red); }
 .streamer-memory-edit { display: grid; gap: 13px; }
 .streamer-memory-edit .panel-heading { margin-bottom: 0; }
 .streamer-memory-edit .four-columns label b { justify-self: end; margin-bottom: -18px; color: var(--green); font: 9px 'DM Mono'; }

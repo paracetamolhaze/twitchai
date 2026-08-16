@@ -65,6 +65,74 @@ describe('Gemini Live perception protocol', () => {
     client.stop();
   });
 
+  it('remakes a session that stays connected and fed but stops producing anything', async () => {
+    // Production ran 5.8 minutes in which Live held READY, kept accepting audio and video, and
+    // returned neither a transcript nor an event, so the decision layer kept being handed the same
+    // frozen observation. Only the service's own rollover ended it.
+    vi.useFakeTimers();
+    const sessions: Session[] = [];
+    const closed: number[] = [];
+    let parameters: LiveConnectParameters | undefined;
+    const client = createClient({
+      perceptionStallMs: 60_000,
+      reconnectMinimumMs: 1,
+      connect: async (value) => {
+        parameters = value;
+        const index = sessions.length;
+        const session = {
+          sendRealtimeInput: vi.fn(),
+          sendToolResponse: vi.fn(),
+          close: () => closed.push(index),
+        } as unknown as Session;
+        sessions.push(session);
+        return session;
+      },
+    });
+    await client.start();
+    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    expect(client.isConnected()).toBe(true);
+
+    // Media keeps arriving throughout, which is what separates a deaf session from a dead stream.
+    for (let elapsed = 0; elapsed < 70_000; elapsed += 5_000) {
+      client.sendAudio(Buffer.from([1, 2]));
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    expect(closed).toEqual([0]);
+    expect(client.getDiagnostics().stallRecoveries).toBe(1);
+
+    // The replacement session is left alone for as long as it is actually transcribing.
+    await vi.advanceTimersByTimeAsync(10);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    for (let elapsed = 0; elapsed < 80_000; elapsed += 5_000) {
+      client.sendAudio(Buffer.from([1, 2]));
+      parameters?.callbacks?.onmessage?.({
+        serverContent: { inputTranscription: { text: 'slyshno' } },
+      } as LiveServerMessage);
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    expect(closed).toEqual([0]);
+    client.stop();
+  });
+
+  it('leaves a quiet session alone when no audio is arriving, because that is a media problem', async () => {
+    vi.useFakeTimers();
+    const close = vi.fn();
+    let parameters: LiveConnectParameters | undefined;
+    const client = createClient({
+      perceptionStallMs: 60_000,
+      connect: async (value) => {
+        parameters = value;
+        return { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close } as unknown as Session;
+      },
+    });
+    await client.start();
+    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(close).not.toHaveBeenCalled();
+    expect(client.getDiagnostics().stallRecoveries).toBe(0);
+    client.stop();
+  });
+
   it('never shows Live its own bots\' chat messages, so an autonomous Persona Drive message cannot cause Live to emit a StreamEvent about itself', async () => {
     // Closes the one path that wasn't already guarded by Application.handleChat's kind !== 'viewer'
     // check (application.ts): that guard stops a bot message from ever reaching the direct
@@ -436,6 +504,7 @@ interface ClientOverrides {
   usage?: UsageTracker;
   responseModality?: 'text' | 'audio';
   minFramesBeforeEvents?: number;
+  perceptionStallMs?: number;
 }
 
 function createClient(overrides: ClientOverrides): GeminiLiveClient {
@@ -450,6 +519,7 @@ function createClient(overrides: ClientOverrides): GeminiLiveClient {
     ...(overrides.responseModality ? { responseModality: overrides.responseModality } : {}),
     // Off unless a test is about the warm-up gate itself, so unrelated cases need not feed frames.
     minFramesBeforeEvents: overrides.minFramesBeforeEvents ?? 0,
+    ...(overrides.perceptionStallMs !== undefined ? { perceptionStallMs: overrides.perceptionStallMs } : {}),
     handlers: {
       onStreamEvent: (event) => overrides.onStreamEvent?.(event) ?? Promise.resolve({ accepted: true }),
       ...(overrides.onTranscript ? { onTranscript: overrides.onTranscript } : {}),

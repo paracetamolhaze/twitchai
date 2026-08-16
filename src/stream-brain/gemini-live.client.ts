@@ -53,6 +53,8 @@ export interface GeminiLiveClientOptions {
   speechSilenceMs?: number;
   /** Frames that must arrive before an emitted event is trusted, so nothing is reported unseen. */
   minFramesBeforeEvents?: number;
+  /** How long perception may return nothing while audio keeps flowing before the session is remade. */
+  perceptionStallMs?: number;
   connect?: (parameters: LiveConnectParameters) => Promise<Session>;
 }
 
@@ -128,10 +130,17 @@ export class GeminiLiveClient implements StreamBrainClient {
   private usageReports = 0;
   private modelTurns = 0;
   private readonly minFramesBeforeEvents: number;
+  private readonly perceptionStallMs: number;
+  /** Last time the session produced anything at all: a transcript or an event. */
+  private lastPerceptionOutputAt?: number;
+  /** Audio counter at the previous stall check, so a silent session is told apart from silent media. */
+  private audioChunksAtLastStallCheck = 0;
+  private stallRecoveries = 0;
 
   constructor(private readonly options: GeminiLiveClientOptions) {
     this.effectiveResponseModality = options.responseModality ?? 'audio';
     this.minFramesBeforeEvents = options.minFramesBeforeEvents ?? 3;
+    this.perceptionStallMs = options.perceptionStallMs ?? 120_000;
     this.ai = new GoogleGenAI({ apiKey: options.apiKey });
     this.logger = options.logger.child('PERCEPTION');
     this.backoff = new ExponentialBackoff(
@@ -167,6 +176,10 @@ export class GeminiLiveClient implements StreamBrainClient {
       protocolErrorsInWindow: this.protocolErrorTimes.length,
       modelTurns: this.modelTurns,
       usageReports: this.usageReports,
+      stallRecoveries: this.stallRecoveries,
+      ...(this.lastPerceptionOutputAt !== undefined
+        ? { msSincePerceptionOutput: Date.now() - this.lastPerceptionOutputAt }
+        : {}),
       contextWindowMode: this.useExplicitContextWindow ? 'explicit' : 'service_default',
       responseModality: this.effectiveResponseModality,
     };
@@ -417,6 +430,7 @@ export class GeminiLiveClient implements StreamBrainClient {
     const transcript = message.serverContent?.inputTranscription?.text?.trim();
     if (transcript) {
       this.transcriptsReceived += 1;
+      this.lastPerceptionOutputAt = Date.now();
       this.options.handlers.onTranscript?.(transcript);
     }
     for (const part of message.serverContent?.modelTurn?.parts ?? []) {
@@ -424,6 +438,7 @@ export class GeminiLiveClient implements StreamBrainClient {
       if (part.inlineData?.data) this.logger.debug('Ignored Gemini voice-output audio', { bytes: part.inlineData.data.length });
     }
     const calls = (message.toolCall?.functionCalls ?? []) as LiveFunctionCallLike[];
+    if (calls.length > 0) this.lastPerceptionOutputAt = Date.now();
     const toolProcessing = calls.length > 0 ? this.enqueueToolCalls(calls, connectionId, this.generation) : undefined;
     if (message.goAway) {
       const reason = 'Gemini Live requested a session rollover';
@@ -708,8 +723,52 @@ export class GeminiLiveClient implements StreamBrainClient {
    */
   private startHeartbeat(): void {
     this.clearHeartbeat();
-    this.heartbeatTimer = setInterval(() => this.notifyStatus(), 5_000);
+    this.heartbeatTimer = setInterval(() => {
+      this.checkPerceptionStall();
+      this.notifyStatus();
+    }, 5_000);
     this.heartbeatTimer.unref?.();
+  }
+
+  /**
+   * Recovers a session that is connected and fed but has gone deaf.
+   *
+   * Production ran 5.8 minutes in which Live stayed READY, kept taking audio and video, and
+   * returned neither a transcript nor a single event. Nothing noticed: the dashboard showed a
+   * healthy session, the decision layer kept being handed the same frozen observation, and the
+   * accounts drifted into a conversation with each other about a topic the stream had left behind.
+   * The service's own rollover was what eventually fixed it, which is the whole remedy here — the
+   * session is remade, clean rather than resumed, since a handle would restore the same stuck
+   * state. A rollover already happens every ten minutes or so, making this cheap when it is wrong.
+   */
+  private checkPerceptionStall(): void {
+    const connectionId = this.activeConnectionId;
+    const audioSent = this.audioChunksSent;
+    const audioAdvanced = audioSent > this.audioChunksAtLastStallCheck;
+    this.audioChunksAtLastStallCheck = audioSent;
+    if (!this.desiredRunning || this.state !== 'READY' || !this.session || connectionId === undefined) return;
+    // Without audio arriving there is nothing to be deaf to; that is a media problem, not this one.
+    if (!audioAdvanced) return;
+    const since = this.lastPerceptionOutputAt ?? this.sessionStartedAt;
+    if (since === undefined) return;
+    const silentMs = Date.now() - since;
+    if (silentMs < this.perceptionStallMs) return;
+
+    this.stallRecoveries += 1;
+    this.lastPerceptionOutputAt = Date.now();
+    this.resumptionHandle = undefined;
+    this.logger.warn('Perception returned nothing while audio kept flowing; remaking the session', {
+      silentMs,
+      audioChunksSent: this.audioChunksSent,
+      videoFramesSent: this.videoFramesSent,
+      transcriptsReceived: this.transcriptsReceived,
+    });
+    this.handleDisconnect({
+      connectionId,
+      source: 'local_protocol',
+      message: 'Perception stopped producing transcripts and events while media kept arriving',
+      reconnectDelayMs: 50,
+    });
   }
 
   private clearHeartbeat(): void {

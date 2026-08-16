@@ -109,6 +109,10 @@ export interface GeminiLiveDiagnostics {
   /** Whether retention is bounded by our values or left to the much larger service default. */
   contextWindowMode: 'explicit' | 'service_default';
   responseModality: 'text' | 'audio';
+  /** Sessions remade because they went deaf while still connected and fed. */
+  stallRecoveries: number;
+  /** How long ago the session last produced a transcript or an event. */
+  msSincePerceptionOutput?: number;
 }
 
 export interface StreamBrainStatus {
@@ -143,6 +147,8 @@ export interface StreamBrainStatus {
   usageReports?: number;
   contextWindowMode?: 'explicit' | 'service_default';
   responseModality?: 'text' | 'audio';
+  stallRecoveries?: number;
+  msSincePerceptionOutput?: number;
   spokenMentionsDetected?: number;
   eligibleBots?: number;
 }

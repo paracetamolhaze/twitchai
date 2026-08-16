@@ -35,6 +35,8 @@ interface BrainStatus {
   audioChunksSent?: number
   videoFramesSent?: number
   transcriptsReceived?: number
+  stallRecoveries?: number
+  msSincePerceptionOutput?: number
   modelTurns?: number
   usageReports?: number
   contextWindowMode?: 'explicit' | 'service_default'
@@ -1244,6 +1246,16 @@ function reactionTraceMessageStatusLabel(status: ReactionTraceMessage['status'])
     UNDELIVERED: 'Twitch не показал',
   })[status]
 }
+// Perception can hold a healthy-looking session while returning nothing at all; production ran
+// 5.8 minutes that way. The watchdog remakes the session at two minutes, so anything approaching
+// that is worth seeing on screen rather than only in the logs.
+const perceptionSilenceClass = computed(() => {
+  const silent = overview.streamBrain.msSincePerceptionOutput
+  if (silent === undefined) return ''
+  if (silent >= 90_000) return 'silence-critical'
+  return silent >= 45_000 ? 'silence-warning' : ''
+})
+
 function formatMilliseconds(value?: number): string {
   if (value === undefined || !Number.isFinite(value)) return '—'
   const milliseconds = Math.max(0, value)
@@ -1653,7 +1665,7 @@ onBeforeUnmount(() => {
             <div><span>Стоимость Persona Drive</span><strong>${{ usage.currentStream.driveBrain.estimatedCostUsd.toFixed(4) }}</strong></div>
           </section>
           <section class="panel debug-context">
-            <div><h3>Диагностика двух слоёв</h3><p>Perception стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · ошибок протокола: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Live-сессия: возраст <b>{{ formatSessionDuration(overview.streamBrain.sessionStartedAt) }}</b> · reconnects <b>{{ usage.geminiReconnects }}</b> · аудио отправлено в Gemini <b>{{ overview.streamBrain.audioChunksSent ?? 0 }}</b> чанков · видео отправлено <b>{{ overview.streamBrain.videoFramesSent ?? 0 }}</b> кадров · транскриптов получено <b>{{ overview.streamBrain.transcriptsReceived ?? 0 }}</b></p><p>Live turns: <b>{{ overview.streamBrain.modelTurns ?? 0 }}</b> · отчётов об usage <b>{{ overview.streamBrain.usageReports ?? 0 }}</b> · окно контекста <b>{{ overview.streamBrain.contextWindowMode === 'service_default' ? 'ДЕФОЛТ СЕРВИСА (дорого)' : '16k → 8k' }}</b> · вывод <b>{{ overview.streamBrain.responseModality ?? "—" }}</b></p><p>Brain: <b>{{ stateLabel(overview.geminiBrain.state) }}</b> · последнее решение {{ formatMilliseconds(overview.geminiBrain.lastLatencyMs) }} · среднее {{ formatMilliseconds(overview.geminiBrain.averageLatencyMs) }} · recovery {{ overview.geminiBrain.rebuiltSessions }} · rollover {{ overview.geminiBrain.rollovers }}</p><p v-if="overview.geminiBrain.lastError">Ошибка Brain: <b>{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</b></p><p>Последнее закрытие Live: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ closeReasonLabel(overview.streamBrain.lastCloseCode, overview.streamBrain.lastCloseReason) }}</p><details v-if="overview.streamBrain.lastCloseReason"><summary>Техническое сообщение сервера</summary><code>{{ overview.streamBrain.lastCloseReason }}</code></details><p>Последние операции Live: исходящая <b>{{ diagnosticOperationLabel(overview.streamBrain.lastOutbound) }}</b> · инструмент <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolCall) }}</b> · медиа <b>{{ diagnosticOperationLabel(overview.streamBrain.lastMediaInput) }}</b></p></div>
+            <div><h3>Диагностика двух слоёв</h3><p>Perception стабильна: <b>{{ overview.streamBrain.geminiStable ? 'да' : 'нет' }}</b> · состояние: <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · ошибок протокола: <b>{{ overview.streamBrain.protocolErrorsInWindow || 0 }}</b></p><p>Live-сессия: возраст <b>{{ formatSessionDuration(overview.streamBrain.sessionStartedAt) }}</b> · reconnects <b>{{ usage.geminiReconnects }}</b> · аудио отправлено в Gemini <b>{{ overview.streamBrain.audioChunksSent ?? 0 }}</b> чанков · видео отправлено <b>{{ overview.streamBrain.videoFramesSent ?? 0 }}</b> кадров · транскриптов получено <b>{{ overview.streamBrain.transcriptsReceived ?? 0 }}</b> · молчит <b :class="perceptionSilenceClass">{{ formatMilliseconds(overview.streamBrain.msSincePerceptionOutput) }}</b> · пересозданий из-за тишины <b>{{ overview.streamBrain.stallRecoveries ?? 0 }}</b></p><p>Live turns: <b>{{ overview.streamBrain.modelTurns ?? 0 }}</b> · отчётов об usage <b>{{ overview.streamBrain.usageReports ?? 0 }}</b> · окно контекста <b>{{ overview.streamBrain.contextWindowMode === 'service_default' ? 'ДЕФОЛТ СЕРВИСА (дорого)' : '16k → 8k' }}</b> · вывод <b>{{ overview.streamBrain.responseModality ?? "—" }}</b></p><p>Brain: <b>{{ stateLabel(overview.geminiBrain.state) }}</b> · последнее решение {{ formatMilliseconds(overview.geminiBrain.lastLatencyMs) }} · среднее {{ formatMilliseconds(overview.geminiBrain.averageLatencyMs) }} · recovery {{ overview.geminiBrain.rebuiltSessions }} · rollover {{ overview.geminiBrain.rollovers }}</p><p v-if="overview.geminiBrain.lastError">Ошибка Brain: <b>{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</b></p><p>Последнее закрытие Live: <b>{{ overview.streamBrain.lastCloseCode ?? '—' }}</b> · {{ closeReasonLabel(overview.streamBrain.lastCloseCode, overview.streamBrain.lastCloseReason) }}</p><details v-if="overview.streamBrain.lastCloseReason"><summary>Техническое сообщение сервера</summary><code>{{ overview.streamBrain.lastCloseReason }}</code></details><p>Последние операции Live: исходящая <b>{{ diagnosticOperationLabel(overview.streamBrain.lastOutbound) }}</b> · инструмент <b>{{ diagnosticToolLabel(overview.streamBrain.lastToolCall) }}</b> · медиа <b>{{ diagnosticOperationLabel(overview.streamBrain.lastMediaInput) }}</b></p></div>
             <pre>{{ (overview.streamBrain.outboundTrace || []).map(item => `${formatTime(item.at)} ${diagnosticOperationLabel(item.type)}${item.bytes !== undefined ? ` (${item.bytes} байт)` : ''}`).join('\n') || 'Исходящих операций пока нет.' }}</pre>
           </section>
           <div class="section-heading reaction-trace-heading">

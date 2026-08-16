@@ -198,6 +198,15 @@ export class PersonaDriveService {
     }
 
     const snapshot = o.contextStore.snapshot();
+    // Perception going quiet is not the same as the stream being quiet, and neither the decision
+    // layer nor this service can tell them apart on its own. Production ran nearly six minutes in
+    // which a connected perception layer reported nothing at all, and every spontaneous message in
+    // that window was written against the same frozen observation, which is how the accounts ended
+    // up discussing servers on a stream about dinner.
+    const lastObservationAt = Math.max(
+      snapshot.recentEvents.at(-1)?.timestamp ?? 0,
+      snapshot.recentSpeech.at(-1)?.timestamp ?? 0,
+    ) || undefined;
     const input: BrainDriveOpportunityInput = {
       triggerKind: 'persona_drive',
       channel: snapshot.channel,
@@ -206,6 +215,9 @@ export class PersonaDriveService {
       candidates: driveCandidates,
       recentChat: snapshot.recentChat.slice(-MAX_RECENT_CHAT_FOR_DRIVE)
         .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
+      ...(lastObservationAt !== undefined
+        ? { secondsSinceLastObservation: Math.round((now - lastObservationAt) / 1000) }
+        : {}),
       deltas: [],
     };
 

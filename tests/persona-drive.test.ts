@@ -265,6 +265,24 @@ describe('PersonaDriveService', () => {
       service.stop();
     });
 
+    it('tells the Brain how old the newest observation is, so it can drop a topic the stream has left', async () => {
+      // A connected perception layer that reports nothing looks exactly like a quiet stream from
+      // here. Production spent 5.8 minutes in that state and every spontaneous message in the
+      // window was written against the same frozen observation.
+      vi.useFakeTimers();
+      const now = Date.now();
+      const { service, contextStore, evaluateOpportunity } = await harness();
+      contextStore.addEvent({
+        id: 'event-1', timestamp: now - 300_000, type: 'other', summary: 'Стример говорит про VPN.',
+        importance: 0.6, confidence: 0.9, source: 'gemini-live', category: 'IRL', directMentions: [],
+      });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(evaluateOpportunity).toHaveBeenCalledTimes(1);
+      expect(evaluateOpportunity.mock.calls[0]?.[0]?.secondsSinceLastObservation).toBe(301);
+      service.stop();
+    });
+
     it('two consecutive trailing AI messages block a drive attempt (A → B → C is blocked)', async () => {
       vi.useFakeTimers();
       const now = Date.now();

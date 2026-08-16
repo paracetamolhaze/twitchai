@@ -154,6 +154,12 @@ export interface BrainDriveOpportunityInput {
   streamContext: string;
   candidates: BrainDriveCandidate[];
   recentChat: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
+  /**
+   * How long ago perception last reported anything at all. A spontaneous message written while
+   * this is minutes old is being written against a scene that has since moved on, so the decision
+   * layer is told the age rather than being handed a stale observation as if it were current.
+   */
+  secondsSinceLastObservation?: number;
   deltas: BrainDynamicDelta[];
 }
 
