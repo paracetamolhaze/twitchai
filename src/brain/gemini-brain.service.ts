@@ -593,6 +593,17 @@ export class GeminiBrainService extends EventEmitter {
           });
           throw cause;
         }
+        // Depleted prepaid credits arrive as 429 exactly like a per-minute rate limit, but no
+        // amount of backing off brings the money back. Retried as transient, every event spent
+        // three requests and a second of the serial queue to fail the same way: production logged
+        // 33 such events in six minutes, and the dashboard told the operator to wait for a limit
+        // that was never going to lift.
+        if (isBillingExhaustedError(cause)) {
+          this.logger.warn('Gemini credits are depleted; not retrying until the balance is topped up', {
+            kind: request.kind, cause,
+          });
+          throw cause;
+        }
         if (attempt >= 2 || !isTransientBrainError(cause)) throw cause;
         const backoffMs = 250 * 3 ** attempt;
         this.logger.warn('Gemini Brain transient failure; retrying', { attempt: attempt + 1, backoffMs, cause });
@@ -668,6 +679,11 @@ function isInvalidPreviousInteraction(cause: unknown): boolean {
 function isBlockedPromptError(cause: unknown): boolean {
   const message = cause instanceof Error ? cause.message : String(cause);
   return /input blocked|blocked by|safety|prohibited_content|status 400/i.test(message);
+}
+
+/** A 429 that describes an empty balance rather than a speed limit: retrying cannot fix it. */
+function isBillingExhaustedError(cause: unknown): boolean {
+  return /prepayment|credits are depleted|billing|insufficient (?:funds|balance|credit)/iu.test(safeError(cause));
 }
 
 function isTransientBrainError(cause: unknown): boolean {

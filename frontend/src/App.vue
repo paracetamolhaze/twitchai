@@ -1200,6 +1200,11 @@ function operatorErrorLabel(message?: string): string {
   if (/no playable streams found|stream.*offline|not live/u.test(normalized)) return 'Трансляция сейчас офлайн.'
   if (/api.?key|invalid key|authentication|unauthorized|\b401\b/u.test(normalized)) return 'Gemini отклонила ключ доступа. Проверьте ключ на Railway.'
   if (/permission denied|forbidden|\b403\b/u.test(normalized)) return 'У ключа Gemini недостаточно прав для этой модели.'
+  // Depleted prepaid credits and a per-minute rate limit both arrive as 429, and only one of them
+  // recovers on its own. Told to wait for a limit that never lifts, the operator waits.
+  if (/prepayment|credits are depleted|billing|insufficient|balance/u.test(normalized)) {
+    return 'У Gemini закончились предоплаченные кредиты. Само не восстановится — пополните баланс в AI Studio.'
+  }
   if (/quota|resource exhausted|rate.?limit|\b429\b/u.test(normalized)) return 'Достигнут лимит Gemini. Подключение возобновится после восстановления лимита.'
   if (/\b1007\b|invalid argument|malformed|protocol/u.test(normalized)) return 'Gemini отклонила формат данных или настройки сессии.'
   if (/timed? ?out|timeout/u.test(normalized)) return 'Gemini не ответила вовремя. Система попробует переподключиться.'

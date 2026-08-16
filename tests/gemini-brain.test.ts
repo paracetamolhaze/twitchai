@@ -511,6 +511,48 @@ describe('Gemini 3.7 stateful Brain', () => {
     vi.useRealTimers();
   });
 
+  it('does not retry a 429 that means the credits ran out, which no amount of backing off fixes', async () => {
+    // Depleted prepaid credits arrive as 429 exactly like a per-minute rate limit. Retried as
+    // transient, every event spent three requests and a second of the serial queue to fail the
+    // same way: production logged 33 such events in six minutes.
+    const requests: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        if (request.kind === 'bootstrap') {
+          return {
+            id: 'A', status: 'completed', outputText: '{"ready":true}',
+            usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+          };
+        }
+        throw new Error('429 Your prepayment credits are depleted. Please go to AI Studio to manage billing.');
+      },
+    };
+    const service = brainService(client);
+    await service.startStream();
+    await service.enqueueEvent(firstEvent).catch(() => undefined);
+    expect(requests.filter((request) => request.kind !== 'bootstrap')).toHaveLength(1);
+
+    // An ordinary rate limit still gets its retries, since that one does clear on its own.
+    const transientRequests: BrainInteractionRequest[] = [];
+    const transientClient: BrainInteractionClient = {
+      create: async (request) => {
+        transientRequests.push(structuredClone(request));
+        if (request.kind === 'bootstrap') {
+          return {
+            id: 'A', status: 'completed', outputText: '{"ready":true}',
+            usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+          };
+        }
+        throw new Error('429 Resource exhausted: too many requests per minute');
+      },
+    };
+    const transient = brainService(transientClient);
+    await transient.startStream();
+    await transient.enqueueEvent(firstEvent).catch(() => undefined);
+    expect(transientRequests.filter((request) => request.kind !== 'bootstrap')).toHaveLength(3);
+  });
+
   it('makes no Interactions API call for events received while the stream session is offline', async () => {
     const client: BrainInteractionClient = { create: vi.fn() };
     const service = brainService(client);
