@@ -475,6 +475,11 @@ function addModalityUsage(
 function normalizeModality(value: string | undefined): keyof TokenModalityUsage {
   const normalized = value?.toLowerCase();
   if (normalized === 'text' || normalized === 'audio' || normalized === 'video') return normalized;
+  // Sampled frames go out as image/jpeg, and the service accounts for them as IMAGE rather than
+  // VIDEO. Counting that as 'other' made the dashboard read "video: 0" on a session that was in
+  // fact being charged for every frame — the one number needed to tell whether perception can see
+  // at all, reported as zero while it worked.
+  if (normalized === 'image') return 'video';
   return 'other';
 }
 

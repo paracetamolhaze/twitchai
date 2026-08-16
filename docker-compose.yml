@@ -1,0 +1,60 @@
+# Whole stack on one machine: database, backend, dashboard.
+#
+#   docker compose up -d --build
+#   dashboard  http://localhost:8080
+#   api        http://localhost:3000
+#
+# Secrets come from .env in this directory — it is gitignored and never baked into an image.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: twitchai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-twitchai}
+      POSTGRES_DB: twitchai
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twitchai -d twitchai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Not published by default: only the backend needs it. Add a ports mapping to inspect it.
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # Overrides whatever DATABASE_URL is in .env: inside the network the host is the service name,
+      # and TLS is neither present nor needed on a local link.
+      DATABASE_URL: postgres://twitchai:${POSTGRES_PASSWORD:-twitchai}@postgres:5432/twitchai
+      DATABASE_SSL: "false"
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
+    ports:
+      - "3000:3000"
+
+  dashboard:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked in at build time by Vite, so changing where the dashboard points needs a rebuild.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  postgres-data:

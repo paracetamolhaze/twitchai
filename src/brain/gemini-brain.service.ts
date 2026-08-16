@@ -148,6 +148,8 @@ Every request carries a triggerKind of either external_stream_event or persona_d
 
 triggerKind external_stream_event: decide whether any reaction is natural to the supplied StreamEvent, select zero to N currently available usernames, and write the final short Twitch-native messages. Natural silence is correct. Never force every account to write. Avoid duplicate thoughts and keep each selected voice distinct. Direct spoken mentions have high social relevance when the exact username is available, but never create an unconditional reply rule.
 
+When mergedObservations is present, several separate things were noticed close together and the event's own summary is their texts joined into one string. Treat mergedObservations as the truth and that joined summary as a convenience: they did not happen as one moment, so never write a reply that describes them as a single connected scene, and never invent a link between them. Reacting to one of them, or to none, is usually right. An observation carries confidence — a low one is something perception was unsure it saw, so never restate it as established fact.
+
 triggerKind persona_drive: an internal spontaneous-expression opportunity supplied by the backend, not an external event. Nothing necessarily happened on stream — never pretend it did, and never describe an event that was not supplied. Silence (reactions: []) is the normal, expected outcome for most opportunities. At most one persona may speak. A message may naturally arise only from that candidate's supplied memory, stable interests, mood, engagement, relationship context, an unresolved prior topic, or something that persona previously said — never invent a memory, never expose another candidate's memory, and never manufacture generic filler such as "как дела?", "что нового?", or "чат вы где?" without a persona-specific reason. The message should sound like the persona naturally decided to say it, not like an AI announcing that it remembered something.
 
 Use only the selected username's own profile, targeted canon, targeted memory, public streamer memory, and public chat context for that reaction. Never transfer private facts, relatives, memories, or speech habits between usernames.
@@ -249,7 +251,7 @@ export class GeminiBrainService extends EventEmitter {
       return this.enqueueBurstEvent(event, emittedAt);
     }
     this.flushPendingBurst();
-    return this.enqueueSerialized(event, [event.id], emittedAt);
+    return this.enqueueSerialized(event, [event], emittedAt);
   }
 
   private enqueueBurstEvent(event: StreamEvent, emittedAt: number): Promise<BrainDecision | undefined> {
@@ -274,9 +276,8 @@ export class GeminiBrainService extends EventEmitter {
     if (!burst) return;
     this.pendingBurst = undefined;
     clearTimeout(burst.timer);
-    const eventIds = burst.events.map((event) => event.id);
     const event = mergeBrainEvents(burst.events);
-    void this.enqueueSerialized(event, eventIds, burst.emittedAt).then(
+    void this.enqueueSerialized(event, burst.events, burst.emittedAt).then(
       (decision) => burst.waiters.forEach((waiter) => waiter.resolve(decision)),
       (cause) => burst.waiters.forEach((waiter) => waiter.reject(cause)),
     );
@@ -292,12 +293,12 @@ export class GeminiBrainService extends EventEmitter {
 
   private enqueueSerialized(
     event: StreamEvent,
-    mergedEventIds: string[],
+    burstEvents: StreamEvent[],
     emittedAt: number,
   ): Promise<BrainDecision | undefined> {
     const queueGeneration = this.sessionGeneration;
     let result: BrainDecision | undefined;
-    const run = async (): Promise<void> => { result = await this.processEvent(event, mergedEventIds, emittedAt); };
+    const run = async (): Promise<void> => { result = await this.processEvent(event, burstEvents, emittedAt); };
     const queued = this.queueTail.then(run, run);
     this.queueTail = queued.catch((cause: unknown) => {
       if (queueGeneration === this.sessionGeneration) {
@@ -365,7 +366,7 @@ export class GeminiBrainService extends EventEmitter {
 
   private async processEvent(
     event: StreamEvent,
-    mergedEventIds: string[],
+    burstEvents: StreamEvent[],
     emittedAt: number,
   ): Promise<BrainDecision | undefined> {
     // Media lifecycle is the only authority allowed to start a Brain session.
@@ -380,6 +381,22 @@ export class GeminiBrainService extends EventEmitter {
     }
     if (!this.previousInteractionId) return undefined;
     const prepared = await this.options.prepareEvent(event, this.chatCursor, emittedAt);
+    // A burst is several separate observations, and flattening them into one summary string
+    // presented them as a single moment: six things noticed over a stretch of stream arrived as one
+    // run-on sentence, so a reply written "to that event" answered a moment that never existed as
+    // such. The merged event still carries the combined text for everything downstream that expects
+    // one event, but the Brain also gets the observations intact and can weigh them separately.
+    if (burstEvents.length > 1) {
+      prepared.mergedObservations = burstEvents.map((item) => ({
+        timestamp: item.timestamp,
+        type: item.type,
+        summary: item.summary,
+        importance: item.importance,
+        confidence: item.confidence,
+        ...(item.speech ? { speech: item.speech } : {}),
+        ...(item.visualContext ? { visualContext: item.visualContext } : {}),
+      }));
+    }
     // Nobody can answer, so the only possible decision is silence — asking for it costs a full
     // interaction. This happens when a spoken name is recognised for an account that is configured
     // but not currently enabled and connected: the coordinator narrows candidates to the mentioned
@@ -390,7 +407,7 @@ export class GeminiBrainService extends EventEmitter {
       });
       return undefined;
     }
-    prepared.mergedEventIds = mergedEventIds;
+    prepared.mergedEventIds = burstEvents.map((item) => item.id);
     const capturedDeltas = this.pendingDeltas.splice(0);
     const deltas = [...capturedDeltas, ...prepared.deltas];
     const input = JSON.stringify({ ...prepared, deltas });

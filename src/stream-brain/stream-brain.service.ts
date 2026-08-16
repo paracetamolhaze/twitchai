@@ -235,6 +235,13 @@ export class StreamBrainService extends EventEmitter {
       type: deduplicated.event.type,
       importance: deduplicated.event.importance,
       confidence: deduplicated.event.confidence,
+      // What perception claims it observed. Without this a report of "the bot reacted to something
+      // that never happened" cannot be checked against anything: the logs recorded that an event
+      // existed, never what it said, so a description invented by the model and an accurate one
+      // were indistinguishable after the fact.
+      summary: deduplicated.event.summary,
+      ...(deduplicated.event.speech ? { speech: deduplicated.event.speech } : {}),
+      ...(deduplicated.event.visualContext ? { visualContext: deduplicated.event.visualContext } : {}),
     });
     this.queueEventEmission(deduplicated);
     if (this.options.eventSink) {

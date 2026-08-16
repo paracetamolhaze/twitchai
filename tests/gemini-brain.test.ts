@@ -415,6 +415,66 @@ describe('Gemini 3.7 stateful Brain', () => {
     vi.useRealTimers();
   });
 
+  it('keeps merged observations separate instead of only their summaries joined into one string', async () => {
+    vi.useFakeTimers();
+    const requests: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        return {
+          id: request.kind === 'bootstrap' ? 'A' : 'B', status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+        };
+      },
+    };
+    const service = brainService(client, { eventMergeWindowMs: 10 });
+    await service.startStream();
+
+    const burst = [
+      { ...firstEvent, id: 'e1', summary: 'Стример поздоровался.', importance: 0.5, confidence: 0.8 },
+      { ...firstEvent, id: 'e2', summary: 'Кто-то вошёл в комнату.', importance: 0.7, confidence: 0.6 },
+      { ...firstEvent, id: 'e3', summary: 'Стример показывает ключ-карту.', importance: 0.6, confidence: 0.9 },
+    ];
+    const decisions = burst.map((event) => service.enqueueEvent(event));
+    await vi.advanceTimersByTimeAsync(50);
+    await Promise.all(decisions);
+
+    const decision = requests.find((request) => request.kind === 'decision');
+    const payload = JSON.parse(decision!.input) as {
+      event: { summary: string };
+      mergedObservations?: Array<{ summary: string; confidence: number }>;
+    };
+    // Joined, the three read as one connected scene that never happened in that form — which is
+    // what a reply then answered. The observations are also sent intact, each with its own
+    // confidence, so an uncertain one is not restated as established fact.
+    expect(payload.event.summary).toContain('Стример поздоровался.');
+    expect(payload.mergedObservations?.map((item) => item.summary)).toEqual([
+      'Стример поздоровался.', 'Кто-то вошёл в комнату.', 'Стример показывает ключ-карту.',
+    ]);
+    expect(payload.mergedObservations?.map((item) => item.confidence)).toEqual([0.8, 0.6, 0.9]);
+    vi.useRealTimers();
+  });
+
+  it('sends no merged observations for a single event, which is not a burst', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        return {
+          id: request.kind === 'bootstrap' ? 'A' : 'B', status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+        };
+      },
+    };
+    const service = brainService(client);
+    await service.startStream();
+    await service.enqueueEvent(firstEvent);
+    const decision = requests.find((request) => request.kind === 'decision');
+    expect(JSON.parse(decision!.input).mergedObservations).toBeUndefined();
+  });
+
   it('keeps the interaction chain after a deadline miss instead of re-sending the whole bootstrap', async () => {
     vi.useFakeTimers();
     const requests: BrainInteractionRequest[] = [];

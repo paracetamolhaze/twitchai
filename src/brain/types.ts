@@ -93,6 +93,23 @@ export interface BrainEventInput {
     expiresAt: number;
   };
   mergedEventIds?: string[];
+  /**
+   * When a burst was merged, the individual observations that went into it.
+   *
+   * The merged event concatenates their summaries into one string, which reads as a single moment
+   * and is not one: several things noticed across a stretch of stream arrive as one run-on
+   * sentence. These are kept separate so the decision can weigh them as what they are, rather than
+   * answering an event that never existed in that form.
+   */
+  mergedObservations?: Array<{
+    timestamp: number;
+    type: string;
+    summary: string;
+    importance: number;
+    confidence: number;
+    speech?: string;
+    visualContext?: string;
+  }>;
 }
 
 /**
