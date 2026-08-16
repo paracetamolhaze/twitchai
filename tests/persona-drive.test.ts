@@ -79,6 +79,7 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
     usage,
     contextStore,
     candidatesList,
+    history,
     evaluateOpportunity: options.evaluateOpportunity,
     prepareCandidates: options.prepareCandidates,
     submitReaction: options.submitReaction,
@@ -270,6 +271,38 @@ describe('PersonaDriveService', () => {
       const { service, contextStore, usage, evaluateOpportunity } = await harness();
       contextStore.addChat(chat('bot', 'karlbekner', now - 2_000));
       contextStore.addChat(chat('bot', 'gigantiuz', now - 1_000));
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(evaluateOpportunity).not.toHaveBeenCalled();
+      expect(usage.snapshot().drive.cancelledForCooldown).toBe(1);
+      service.stop();
+    });
+
+    it('does not count several accounts answering one stream event as a chain', async () => {
+      vi.useFakeTimers();
+      const now = Date.now();
+      const { service, contextStore, history, evaluateOpportunity } = await harness();
+      // Three accounts replying to the same observed moment are parallel reactions to something
+      // that happened on stream, not bots talking to each other. Counted as a chain, a single
+      // event routinely closed this gate for good, since one event draws up to three replies.
+      await history.add('karlbekner', 'привет', 'event-42', now - 3_000);
+      await history.add('gigantiuz', 'привет', 'event-42', now - 2_000);
+      contextStore.addChat(chat('bot', 'karlbekner', now - 3_000));
+      contextStore.addChat(chat('bot', 'gigantiuz', now - 2_000));
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(evaluateOpportunity).toHaveBeenCalledTimes(1);
+      service.stop();
+    });
+
+    it('still blocks when the trailing messages were autonomous rather than answers to the stream', async () => {
+      vi.useFakeTimers();
+      const now = Date.now();
+      const { service, contextStore, history, usage, evaluateOpportunity } = await harness();
+      await history.add('karlbekner', 'привет', 'persona-drive:abc', now - 3_000);
+      await history.add('gigantiuz', 'привет', 'persona-drive:def', now - 2_000);
+      contextStore.addChat(chat('bot', 'karlbekner', now - 3_000));
+      contextStore.addChat(chat('bot', 'gigantiuz', now - 2_000));
       service.start();
       await vi.advanceTimersByTimeAsync(1_000);
       expect(evaluateOpportunity).not.toHaveBeenCalled();

@@ -46,6 +46,7 @@ export interface PersonaDriveServiceOptions {
  * already trailing means the one allowed hop was used).
  */
 const AI_CHAIN_DEPTH_LIMIT = 2;
+const MAX_TRAILING_BOT_MESSAGES_INSPECTED = 8;
 const HOURLY_WINDOW_MS = 60 * 60_000;
 const MAX_MEMORIES_PER_CANDIDATE = 3;
 const MAX_RECENT_OWN_MESSAGES = 4;
@@ -149,7 +150,7 @@ export class PersonaDriveService {
       this.logger.info('PERSONA_DRIVE_SKIPPED', { reason: 'global_cooldown' });
       return;
     }
-    if (this.aiChainDepth() >= AI_CHAIN_DEPTH_LIMIT) {
+    if (await this.aiChainDepth() >= AI_CHAIN_DEPTH_LIMIT) {
       o.usage.recordDriveCancelledForCooldown();
       this.logger.info('PERSONA_DRIVE_SKIPPED', { reason: 'ai_chain_depth' });
       return;
@@ -181,8 +182,12 @@ export class PersonaDriveService {
         this.logger.info('PERSONA_MEMORY_RECALLED', { username: candidate.username, type: memory.type, importance: memory.importance });
       }
     }
+    // A candidate with a memory to draw on still makes the better opportunity, but the penalty for
+    // having none is mild rather than disqualifying: at the old floor almost every tick without a
+    // recalled memory was thrown away, which is fine for a rare aside and far too strict for a
+    // layer meant to keep chat alive.
     const qualityScore = driveCandidates.reduce(
-      (sum, candidate) => sum + (candidate.recalledMemories.length > 0 ? 1 : 0.35), 0,
+      (sum, candidate) => sum + (candidate.recalledMemories.length > 0 ? 1 : 0.7), 0,
     ) / driveCandidates.length;
     const probability = o.maxBrainCallProbability * qualityScore;
     o.usage.recordDriveEligibleTick();
@@ -248,14 +253,39 @@ export class PersonaDriveService {
     }
   }
 
-  /** How many trailing chat messages (most recent first) were AI-authored with no human message since. */
-  private aiChainDepth(): number {
+  /**
+   * How deep the bots are into talking among themselves.
+   *
+   * Only messages with nothing external behind them count. Several accounts answering one
+   * StreamEvent are parallel reactions to the same thing that happened on stream, not a
+   * conversation between bots — counting them as one made the gate permanently closed, because a
+   * single event routinely draws three replies and the limit is two. What this is actually meant
+   * to stop is an autonomous message drawing an autonomous answer with nothing on stream between.
+   */
+  private async aiChainDepth(): Promise<number> {
     const chat = this.options.contextStore.snapshot().recentChat;
-    let depth = 0;
+    const trailing: typeof chat = [];
     for (let index = chat.length - 1; index >= 0; index -= 1) {
       const message = chat[index]!;
       if (message.kind !== 'bot') break;
-      depth += 1;
+      trailing.unshift(message);
+      if (trailing.length >= MAX_TRAILING_BOT_MESSAGES_INSPECTED) break;
+    }
+    if (trailing.length === 0) return 0;
+
+    const usernames = [...new Set(trailing.map((message) => message.username.toLowerCase()))];
+    const records = new Map<string, string | undefined>();
+    await Promise.all(usernames.map(async (username) => {
+      for (const record of await this.options.history.recent(username)) {
+        records.set(`${username}::${normalizeForLookup(record.message)}`, record.eventId);
+      }
+    }));
+
+    let depth = 0;
+    for (const message of trailing) {
+      const eventId = records.get(`${message.username.toLowerCase()}::${normalizeForLookup(message.message)}`);
+      // A persona-drive id, or no id at all, means nothing on stream prompted this message.
+      if (!eventId || eventId.startsWith('persona-drive:')) depth += 1;
     }
     return depth;
   }
@@ -307,6 +337,11 @@ export class PersonaDriveService {
   private pruneWindow(timestamps: number[], now: number): void {
     while (timestamps[0] !== undefined && timestamps[0] <= now - HOURLY_WINDOW_MS) timestamps.shift();
   }
+}
+
+/** Matches a chat echo back to the stored record it came from, ignoring whitespace differences. */
+function normalizeForLookup(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 /** Weighted random sampling without replacement — probabilistic candidate selection, not round-robin. */
