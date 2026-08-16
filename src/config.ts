@@ -164,8 +164,8 @@ const envSchema = z.object({
   // (enforced in code regardless of this value). Kept as a validated env var so a misconfiguration
   // fails loudly at startup instead of silently doing nothing.
   PERSONA_DRIVE_MAX_REACTIONS: z.coerce.number().int().min(1).max(1).default(1),
-  PERSONA_DRIVE_MAX_BRAIN_CALLS_PER_HOUR: z.coerce.number().int().min(0).max(400).default(150),
-  PERSONA_DRIVE_MAX_MESSAGES_PER_HOUR: z.coerce.number().int().min(0).max(400).default(100),
+  PERSONA_DRIVE_MAX_BRAIN_CALLS_PER_HOUR: z.coerce.number().int().min(0).max(400).default(90),
+  PERSONA_DRIVE_MAX_MESSAGES_PER_HOUR: z.coerce.number().int().min(0).max(400).default(50),
   PERSONA_DRIVE_MAX_BRAIN_CALL_PROBABILITY: z.coerce.number().min(0).max(1).default(0.9),
 }).refine(
   (value) => value.PERSONA_DRIVE_MAX_INTERVAL_SECONDS >= value.PERSONA_DRIVE_MIN_INTERVAL_SECONDS,
