@@ -188,6 +188,33 @@ describe('Gemini Live perception protocol', () => {
     client.stop();
   });
 
+  it('asks for text output by default and keeps a bounded retained context', async () => {
+    let parameters: LiveConnectParameters | undefined;
+    const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({ connect: async (value) => { parameters = value; return session; } });
+    await client.start();
+    // Perception is told never to speak and its audio parts are discarded on arrival, so asking
+    // for spoken output was paying $12/M for tokens that were thrown away.
+    expect(parameters?.config?.responseModalities).toEqual(['TEXT']);
+    // Every model turn re-reads the retained window; leaving its size to the service default made
+    // a 4.6-minute session report 308k input tokens against roughly 27k of media actually sent.
+    expect(parameters?.config?.contextWindowCompression?.slidingWindow).toBeDefined();
+    expect(parameters?.config?.contextWindowCompression?.triggerTokens).toBeDefined();
+    client.stop();
+  });
+
+  it('can fall back to voice output for a model that supports nothing else', async () => {
+    let parameters: LiveConnectParameters | undefined;
+    const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({
+      connect: async (value) => { parameters = value; return session; },
+      responseModality: 'audio',
+    });
+    await client.start();
+    expect(parameters?.config?.responseModalities).toEqual(['AUDIO']);
+    client.stop();
+  });
+
   it('declares exactly one tool with supported Live JSON Schema keywords', async () => {
     let parameters: LiveConnectParameters | undefined;
     const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
@@ -267,6 +294,7 @@ interface ClientOverrides {
   reconnectMinimumMs?: number;
   reconnectMaximumMs?: number;
   usage?: UsageTracker;
+  responseModality?: 'text' | 'audio';
 }
 
 function createClient(overrides: ClientOverrides): GeminiLiveClient {
@@ -278,6 +306,7 @@ function createClient(overrides: ClientOverrides): GeminiLiveClient {
     ...(overrides.connect ? { connect: overrides.connect } : {}),
     ...(overrides.reconnectMinimumMs !== undefined ? { reconnectMinimumMs: overrides.reconnectMinimumMs } : {}),
     ...(overrides.reconnectMaximumMs !== undefined ? { reconnectMaximumMs: overrides.reconnectMaximumMs } : {}),
+    ...(overrides.responseModality ? { responseModality: overrides.responseModality } : {}),
     handlers: {
       onStreamEvent: (event) => overrides.onStreamEvent?.(event) ?? Promise.resolve({ accepted: true }),
       ...(overrides.onTranscript ? { onTranscript: overrides.onTranscript } : {}),

@@ -41,6 +41,8 @@ export interface GeminiLiveClientOptions {
   /** Retained-context size that triggers compression, and the size compression reduces it to. */
   contextWindowTriggerTokens?: number;
   contextWindowTargetTokens?: number;
+  /** Perception output modality. 'text' is the cheap default; 'audio' exists as a fallback. */
+  responseModality?: 'text' | 'audio';
   connect?: (parameters: LiveConnectParameters) => Promise<Session>;
 }
 
@@ -245,7 +247,11 @@ export class GeminiLiveClient implements StreamBrainClient {
           }),
         },
         config: {
-          responseModalities: [Modality.AUDIO],
+          // Perception never speaks — its instruction forbids voice output and the client discards
+          // any audio parts that arrive. Generating spoken audio anyway costs $12/M against $4.5/M
+          // for text. Kept switchable because some Live models only support audio output: if the
+          // session fails to start, flip GEMINI_LIVE_RESPONSE_MODALITY back to audio.
+          responseModalities: [this.options.responseModality === 'audio' ? Modality.AUDIO : Modality.TEXT],
           mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
           inputAudioTranscription: {},
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },

@@ -30,6 +30,7 @@ export interface AppConfig {
   gemini: {
     apiKey?: string;
     liveModel: string;
+    liveResponseModality: 'text' | 'audio';
     brainModel: string;
     brainThinkingLevel: 'low' | 'medium' | 'high';
     brainEventMergeWindowMs: number;
@@ -97,6 +98,10 @@ const envSchema = z.object({
   TWITCH_CATEGORY_REFRESH_SECONDS: z.coerce.number().min(30).max(3600).default(120),
   GEMINI_API_KEY: z.string().trim().optional(),
   GEMINI_LIVE_MODEL: z.string().trim().default('gemini-3.1-flash-live-preview'),
+  // Perception is instructed never to speak and its audio output is discarded on arrival, so text
+  // is both cheaper and closer to what the layer actually does. Some Live models only support
+  // audio output — set this to `audio` if the session refuses to start.
+  GEMINI_LIVE_RESPONSE_MODALITY: z.enum(['text', 'audio']).default('text'),
   GEMINI_BRAIN_MODEL: z.string().trim().default('gemini-3.7-flash'),
   GEMINI_BRAIN_THINKING_LEVEL: z.enum(['low', 'medium', 'high']).default('low'),
   BRAIN_EVENT_MERGE_WINDOW_MS: z.coerce.number().int().min(0).max(2_000).default(250),
@@ -110,7 +115,9 @@ const envSchema = z.object({
   // discarded anyway, so waiting longer only holds up every event queued behind it.
   BRAIN_INTERACTION_TIMEOUT_SECONDS: z.coerce.number().int().min(5).max(40).default(35),
   STREAM_CONTEXT: z.string().default(''),
-  VISION_FPS: z.coerce.number().min(0.05).max(1).default(1),
+  // One frame per second is far more than an IRL stream needs — a moment worth reacting to lasts
+  // seconds, and video is the largest share of perception input. Raise only if events are missed.
+  VISION_FPS: z.coerce.number().min(0.05).max(1).default(0.33),
   VISION_FRAME_WIDTH: z.coerce.number().int().min(320).max(1280).default(640),
   EVENT_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.4),
   STREAM_CONTEXT_REFRESH_SECONDS: z.coerce.number().min(10).max(300).default(30),
@@ -209,6 +216,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     gemini: {
       apiKey: parsed.GEMINI_API_KEY,
       liveModel: parsed.GEMINI_LIVE_MODEL,
+      liveResponseModality: parsed.GEMINI_LIVE_RESPONSE_MODALITY,
       brainModel: parsed.GEMINI_BRAIN_MODEL,
       brainThinkingLevel: parsed.GEMINI_BRAIN_THINKING_LEVEL,
       brainEventMergeWindowMs: parsed.BRAIN_EVENT_MERGE_WINDOW_MS,

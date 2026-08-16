@@ -192,6 +192,7 @@ export class Application {
         model: this.config.gemini.liveModel,
         logger: this.logger,
         usage: this.usage,
+        responseModality: this.config.gemini.liveResponseModality,
         handlers: {
           onStreamEvent: async (candidate) => {
             const event = await this.perception.acceptCandidate(candidate);
