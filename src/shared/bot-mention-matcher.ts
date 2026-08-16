@@ -10,10 +10,40 @@ export interface SpokenReactionSignal {
   candidate: StreamEventCandidate;
 }
 
+/**
+ * Cyrillic spelled back as Latin, so a name said out loud can be recognised as the account it
+ * belongs to. A Russian speaker saying karlbekner is transcribed Карлбекнер, or Карл Бекнер, or
+ * КарлБекнер — none of which contain the username as written, so a question addressed to an
+ * account by name went unanswered while the same name typed in chat worked fine.
+ */
+const CYRILLIC_TO_LATIN: Record<string, string> = {
+  а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i', й: 'y',
+  к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f',
+  х: 'h', ц: 'c', ч: 'ch', ш: 'sh', щ: 'sch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
+};
+
+export function transliterateToLatin(text: string): string {
+  return [...text.toLowerCase()].map((character) => CYRILLIC_TO_LATIN[character] ?? character).join('');
+}
+
+/** Letters and digits only: a name heard as two words is still the one account. */
+function reduce(text: string): string {
+  return transliterateToLatin(text).replace(/[^a-z0-9]/g, '');
+}
+
+/** Below this a reduced match is more likely to be a coincidence inside a longer word. */
+const MINIMUM_REDUCED_LENGTH = 5;
+
 export class BotMentionMatcher {
   private readonly regexes: Array<{ username: string; regex: RegExp }>;
+  private readonly reduced: Array<{ username: string; needle: string }>;
 
   constructor(candidates: readonly BotMentionCandidate[]) {
+    this.reduced = candidates.flatMap((candidate) => {
+      const username = candidate.username.trim().toLowerCase();
+      const needle = reduce(username);
+      return username && needle.length >= MINIMUM_REDUCED_LENGTH ? [{ username, needle }] : [];
+    });
     this.regexes = candidates.flatMap((candidate) => {
       const username = candidate.username.trim().toLowerCase();
       if (!username) return [];
@@ -39,6 +69,12 @@ export class BotMentionMatcher {
       if (regex.test(searchable)) {
         matches.add(username);
       }
+    }
+    // Spoken names arrive spelled in the language being spoken, so the same text is checked again
+    // with both sides reduced to bare Latin letters.
+    const spoken = reduce(searchable);
+    for (const { username, needle } of this.reduced) {
+      if (spoken.includes(needle)) matches.add(username);
     }
     return [...matches];
   }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectSpokenReactionSignal } from '../src/shared/bot-mention-matcher';
+import { BotMentionMatcher, detectSpokenReactionSignal } from '../src/shared/bot-mention-matcher';
 
 const candidates = [
   { username: 'karlbekner', aliases: ['карлбекнер'] },
@@ -38,5 +38,30 @@ describe('spoken Twitch bot signals', () => {
     });
     expect(signal?.candidate.importance).toBeGreaterThanOrEqual(0.75);
     expect(detectSpokenReactionSignal('Всем привет, чат!', candidates, false)).toBeUndefined();
+  });
+});
+
+describe('a name said out loud in the language being spoken', () => {
+  // Configured aliases only ever covered the accounts somebody remembered to write them for.
+  // These have none, which is the normal case for thirty of them.
+  const matcher = new BotMentionMatcher([{ username: 'karlbekner' }, { username: 'gigantiuz' }]);
+
+  it('recognises the account when the transcript spells it in Cyrillic', () => {
+    expect(matcher.match('Карлбекнер, а ты чё думаешь, стоит туда идти?')).toEqual(['karlbekner']);
+  });
+
+  it('recognises it when the transcriber splits the name into two words', () => {
+    // Every model tested did this at least once: Карл Бекнер, КарлБекнер, Карлбекнер.
+    expect(matcher.match('Карл Бекнер, а ты что думаешь?')).toEqual(['karlbekner']);
+    expect(matcher.match('КарлБекнер, а ты что думаешь?')).toEqual(['karlbekner']);
+  });
+
+  it('still recognises the name typed the ordinary way', () => {
+    expect(matcher.match('@karlbekner ты бот?')).toEqual(['karlbekner']);
+  });
+
+  it('does not answer to ordinary speech that merely sounds similar', () => {
+    expect(matcher.match('короче поехали в центр, там бар нормальный')).toEqual([]);
+    expect(matcher.match('гигант какой-то, вообще не понял')).toEqual([]);
   });
 });

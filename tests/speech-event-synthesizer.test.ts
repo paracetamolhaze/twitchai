@@ -42,6 +42,16 @@ describe('SpeechEventSynthesizer', () => {
     expect(emitted[0]?.speech).toContain('karlbekner');
   });
 
+  it('answers a name that was spoken in Russian, not only one typed in Latin', async () => {
+    // The transcriber writes down what it hears, and a Russian speaker saying karlbekner is
+    // transcribed Карлбекнер. Matching the username as written would never have fired.
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer();
+    instance.accept('Карлбекнер, а ты чё думаешь, стоит туда идти?');
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]?.type).toBe('direct_mention');
+  });
+
   it('turns a talkative minute into a few decisions instead of one per sentence', async () => {
     vi.useFakeTimers();
     const { instance, emitted } = synthesizer({ minIntervalMs: 9_000, minCharacters: 60 });

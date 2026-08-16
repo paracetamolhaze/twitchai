@@ -173,7 +173,7 @@ const envSchema = z.object({
   GLOBAL_MEMORY_CHANNEL: z.string().default(''),
   TRANSCRIPTION_MODE: z.enum(['live', 'shadow', 'transcriber']).default('live'),
   TRANSCRIPTION_PROVIDER: z.enum(['openrouter', 'groq']).default('openrouter'),
-  TRANSCRIPTION_MODEL: z.string().default('google/gemini-2.5-flash-lite'),
+  TRANSCRIPTION_MODEL: z.string().default('google/gemini-3.5-flash-lite'),
   TRANSCRIPTION_GROQ_MODEL: z.string().default('whisper-large-v3-turbo'),
   GROQ_API_KEY: z.string().trim().optional(),
   ORIGINAL_STREAM_LANGUAGE: z.string().trim().default('ru'),
