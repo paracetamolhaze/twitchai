@@ -90,6 +90,8 @@ export class Application {
   private transcriptAccumulator = '';
   private transcriptTimer?: NodeJS.Timeout;
   private mediaStreaming = false;
+  /** Operator stop switch: no media, no perception, no autonomous messages, session left intact. */
+  private paused = false;
   private mediaOfflineGraceTimer?: NodeJS.Timeout;
   private mediaOfflineGraceState?: string;
   private streamGeneration = 0;
@@ -919,6 +921,20 @@ export class Application {
       this.contextStore.configure({ streamContext: settings.streamContext });
       persisted.streamContext = settings.streamContext;
       this.queueBrainDelta({ type: 'CONTEXT_UPDATED', summary: settings.streamContext.slice(0, 500) });
+    }
+    // A real stop switch. Until now the only way to silence the bots mid-stream was to point the
+    // channel somewhere else, which tears down the session and the memory with it.
+    if (typeof settings.paused === 'boolean' && settings.paused !== this.paused) {
+      this.paused = settings.paused;
+      persisted.paused = settings.paused;
+      if (this.paused) {
+        this.personaDrive?.stop();
+        await this.perception.reconfigureMedia('', this.config.stream.visionFps);
+        this.logger.info('Paused by operator; media and autonomous layer stopped');
+      } else {
+        await this.perception.reconfigureMedia(this.config.twitch.channel, this.config.stream.visionFps);
+        this.logger.info('Resumed by operator');
+      }
     }
     const nextChannel = typeof settings.channel === 'string' ? normalizeChannel(settings.channel) : this.config.twitch.channel;
     const nextVisionFps = typeof settings.visionFps === 'number' ? settings.visionFps : this.config.stream.visionFps;

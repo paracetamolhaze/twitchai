@@ -152,7 +152,7 @@ recentSpeech is what was actually said, transcribed. The event summary is a seco
 
 When mergedObservations is present, several separate things were noticed close together and the event's own summary is their texts joined into one string. Treat mergedObservations as the truth and that joined summary as a convenience: they did not happen as one moment, so never write a reply that describes them as a single connected scene, and never invent a link between them. Reacting to one of them, or to none, is usually right. An observation carries confidence — a low one is something perception was unsure it saw, so never restate it as established fact.
 
-triggerKind persona_drive: an internal spontaneous-expression opportunity supplied by the backend, not an external event. Nothing necessarily happened on stream — never pretend it did, and never describe an event that was not supplied. The backend has already judged the timing, so speaking is the expected outcome whenever a candidate has something specific of their own to say; return reactions: [] when none of them genuinely does, rather than filling the slot. At most one persona may speak. A message may naturally arise only from that candidate's supplied memory, stable interests, mood, engagement, relationship context, an unresolved prior topic, or something that persona previously said — never invent a memory, never expose another candidate's memory, and never manufacture generic filler such as "как дела?", "что нового?", or "чат вы где?" without a persona-specific reason. The message should sound like the persona naturally decided to say it, not like an AI announcing that it remembered something.
+triggerKind persona_drive: an internal spontaneous-expression opportunity supplied by the backend, not an external event. Nothing necessarily happened on stream — never pretend it did, and never describe an event that was not supplied. The backend has already judged the timing and the candidates, so this is a turn to speak, not a question of whether to. Pick the candidate with the most to work with and write their message. A chat this quiet is the failure, not a risk worth avoiding: an ordinary aside about what is on screen, a reaction to something said a moment ago, an unfinished thought from earlier, or a plain remark in that character's voice is enough — it does not need to be clever or important. Return reactions: [] only when the supplied candidates genuinely have nothing, which is rare, and never as the safe default. At most one persona may speak. A message may naturally arise only from that candidate's supplied memory, stable interests, mood, engagement, relationship context, an unresolved prior topic, or something that persona previously said — never invent a memory, never expose another candidate's memory, and never manufacture generic filler such as "как дела?", "что нового?", or "чат вы где?" without a persona-specific reason. The message should sound like the persona naturally decided to say it, not like an AI announcing that it remembered something.
 
 Use only the selected username's own profile, targeted canon, targeted memory, public streamer memory, and public chat context for that reaction. Never transfer private facts, relatives, memories, or speech habits between usernames.
 Every profile establishes a character by what they are not, as much as by what they are. Treat weakTopics as subjects the character hedges on or defers rather than explains, unknownTopics as subjects they plainly do not know — say so briefly in character, or stay silent, and never improvise expertise there. Let flaws show instead of smoothing them over. Never use a phrase listed in that character's avoidedExpressions, even when it would fit. opinions are stances the character already holds and may voice; emotionalTriggers are what actually pulls a reaction out of them. A character who answers everything competently and agreeably is wrong, no matter how well written the message is.
@@ -582,6 +582,17 @@ export class GeminiBrainService extends EventEmitter {
         // serial queue quickly, and retrying would hold it for another full deadline. It is checked
         // before the transient test because the word "timeout" also matches that pattern.
         if (cause instanceof BrainInteractionTimeoutError) throw cause;
+        // A safety refusal is not transient and never succeeds on retry, so it is surfaced by name
+        // rather than burning two more attempts. Production hit one on a live stream: the layer
+        // relays what the streamer says, so a blocked prompt means something in the transcript or
+        // the accumulated chain tripped a filter, and knowing which call it was is the only way to
+        // find out what.
+        if (isBlockedPromptError(cause)) {
+          this.logger.warn('Gemini refused the prompt outright; not retrying', {
+            kind: request.kind, inputChars: request.input.length, cause,
+          });
+          throw cause;
+        }
         if (attempt >= 2 || !isTransientBrainError(cause)) throw cause;
         const backoffMs = 250 * 3 ** attempt;
         this.logger.warn('Gemini Brain transient failure; retrying', { attempt: attempt + 1, backoffMs, cause });
@@ -651,6 +662,12 @@ export class GeminiBrainService extends EventEmitter {
 function isInvalidPreviousInteraction(cause: unknown): boolean {
   const message = safeError(cause);
   return /previous[_ ]interaction|interaction.+(?:not found|invalid|expired)|(?:not found|invalid|expired).+interaction/iu.test(message);
+}
+
+/** A prompt the service refuses to accept at all — a filter decision, not a temporary failure. */
+function isBlockedPromptError(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return /input blocked|blocked by|safety|prohibited_content|400/i.test(message);
 }
 
 function isTransientBrainError(cause: unknown): boolean {

@@ -92,6 +92,10 @@ export class GeminiLiveClient implements StreamBrainClient {
   private stabilityTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
   private resumptionHandle?: string;
+  /** Whether the live connection was opened by resuming a handle rather than starting clean. */
+  private resumedThisConnection = false;
+  /** Cleared once a resumed session has been refused, so later reconnects start clean. */
+  private resumeFromHandle = true;
   private lastContext?: StreamContextSnapshot;
   private contextDirty = false;
   private toolQueue: Promise<void> = Promise.resolve();
@@ -188,6 +192,7 @@ export class GeminiLiveClient implements StreamBrainClient {
     // one, which otherwise persisted for the lifetime of the process.
     this.effectiveResponseModality = this.options.responseModality ?? 'audio';
     this.useExplicitContextWindow = true;
+    this.resumeFromHandle = true;
     this.startHeartbeat();
     this.lastSentContextText = undefined;
     await this.connect(this.generation);
@@ -262,7 +267,8 @@ export class GeminiLiveClient implements StreamBrainClient {
 
   private async openSession(generation: number, connectionId: number): Promise<void> {
     try {
-      if (this.resumptionHandle) this.resumeAttempts += 1;
+      this.resumedThisConnection = Boolean(this.resumptionHandle);
+      if (this.resumedThisConnection) this.resumeAttempts += 1;
       else this.freshReconnects += 1;
 
       const parameters: LiveConnectParameters = {
@@ -314,7 +320,7 @@ export class GeminiLiveClient implements StreamBrainClient {
             },
           },
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          sessionResumption: this.resumptionHandle ? { handle: this.resumptionHandle } : {},
+          sessionResumption: this.resumptionHandle && this.resumeFromHandle ? { handle: this.resumptionHandle } : {},
           // Every model turn re-reads the retained window, so an unbounded one makes cost grow with
           // session length rather than with what is happening on stream: a 4.6-minute session
           // reported 308k input tokens while the media actually sent was worth roughly 27k. An
@@ -518,6 +524,15 @@ export class GeminiLiveClient implements StreamBrainClient {
         this.protocolErrorTimes.shift();
       }
       this.resumptionHandle = undefined;
+      // A resumed session dying on 1007 means the handle carried something the service will not
+      // take a second time. Production showed the same pair twice: the service asked for a
+      // rollover, we resumed from its handle, and the resumed session was closed as invalid within
+      // the minute — taking the media with it each time. After that, reconnect clean for the rest
+      // of the stream rather than resuming into the same refusal.
+      if (this.resumedThisConnection && this.resumeFromHandle) {
+        this.resumeFromHandle = false;
+        this.logger.warn('Resumed session was rejected; reconnecting fresh from now on', { code: details.code, reason });
+      }
       // Not every Live model accepts text output; the ones built around native audio reject the
       // session outright with 1007 rather than negotiating. Perception is the layer everything else
       // depends on, so an output format the model will not take must degrade to the one it will
@@ -712,7 +727,7 @@ export const STREAM_BRAIN_INSTRUCTION = `You are a multimodal Twitch perception 
 Continuously understand the combined audio, sampled video, category, minimal stream context, recent relevant chat, and connected usernames supplied by the backend.
 
 Call emit_stream_event only for a semantically meaningful moment. Long periods with zero calls are correct and expected.
-Good events include a streamer greeting, a question to chat, a direct spoken username, an interesting game situation, death, win, mistake, strong emotion, unusual visual event, IRL interaction, another person appearing, a joke, an important story, or a plan.
+This channel is mostly IRL: someone walking a city, eating, shopping, travelling, talking to people around them. Good events include a greeting, a question to chat, a direct spoken username, someone new appearing or joining in, an exchange with a stranger, food or a place being reacted to, a price or a purchase, a transport or navigation moment, something striking in view, a mishap or awkward moment, a joke, a strong reaction, an important story, or a plan. Gameplay types exist for the rarer streams that are games, and describe play only when a game is actually on screen; never frame an IRL moment as if it were a match.
 Never emit routine blinking, filler sounds, static frames, "nothing happened", or tiny changes every second.
 
 Write summary, visualContext, gameContext, and emotion in concise natural Russian. Keep reliably heard speech verbatim rather than translating it.
@@ -725,7 +740,7 @@ Never speak to the user or rely on voice output. Communicate observations only t
 const EVENT_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['type', 'summary', 'importance', 'confidence'],
   properties: {
-    type: { type: 'string', enum: ['speech', 'conversation', 'greeting', 'gameplay', 'irl', 'visual', 'reaction', 'question', 'direct_mention', 'funny', 'fail', 'win', 'loss', 'surprise', 'other'] },
+    type: { type: 'string', enum: ['speech', 'conversation', 'greeting', 'gameplay', 'food', 'place', 'purchase', 'travel', 'stranger', 'mishap', 'irl', 'visual', 'reaction', 'question', 'direct_mention', 'funny', 'fail', 'win', 'loss', 'surprise', 'other'] },
     summary: { type: 'string', description: 'Краткое естественное описание произошедшего на русском языке.' },
     speech: { type: 'string', description: 'Relevant spoken words, when reliably heard.' },
     visualContext: { type: 'string', description: 'Важный визуальный контекст на русском языке.' },

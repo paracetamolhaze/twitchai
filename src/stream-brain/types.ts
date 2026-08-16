@@ -3,6 +3,14 @@ export const STREAM_EVENT_TYPES = [
   'conversation',
   'greeting',
   'gameplay',
+  // This channel is mostly IRL, and the vocabulary was built around games, so a walk through a
+  // city had to be labelled as gameplay or 'other'. These name what actually happens on it.
+  'food',
+  'place',
+  'purchase',
+  'travel',
+  'stranger',
+  'mishap',
   'irl',
   'visual',
   'reaction',

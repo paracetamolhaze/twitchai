@@ -460,7 +460,7 @@ const streamerMemoryEditDraft = reactive({
   status: 'active' as Exclude<StreamerMemoryStatus, 'superseded'>,
 })
 const twitchOAuth = reactive<TwitchOAuthStatus>({ configured: false, accounts: [] })
-const settings = reactive({ channel: '', streamContext: '', visionFps: 1 })
+const settings = reactive({ channel: '', streamContext: '', visionFps: 1, paused: false })
 let socket: Socket | undefined
 let pollTimer: number | undefined
 
@@ -1346,7 +1346,7 @@ function kindLabel(kind: ChatMessage['kind']): string {
   return ({ viewer: 'зритель', bot: 'бот', system: 'система' })[kind]
 }
 function eventTypeLabel(type: string): string {
-  return ({ speech: 'речь', gameplay: 'игровой момент', reaction: 'реакция', funny: 'смешной момент', fail: 'ошибка', win: 'победа', loss: 'поражение', surprise: 'неожиданность', conversation: 'разговор', greeting: 'приветствие', visual: 'визуальное событие', question: 'вопрос', direct_mention: 'прямое обращение', irl: 'вне игры', other: 'другое' } as Record<string, string>)[type] || type
+  return ({ speech: 'речь', gameplay: 'игровой момент', reaction: 'реакция', funny: 'смешной момент', fail: 'ошибка', win: 'победа', loss: 'поражение', surprise: 'неожиданность', conversation: 'разговор', greeting: 'приветствие', visual: 'визуальное событие', question: 'вопрос', direct_mention: 'прямое обращение', irl: 'вживую', food: 'еда', place: 'место', purchase: 'покупка', travel: 'дорога', stranger: 'посторонний', mishap: 'неловкий момент', other: 'другое' } as Record<string, string>)[type] || type
 }
 function sourceLabel(source: StreamEvent['source']): string {
   return ({ 'gemini-live': 'Gemini Live', chat: 'чат', 'fallback-transcription': 'резервная транскрипция' })[source]
@@ -1531,7 +1531,10 @@ onBeforeUnmount(() => {
           <section class="panel">
             <div class="panel-heading">
               <div><p class="eyebrow">ДИАГНОСТИКА</p><h3>Проверка доставки</h3></div>
-              <button class="text-button" type="button" :disabled="deliveryCheckRunning" @click="runDeliveryCheck()">
+              <button class="text-button" type="button" @click="settings.paused = !settings.paused; saveSettings()">
+              {{ settings.paused ? 'Возобновить' : 'Остановить всё' }}
+            </button>
+            <button class="text-button" type="button" :disabled="deliveryCheckRunning" @click="runDeliveryCheck()">
                 {{ deliveryCheckRunning ? 'Идёт проверка…' : 'Проверить все аккаунты' }}
               </button>
             </div>
