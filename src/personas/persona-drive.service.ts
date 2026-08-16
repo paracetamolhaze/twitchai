@@ -32,6 +32,11 @@ export interface PersonaDriveServiceOptions {
   prepareCandidates: (usernames: string[]) => string;
   /** ReactionCoordinator.submitBatch, wrapped as (requestId, reactions) => ... */
   submitReaction: (requestId: string, reactions: Array<{ username: string; message: string }>) => Promise<ReactionBatchResult>;
+  /**
+   * Durable memory the Brain proposed on this tick. Every decision may carry some, and until this
+   * existed the ones from spontaneous initiation were parsed and then dropped on the floor.
+   */
+  applyMemoryUpdates: (decision: BrainDecision, requestId: string) => Promise<void>;
   usage: UsageTracker;
   logger: Logger;
   now?: () => number;
@@ -234,6 +239,9 @@ export class PersonaDriveService {
       this.logger.info('PERSONA_DRIVE_SILENT', { requestId, reason: 'no_decision' });
       return;
     }
+    // Before the branches below, all of which can end the tick: whether this persona ends up
+    // speaking has nothing to do with whether what the Brain noticed is worth keeping.
+    await o.applyMemoryUpdates(decision, requestId);
     if (this.lastExternalEventAt > driveStartedAt) {
       // A real observation arrived while Gemini was still thinking about the drive opportunity.
       // The tokens are already spent; sending a now-stale autonomous reply on top of something

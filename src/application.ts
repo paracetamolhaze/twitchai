@@ -244,6 +244,9 @@ export class Application {
         evaluateOpportunity: (input) => this.geminiBrain!.evaluateDriveOpportunity(input),
         prepareCandidates: (usernames) => this.coordinator.prepareAutonomousCandidates(usernames),
         submitReaction: (requestId, reactions) => this.coordinator.submitBatch({ eventId: requestId, reactions }),
+        applyMemoryUpdates: (decision, requestId) => this.persistBrainMemoryUpdates(decision, {
+          eventId: requestId, occurredAt: Date.now(), tag: 'persona_drive',
+        }),
         usage: this.usage,
         logger: this.logger,
       });
@@ -649,13 +652,17 @@ export class Application {
       reactions: decision.reactions.map(({ username, message }) => ({ username, message })),
     });
     if (decision.memoryUpdates.length > 0) {
-      void this.persistBrainMemoryUpdates(event, decision).catch((cause: unknown) => {
-        this.logger.warn('Brain memory updates failed after decision', { eventId: event.id, cause });
-      });
+      void this.persistBrainMemoryUpdates(decision, { eventId: event.id, occurredAt: event.timestamp, tag: event.type })
+        .catch((cause: unknown) => {
+          this.logger.warn('Brain memory updates failed after decision', { eventId: event.id, cause });
+        });
     }
   }
 
-  private async persistBrainMemoryUpdates(event: StreamEvent, decision: BrainDecision): Promise<void> {
+  private async persistBrainMemoryUpdates(
+    decision: BrainDecision,
+    source: { eventId: string; occurredAt: number; tag: string },
+  ): Promise<void> {
     const globalUpdates = decision.memoryUpdates.filter((update) => update.scope === 'global');
     if (globalUpdates.length > 0) {
       const result = await this.globalMemory.recordFromBrain({
@@ -666,13 +673,20 @@ export class Application {
           confidence: update.confidence,
           entities: update.entities ?? [],
           tags: update.tags ?? [],
-          sourceEventId: event.id,
-          occurredAt: event.timestamp,
+          sourceEventId: source.eventId,
+          occurredAt: source.occurredAt,
         })),
+      });
+      // Both halves are logged, because a run that stores almost nothing looks identical to one
+      // where nothing was ever proposed unless the proposals themselves are counted.
+      this.logger.info('Brain proposed durable memory', {
+        eventId: source.eventId,
+        proposed: globalUpdates.length,
+        stored: result.accepted.length,
       });
       if (result.rejected.length > 0) {
         this.logger.warn('Brain global memory proposals rejected', {
-          eventId: event.id,
+          eventId: source.eventId,
           reasons: result.rejected.map(({ reason }) => reason),
         });
       }
@@ -684,7 +698,7 @@ export class Application {
       const candidate = candidates.get(update.username);
       if (!candidate || update.confidence < 0.5) {
         this.logger.warn('Brain persona memory proposal rejected', {
-          eventId: event.id, username: update.username, reason: candidate ? 'low_confidence' : 'unknown_candidate',
+          eventId: source.eventId, username: update.username, reason: candidate ? 'low_confidence' : 'unknown_candidate',
         });
         continue;
       }
@@ -696,9 +710,9 @@ export class Application {
         type: update.type,
         summary,
         importance: update.importance,
-        tags: update.tags ?? [event.type],
+        tags: update.tags ?? [source.tag],
         ...(update.viewerUsername ? { viewerUsername: update.viewerUsername } : {}),
-        eventId: event.id,
+        eventId: source.eventId,
       });
     }
   }

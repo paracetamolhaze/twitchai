@@ -38,6 +38,7 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
   const evaluateOpportunity = vi.fn(async (): Promise<BrainDecision | undefined> => ({ reactions: [], memoryUpdates: [] }));
   const prepareCandidates = vi.fn((usernames: string[]) => `req-${usernames.join(',')}`);
   const submitReaction = vi.fn(async (): Promise<ReactionBatchResult> => ({ eventId: 'x', accepted: [], rejected: [] }));
+  const applyMemoryUpdates = vi.fn(async (): Promise<void> => undefined);
 
   const options: PersonaDriveServiceOptions = {
     enabled: true,
@@ -61,6 +62,7 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
     evaluateOpportunity,
     prepareCandidates,
     submitReaction,
+    applyMemoryUpdates,
     usage,
     logger,
     // Default to always clearing the probability gate (candidates have no recalled memories in
@@ -83,6 +85,7 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
     evaluateOpportunity: options.evaluateOpportunity,
     prepareCandidates: options.prepareCandidates,
     submitReaction: options.submitReaction,
+    applyMemoryUpdates: options.applyMemoryUpdates,
   };
 }
 
@@ -237,6 +240,27 @@ describe('PersonaDriveService', () => {
     expect(submitReaction).toHaveBeenCalledWith(expect.any(String), []);
     expect(usage.snapshot().drive.cancelledForExternalEvent).toBe(1);
     expect(usage.snapshot().drive.messages).toBe(0);
+    service.stop();
+  });
+
+  it('keeps durable memory from a tick that ends in silence, since remembering is not speaking', async () => {
+    // Every decision may carry memory proposals, and the ones from spontaneous initiation were
+    // parsed and then dropped: the tick returned before anything looked at them.
+    vi.useFakeTimers();
+    const decision: BrainDecision = {
+      reactions: [],
+      memoryUpdates: [{
+        scope: 'global', type: 'preference', summary: 'Стример не ест жареную картошку.',
+        importance: 0.6, confidence: 0.8,
+      }],
+    };
+    const { service, applyMemoryUpdates, submitReaction } = await harness({
+      evaluateOpportunity: vi.fn(async () => decision),
+    });
+    service.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(applyMemoryUpdates).toHaveBeenCalledWith(decision, expect.any(String));
+    expect(submitReaction).toHaveBeenCalledWith(expect.any(String), []);
     service.stop();
   });
 
