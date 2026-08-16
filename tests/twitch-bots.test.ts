@@ -81,6 +81,28 @@ describe('TwitchBotManager isolation', () => {
     return { manager, clients, personas };
   }
 
+  it('keeps every account out of chat while the operator has the system stopped', async () => {
+    // Connecting has three entry points besides start(): enabling an account, adding one, and
+    // refreshing its OAuth credential. That last one runs on a timer, and production showed three
+    // accounts rejoining a stopped system across twenty minutes with nobody touching anything.
+    const { manager, clients } = await setup([
+      { username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true },
+    ]);
+    await manager.stop();
+    clients.clear();
+
+    await manager.upsertAuthorizedAccount({ username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true, personaId: 'analyst' });
+    expect(clients.size).toBe(0);
+    await manager.setEnabled('gigantiuz', true);
+    expect(clients.size).toBe(0);
+    expect(manager.listStatuses()[0]?.chatConnected).toBe(false);
+
+    // And they come back the moment it is started again.
+    await manager.start();
+    expect(manager.listStatuses()[0]?.connectionState).toBe('CONNECTED');
+    await manager.stop();
+  });
+
   it('keeps healthy accounts connected when one token fails', async () => {
     const { manager } = await setup([
       { username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true },

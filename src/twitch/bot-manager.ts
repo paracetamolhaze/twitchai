@@ -48,6 +48,8 @@ export class TwitchBotManager extends EventEmitter {
   private readonly bots = new Map<string, ManagedBot>();
   private readonly persistenceTails = new WeakMap<ManagedBot, Promise<void>>();
   private readonly logger: Logger;
+  /** Whether the operator has the system running. Nothing joins chat while this is false. */
+  private running = false;
   private readonly validator: TwitchTokenValidator;
   private readerUsername?: string;
   private channel: string;
@@ -117,10 +119,12 @@ export class TwitchBotManager extends EventEmitter {
 
   async start(): Promise<void> {
     if (!this.channel) return;
+    this.running = true;
     await Promise.allSettled([...this.bots.values()].map((bot) => this.connectBot(bot)));
   }
 
   async stop(): Promise<void> {
+    this.running = false;
     await Promise.allSettled([...this.bots.values()].map(async (bot) => {
       try { await bot.client?.disconnect(); } catch { /* already disconnected */ }
       bot.client = undefined;
@@ -308,6 +312,14 @@ export class TwitchBotManager extends EventEmitter {
   }
 
   private async connectBot(bot: ManagedBot): Promise<void> {
+    // Connecting has three other entry points besides start(): enabling an account, adding one,
+    // and refreshing its OAuth credential. The last one runs on a timer, so a stopped system put
+    // accounts back into chat by itself — production showed three of them rejoining across twenty
+    // minutes with no operator action and no way to tell from the dashboard.
+    if (!this.running) {
+      this.logger.info('Not connecting a chat account while stopped', { username: bot.config.username });
+      return;
+    }
     if (!bot.config.enabled || bot.client) return;
     await this.patch(bot, { connectionState: 'CONNECTING', chatConnected: false, lastError: undefined });
     try {
