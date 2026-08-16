@@ -29,6 +29,7 @@ import { MediaPipeline } from './stream-brain/media-pipeline';
 import { StreamBrainService } from './stream-brain/stream-brain.service';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from './stream-brain/types';
 import { SpeechEventSynthesizer } from './stream-brain/speech-event-synthesizer';
+import { OpenRouterSceneDescriber, SceneWatcher } from './vision/scene-watcher';
 import { SpeechTranscriber } from './transcription/speech-transcriber';
 import {
   GroqWhisperBackend,
@@ -56,6 +57,10 @@ const TWITCH_OAUTH_REFRESH_LEAD_MS = 5 * 60_000;
  */
 const MEDIA_OFFLINE_GRACE_MS = 20_000;
 
+/** Said out loud when something on screen is worth looking at right now rather than in a minute. */
+const REACTS_TO_SOMETHING_VISIBLE =
+  /(?:^|[\s,.!?])(?:смотри\w*|гляди\w*|глянь|видел\w*|видишь|вон\s|вот\s+это|ого|ничего\s+себе|обалдеть|что\s+это|кто\s+это)/iu;
+
 export class Application {
   private readonly logger: Logger;
   private readonly usage = new UsageTracker();
@@ -81,6 +86,7 @@ export class Application {
   private deliveryProbe!: DeliveryProbe;
   private transcriber?: SpeechTranscriber;
   private speechEvents?: SpeechEventSynthesizer;
+  private sceneWatcher?: SceneWatcher;
   private twitchOAuth?: TwitchOAuthService;
   private categoryTimer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
@@ -316,6 +322,23 @@ export class Application {
           emit: (candidate) => { void this.perception.acceptCandidate(candidate, 'transcription'); },
           logger: this.logger,
         });
+        const visionKey = this.config.openRouter.apiKey;
+        if (visionKey && this.config.vision.model) {
+          this.sceneWatcher = new SceneWatcher({
+            describer: new OpenRouterSceneDescriber({
+              apiKey: visionKey,
+              model: this.config.vision.model,
+              appName: this.config.openRouter.appName,
+              ...(this.config.openRouter.appUrl ? { appUrl: this.config.openRouter.appUrl } : {}),
+            }),
+            intervalMs: this.config.vision.describeIntervalMs,
+            logger: this.logger,
+            onScene: (description, meta) => this.speechEvents?.acceptScene(description, meta.changed),
+          });
+          this.logger.info('Scene watching enabled', {
+            model: this.config.vision.model, everySeconds: this.config.vision.describeIntervalMs / 1000,
+          });
+        }
       }
       this.logger.info('Speech transcription enabled', {
         mode: transcriptionMode, via: backend.name, model: this.transcriptionModel(),
@@ -338,7 +361,10 @@ export class Application {
               this.perception.sendAudio(pcm, durationMs);
               this.transcriber?.acceptPcm(pcm);
             },
-            onVideo: (jpeg, durationMs) => this.perception.sendVideo(jpeg, durationMs),
+            onVideo: (jpeg, durationMs) => {
+              this.perception.sendVideo(jpeg, durationMs);
+              this.sceneWatcher?.acceptFrame(jpeg);
+            },
             onState: (state, error) => this.perception.onMediaState(state, error),
           },
         })
@@ -572,6 +598,7 @@ export class Application {
             this.logger.warn('Stream AI session start failed', { cause });
           });
           this.personaDrive?.start();
+          this.sceneWatcher?.start();
         }
       } else {
         // A single streamlink/ffmpeg restart or short CDN hiccup reports OFFLINE/ERROR/CONNECTING
@@ -590,6 +617,7 @@ export class Application {
           this.brainSessionReady = Promise.resolve();
           this.coordinator.clearPendingContexts();
           this.personaDrive?.stop();
+          this.sceneWatcher?.stop();
           void this.geminiBrain?.stopStream();
           if (finalState === 'OFFLINE') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
           else if (finalState === 'ERROR') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
@@ -818,6 +846,9 @@ export class Application {
     // With Live retired this is the only thing that turns a stream into decisions, so the words
     // are paced into moments here rather than by a model watching alongside.
     this.speechEvents?.accept(text);
+    // Reacting out loud to something is the one moment where the picture matters most, and the
+    // scheduled look may be twenty seconds away.
+    if (REACTS_TO_SOMETHING_VISIBLE.test(text)) this.sceneWatcher?.lookNow();
     // Kept verbatim for the decision layer, separately from the spoken-mention detection below,
     // which only ever looked for a bot name and discarded everything else that was said.
     this.contextStore.addSpeech(text);

@@ -88,6 +88,51 @@ describe('SpeechEventSynthesizer', () => {
     expect(emitted[0]?.speech).toBe('слушай а тут вообще нормально кормят или так себе');
   });
 
+  it('sends what is on screen along with what was said', async () => {
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer();
+    // A moment first, so the scene that follows lands inside the quiet window and rides along with
+    // the next thing said instead of becoming a moment of its own.
+    instance.accept('короче я щас доем и поедем в центр, там бар нормальный есть');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(emitted).toHaveLength(1);
+
+    instance.acceptScene('Мужчина сидит за столом в кафе, перед ним тарелка.', true);
+    expect(emitted).toHaveLength(1);
+
+    instance.accept('ну такое себе, честно говоря, за такие деньги');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]?.visualContext).toBe('Мужчина сидит за столом в кафе, перед ним тарелка.');
+  });
+
+  it('makes a changed scene a moment of its own only when nobody is talking', async () => {
+    // On a talkative stream the words are the moment; a second trigger for the same instant is
+    // just two accounts answering the same thing twice.
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer({ quietBeforeVisualMs: 40_000 });
+    instance.accept('короче я щас доем и поедем в центр, там бар нормальный есть');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(emitted).toHaveLength(1);
+
+    instance.acceptScene('Улица, вечер, компания идёт мимо витрин.', true);
+    expect(emitted).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(40_000);
+    instance.acceptScene('Метро, вагон, людей немного.', true);
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]?.type).toBe('visual');
+    expect(emitted[1]?.summary).toBe('Метро, вагон, людей немного.');
+  });
+
+  it('ignores a scene that has not changed, however long the silence', async () => {
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer();
+    await vi.advanceTimersByTimeAsync(120_000);
+    instance.acceptScene('Мужчина сидит за столом.', false);
+    expect(emitted).toHaveLength(0);
+  });
+
   it('drops what is buffered when the stream ends rather than answering it later', async () => {
     vi.useFakeTimers();
     const { instance, emitted } = synthesizer();

@@ -55,6 +55,11 @@ export interface AppConfig {
     appUrl?: string;
     appName: string;
   };
+  vision: {
+    /** Empty disables watching entirely; the accounts then work from speech and chat alone. */
+    model: string;
+    describeIntervalMs: number;
+  };
   stream: {
     context: string;
     visionFps: number;
@@ -156,6 +161,8 @@ const envSchema = z.object({
   // One frame per second is far more than an IRL stream needs — a moment worth reacting to lasts
   // seconds, and video is the largest share of perception input. Raise only if events are missed.
   VISION_FPS: z.coerce.number().min(0.05).max(1).default(0.33),
+  VISION_MODEL: z.string().default('google/gemini-3.5-flash-lite'),
+  VISION_DESCRIBE_INTERVAL_SECONDS: z.coerce.number().int().min(5).max(300).default(25),
   VISION_FRAME_WIDTH: z.coerce.number().int().min(320).max(1280).default(640),
   EVENT_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.4),
   STREAM_CONTEXT_REFRESH_SECONDS: z.coerce.number().min(10).max(300).default(30),
@@ -286,6 +293,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       brainModel: parsed.OPENROUTER_BRAIN_MODEL,
       ...(parsed.FRONTEND_URL ? { appUrl: parsed.FRONTEND_URL.split(',')[0] } : {}),
       appName: parsed.OPENROUTER_APP_NAME,
+    },
+    vision: {
+      model: parsed.VISION_MODEL.trim(),
+      describeIntervalMs: parsed.VISION_DESCRIBE_INTERVAL_SECONDS * 1000,
     },
     stream: {
       context: parsed.STREAM_CONTEXT.trim(),
