@@ -46,6 +46,19 @@ export interface DeliveryProbeReport {
   totalAccounts: number;
   delivered: number;
   notDelivered: number;
+  /** Every chat message the reader observed while probing, from anyone, including our own. */
+  observedChatMessages: number;
+  /**
+   * Whether "not delivered" can be trusted at all.
+   *
+   * A silenced account and a broken observation path produce the identical result — nothing comes
+   * back — so the probe proves its own eyes work before reporting anything as dropped. tmi.js
+   * echoes the reader's own message locally without Twitch involvement, so that one message must
+   * always be observed; if even it never arrives, the wiring is at fault and no conclusion about
+   * Twitch is available.
+   */
+  detectionVerified: boolean;
+  detectionWarning?: string;
   accounts: DeliveryProbeAccountResult[];
 }
 
@@ -99,10 +112,15 @@ export class DeliveryProbe {
     const accounts = this.options.sender.listStatuses();
     const results = new Map<string, DeliveryProbeAccountResult>();
 
+    let observedChatMessages = 0;
+    let readerSawItsOwnMessage = false;
     const onChat = (message: ChatMessage): void => {
+      observedChatMessages += 1;
       if (message.kind !== 'bot') return;
       const result = results.get(message.username.toLowerCase());
-      if (result && message.message.trim() === result.message) result.delivered = true;
+      if (!result || message.message.trim() !== result.message) return;
+      result.delivered = true;
+      if (result.selfEchoUnreliable) readerSawItsOwnMessage = true;
     };
     const onRejected = ({ username, msgid }: { username: string; msgid: string }): void => {
       const result = results.get(username.toLowerCase());
@@ -147,6 +165,18 @@ export class DeliveryProbe {
 
     const accountResults = [...results.values()].map(({ ...result }) => result);
     const delivered = accountResults.filter((result) => result.delivered).length;
+    const readerWasProbed = accountResults.some((result) => result.selfEchoUnreliable && result.submitted);
+    // Positive proof the observation path works: either something was seen come back, or the
+    // reader's locally generated echo of its own message arrived. Without either, "nothing was
+    // delivered" describes this probe's eyes, not Twitch, and must not be reported as a verdict.
+    const detectionVerified = delivered > 0 || observedChatMessages > 0
+      || (readerWasProbed ? readerSawItsOwnMessage : false);
+    const detectionWarning = detectionVerified ? undefined
+      : !reader
+        ? 'Ни один аккаунт не читает чат, поэтому доставку проверить нечем — результат ничего не доказывает.'
+        : readerWasProbed
+          ? 'Читающий аккаунт не получил даже собственное сообщение, хотя оно подставляется локально. Сломана связь с чатом на нашей стороне, а не Twitch — результат ничего не доказывает.'
+          : 'За время проверки не пришло ни одного сообщения чата, так что подтвердить доставку было нечем — результат ничего не доказывает.';
     const report: DeliveryProbeReport = {
       channel,
       startedAt,
@@ -155,11 +185,16 @@ export class DeliveryProbe {
       totalAccounts: accountResults.length,
       delivered,
       notDelivered: accountResults.filter((result) => result.submitted && !result.delivered).length,
+      observedChatMessages,
+      detectionVerified,
+      ...(detectionWarning ? { detectionWarning } : {}),
       accounts: accountResults,
     };
     this.logger.info('Delivery probe finished', {
       channel, total: report.totalAccounts, delivered: report.delivered, notDelivered: report.notDelivered,
+      observedChatMessages, detectionVerified,
     });
+    if (!detectionVerified) this.logger.warn('Delivery probe could not verify its own observation path', { channel, reader });
     return report;
   }
 }

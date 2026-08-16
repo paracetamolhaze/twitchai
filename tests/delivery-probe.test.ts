@@ -104,6 +104,44 @@ describe('DeliveryProbe', () => {
     expect(report.accounts[1]?.selfEchoUnreliable).toBeUndefined();
   });
 
+  it('refuses to call anything undelivered when nothing was observed at all', async () => {
+    // A silenced account and a broken observation path look identical from here, so a probe that
+    // saw nothing whatsoever must say its own eyes are unproven rather than blame Twitch.
+    const sender = new FakeSender([account('bot_one'), account('bot_two')]);
+    const report = await probe(sender).run();
+    expect(report.delivered).toBe(0);
+    expect(report.observedChatMessages).toBe(0);
+    expect(report.detectionVerified).toBe(false);
+    expect(report.detectionWarning).toContain('ничего не доказывает');
+  });
+
+  it('treats the reader receiving its own local echo as proof the observation path works', async () => {
+    const sender = new FakeSender(
+      [account('reader_bot'), account('bot_two')],
+      // Only the reader's own message comes back — tmi.js generates that one locally, so it proves
+      // the wiring works while saying nothing about whether Twitch showed the others.
+      (username, message) => { if (username === 'reader_bot') sender.echo(username, message); },
+      'reader_bot',
+    );
+    const report = await probe(sender).run();
+    expect(report.detectionVerified).toBe(true);
+    expect(report.detectionWarning).toBeUndefined();
+    expect(report.accounts[1]).toMatchObject({ username: 'bot_two', delivered: false });
+  });
+
+  it('counts unrelated chat as proof the observation path works', async () => {
+    const sender = new FakeSender([account('bot_one')], () => {
+      sender.emit('chat', {
+        id: 'v1', timestamp: 1, username: 'realviewer', displayName: 'realviewer',
+        message: 'привет', kind: 'viewer',
+      });
+    });
+    const report = await probe(sender).run();
+    expect(report.observedChatMessages).toBe(1);
+    expect(report.detectionVerified).toBe(true);
+    expect(report.accounts[0]?.delivered).toBe(false);
+  });
+
   it('refuses to run twice at once so two reports cannot claim the same messages', async () => {
     const sender = new FakeSender([account('bot_one')]);
     const running = probe(sender);

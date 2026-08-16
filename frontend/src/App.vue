@@ -723,6 +723,7 @@ interface DeliveryCheckAccount {
 interface DeliveryCheckReport {
   channel: string; reader?: string
   totalAccounts: number; delivered: number; notDelivered: number
+  observedChatMessages: number; detectionVerified: boolean; detectionWarning?: string
   accounts: DeliveryCheckAccount[]
 }
 const deliveryCheck = ref<DeliveryCheckReport | undefined>()
@@ -1532,11 +1533,13 @@ onBeforeUnmount(() => {
             </div>
             <p class="muted">Каждый аккаунт пишет в чат свой номер с паузой в 2 секунды. Twitch не подтверждает отправку, поэтому доставка определяется по тому, вернулось ли сообщение обратно через читающий аккаунт. Проверка идёт примерно по 2 секунды на аккаунт плюс окно ожидания.</p>
             <template v-if="deliveryCheck">
+              <p v-if="!deliveryCheck.detectionVerified" class="notice error">{{ deliveryCheck.detectionWarning }}</p>
               <div class="metric-strip">
                 <div><span>Канал</span><strong>{{ deliveryCheck.channel || '—' }}</strong></div>
                 <div><span>Дошло</span><strong>{{ deliveryCheck.delivered }} / {{ deliveryCheck.totalAccounts }}</strong></div>
                 <div><span>Twitch не показал</span><strong>{{ deliveryCheck.notDelivered }}</strong></div>
                 <div><span>Читающий аккаунт</span><strong>{{ deliveryCheck.reader || '—' }}</strong></div>
+                <div><span>Видел сообщений в чате</span><strong>{{ deliveryCheck.observedChatMessages }}</strong></div>
               </div>
               <div class="bulk-preview-list">
                 <article v-for="item in deliveryCheck.accounts" :key="item.username">
