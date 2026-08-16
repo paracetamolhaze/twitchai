@@ -413,6 +413,11 @@ export class TwitchBotManager extends EventEmitter {
    * receives incoming messages, so without one there is no way to observe whether a message we
    * sent actually reached the channel.
    */
+  /** The account currently reading channel chat, if any. Its own messages echo locally, not from Twitch. */
+  getChatReader(): string | undefined {
+    return this.hasChatReader() ? this.readerUsername : undefined;
+  }
+
   hasChatReader(): boolean {
     if (!this.readerUsername) return false;
     const reader = this.bots.get(this.readerUsername);

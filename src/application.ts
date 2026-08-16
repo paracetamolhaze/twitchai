@@ -29,6 +29,7 @@ import { StreamBrainService } from './stream-brain/stream-brain.service';
 import { ChatMessage, StreamEvent, StreamEventCandidate } from './stream-brain/types';
 import { GroqWhisperFallback } from './transcription/groq-whisper-fallback';
 import { TwitchBotManager } from './twitch/bot-manager';
+import { DeliveryProbe } from './twitch/delivery-probe';
 import { TwitchHelixClient } from './twitch/helix-client';
 import { OfficialTwitchOAuthGateway } from './twitch/oauth-client';
 import { AuthorizedTwitchAccount, TwitchOAuthService } from './twitch/oauth-service';
@@ -70,6 +71,7 @@ export class Application {
   private gemini?: GeminiLiveClient;
   private geminiBrain?: GeminiBrainService;
   private personaDrive?: PersonaDriveService;
+  private deliveryProbe!: DeliveryProbe;
   private transcriber?: GroqWhisperFallback;
   private twitchOAuth?: TwitchOAuthService;
   private categoryTimer?: NodeJS.Timeout;
@@ -153,6 +155,11 @@ export class Application {
       credentialProvider: this.twitchOAuth,
     });
     await this.botManager.initialize();
+    this.deliveryProbe = new DeliveryProbe({
+      sender: this.botManager,
+      logger: this.logger,
+      channel: () => this.contextStore.snapshot().channel,
+    });
 
     this.coordinator = new ReactionCoordinator({
       policy: this.policy,
@@ -322,6 +329,7 @@ export class Application {
       events: (limit) => this.repository.listStreamEvents(limit),
       chat: () => this.contextStore.snapshot().recentChat,
       usage: () => this.usage.snapshot(),
+      runDeliveryCheck: () => this.deliveryProbe.run(),
       decisions: () => [...this.decisions].reverse(),
       reactionTraces: () => [...this.reactionTraces].reverse(),
       settings: () => this.getSettings(),

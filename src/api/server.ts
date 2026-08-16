@@ -21,6 +21,7 @@ import { BotPersona, PersonaAuditReport, PersonaMemoryItem, PersonaSummary } fro
 import { BotAccountRecord } from '../persistence/repository';
 import { ReactionDecisionRecord, ReactionTraceRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
+import { DeliveryProbeReport } from '../twitch/delivery-probe';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
 import type { BotEnabledResult, PersonaAssignmentResult } from '../twitch/bot-manager';
@@ -63,6 +64,7 @@ export interface ApiServerDependencies {
   events: (limit: number) => Promise<StreamEvent[]>;
   chat: () => ChatMessage[];
   usage: () => UsageSnapshot;
+  runDeliveryCheck?: () => Promise<DeliveryProbeReport>;
   decisions?: () => ReactionDecisionRecord[];
   reactionTraces?: () => ReactionTraceRecord[];
   settings: () => Promise<Record<string, unknown>>;
@@ -285,6 +287,20 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     try {
       return response.json({ authorizationUrl: await dependencies.twitchOAuth.startAuthorization() });
     } catch (error) { return next(error); }
+  });
+  // Posts one short message from every account and reports which ones the channel actually showed.
+  // Twitch acknowledges nothing on send, so this is the only way to tell a silenced account from a
+  // healthy one. It runs long by design (one account every couple of seconds plus an echo window).
+  app.post('/api/diagnostics/delivery-check', async (_request, response, next) => {
+    if (!dependencies.runDeliveryCheck) return response.status(503).json({ error: 'Проверка доставки недоступна' });
+    try {
+      return response.json(await dependencies.runDeliveryCheck());
+    } catch (error) {
+      if (error instanceof Error && error.message === 'delivery_probe_already_running') {
+        return response.status(409).json({ error: 'Проверка доставки уже выполняется' });
+      }
+      return next(error);
+    }
   });
   app.get('/api/overview', (_request, response) => response.json(dependencies.overview()));
   app.get('/api/bots', (_request, response) => response.json(dependencies.bots()));

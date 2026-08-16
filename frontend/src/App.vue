@@ -714,6 +714,42 @@ async function connectTwitchAccount(): Promise<void> {
   }
 }
 
+interface DeliveryCheckAccount {
+  username: string; index: number; message: string
+  skipped?: 'not_enabled' | 'not_connected'
+  submitted: boolean; submitFailureReason?: string
+  delivered: boolean; rejectionReason?: string; selfEchoUnreliable?: boolean
+}
+interface DeliveryCheckReport {
+  channel: string; reader?: string
+  totalAccounts: number; delivered: number; notDelivered: number
+  accounts: DeliveryCheckAccount[]
+}
+const deliveryCheck = ref<DeliveryCheckReport | undefined>()
+const deliveryCheckRunning = ref(false)
+
+async function runDeliveryCheck(): Promise<void> {
+  deliveryCheckRunning.value = true
+  errorMessage.value = ''
+  try {
+    // Runs for a while by design: one account every couple of seconds, then a window for echoes.
+    deliveryCheck.value = await api<DeliveryCheckReport>('/api/diagnostics/delivery-check', { method: 'POST' })
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    deliveryCheckRunning.value = false
+  }
+}
+
+function deliveryCheckStatus(account: DeliveryCheckAccount): string {
+  if (account.skipped === 'not_enabled') return 'выключен'
+  if (account.skipped === 'not_connected') return 'нет в чате'
+  if (account.rejectionReason) return reactionTraceReasonLabel(account.rejectionReason)
+  if (!account.submitted) return account.submitFailureReason ?? 'не отправлено'
+  if (account.delivered) return account.selfEchoUnreliable ? 'дошло (не показатель — это ридер)' : 'дошло'
+  return 'Twitch не показал'
+}
+
 async function saveSettings(): Promise<void> {
   saveMessage.value = ''
   try {
@@ -1487,6 +1523,30 @@ onBeforeUnmount(() => {
 
         <template v-else-if="activePage === 'bots'">
           <div class="page-heading"><div><p class="eyebrow">ОФИЦИАЛЬНЫЙ ЧАТ TWITCH</p><h1>Аккаунты ботов</h1></div><p class="muted">Сбой одного аккаунта не останавливает остальные. Накрутка просмотров не используется.</p></div>
+          <section class="panel">
+            <div class="panel-heading">
+              <div><p class="eyebrow">ДИАГНОСТИКА</p><h3>Проверка доставки</h3></div>
+              <button class="text-button" type="button" :disabled="deliveryCheckRunning" @click="runDeliveryCheck()">
+                {{ deliveryCheckRunning ? 'Идёт проверка…' : 'Проверить все аккаунты' }}
+              </button>
+            </div>
+            <p class="muted">Каждый аккаунт пишет в чат свой номер с паузой в 2 секунды. Twitch не подтверждает отправку, поэтому доставка определяется по тому, вернулось ли сообщение обратно через читающий аккаунт. Проверка идёт примерно по 2 секунды на аккаунт плюс окно ожидания.</p>
+            <template v-if="deliveryCheck">
+              <div class="metric-strip">
+                <div><span>Канал</span><strong>{{ deliveryCheck.channel || '—' }}</strong></div>
+                <div><span>Дошло</span><strong>{{ deliveryCheck.delivered }} / {{ deliveryCheck.totalAccounts }}</strong></div>
+                <div><span>Twitch не показал</span><strong>{{ deliveryCheck.notDelivered }}</strong></div>
+                <div><span>Читающий аккаунт</span><strong>{{ deliveryCheck.reader || '—' }}</strong></div>
+              </div>
+              <div class="bulk-preview-list">
+                <article v-for="item in deliveryCheck.accounts" :key="item.username">
+                  <strong>{{ item.index }}. {{ item.username }}</strong>
+                  <span>{{ deliveryCheckStatus(item) }}</span>
+                  <small>отправлено в чат: «{{ item.message }}»</small>
+                </article>
+              </div>
+            </template>
+          </section>
           <section class="panel oauth-panel">
             <div class="panel-heading">
               <div><p class="eyebrow">АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ</p><h3>Подключение через Twitch</h3></div>
