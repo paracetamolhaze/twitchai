@@ -230,7 +230,10 @@ describe('Gemini Live perception protocol', () => {
     client.stop();
   });
 
-  it('preserves close reason and opens the circuit after three 1007 protocol errors', async () => {
+  it('degrades a rejected session setup before treating 1007 as a persistent fault', async () => {
+    // A setting the model will not accept is a self-correcting cause, unlike a genuine protocol
+    // fault, so each degradation gets a fresh attempt instead of counting toward the circuit —
+    // otherwise one unsupported option would take perception down for the whole stream.
     vi.useFakeTimers();
     const connections: LiveConnectParameters[] = [];
     const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
@@ -239,14 +242,44 @@ describe('Gemini Live perception protocol', () => {
       reconnectMinimumMs: 1, reconnectMaximumMs: 1,
     });
     await client.start();
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const parameters = connections[attempt]!;
+    expect(connections[0]?.config?.responseModalities).toEqual(['TEXT']);
+
+    const reject = async (index: number): Promise<void> => {
+      const parameters = connections[index]!;
       parameters.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
       parameters.callbacks?.onclose?.({ code: 1007, reason: 'Request contains an invalid argument', wasClean: true } as never);
-      if (attempt < 2) await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(1);
+    };
+
+    await reject(0);
+    expect(connections[1]?.config?.responseModalities).toEqual(['AUDIO']);
+
+    await reject(1);
+    // Second and last degradation: hand retention back to the service instead of bounding it here.
+    expect(connections[2]?.config?.contextWindowCompression).toEqual({ slidingWindow: {} });
+
+    client.stop();
+  });
+
+  it('preserves close reason and opens the circuit once degradation is exhausted', async () => {
+    vi.useFakeTimers();
+    const connections: LiveConnectParameters[] = [];
+    const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({
+      connect: async (parameters) => { connections.push(parameters); return session; },
+      reconnectMinimumMs: 1, reconnectMaximumMs: 1,
+      // Already at the last fallback, so every rejection counts toward the circuit immediately.
+      responseModality: 'audio',
+    });
+    await client.start();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const parameters = connections[attempt];
+      if (!parameters) break;
+      parameters.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+      parameters.callbacks?.onclose?.({ code: 1007, reason: 'Request contains an invalid argument', wasClean: true } as never);
+      await vi.advanceTimersByTimeAsync(1);
     }
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(connections).toHaveLength(3);
     expect(client.getDiagnostics()).toMatchObject({ state: 'FATAL_CONFIG_ERROR', lastCloseCode: 1007 });
     expect(client.getDiagnostics().lastCloseReason).toContain('invalid argument');
     client.stop();

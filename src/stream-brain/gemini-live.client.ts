@@ -101,8 +101,13 @@ export class GeminiLiveClient implements StreamBrainClient {
   private audioChunksSent = 0;
   private videoFramesSent = 0;
   private transcriptsReceived = 0;
+  /** Starts at the configured value and degrades to audio if the model refuses text output. */
+  private effectiveResponseModality: 'text' | 'audio';
+  /** Cleared if the service refuses explicit retention bounds, leaving it to pick its own. */
+  private useExplicitContextWindow = true;
 
   constructor(private readonly options: GeminiLiveClientOptions) {
+    this.effectiveResponseModality = options.responseModality ?? 'text';
     this.ai = new GoogleGenAI({ apiKey: options.apiKey });
     this.logger = options.logger.child('PERCEPTION');
     this.backoff = new ExponentialBackoff(
@@ -251,7 +256,7 @@ export class GeminiLiveClient implements StreamBrainClient {
           // any audio parts that arrive. Generating spoken audio anyway costs $12/M against $4.5/M
           // for text. Kept switchable because some Live models only support audio output: if the
           // session fails to start, flip GEMINI_LIVE_RESPONSE_MODALITY back to audio.
-          responseModalities: [this.options.responseModality === 'audio' ? Modality.AUDIO : Modality.TEXT],
+          responseModalities: [this.effectiveResponseModality === 'audio' ? Modality.AUDIO : Modality.TEXT],
           mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
           inputAudioTranscription: {},
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
@@ -260,10 +265,12 @@ export class GeminiLiveClient implements StreamBrainClient {
           // session length rather than with what is happening on stream: a 4.6-minute session
           // reported 308k input tokens while the media actually sent was worth roughly 27k. An
           // explicit trigger keeps the retained context bounded and the per-minute cost flat.
-          contextWindowCompression: {
-            triggerTokens: String(this.options.contextWindowTriggerTokens ?? 16_000),
-            slidingWindow: { targetTokens: String(this.options.contextWindowTargetTokens ?? 8_000) },
-          },
+          contextWindowCompression: this.useExplicitContextWindow
+            ? {
+              triggerTokens: String(this.options.contextWindowTriggerTokens ?? 16_000),
+              slidingWindow: { targetTokens: String(this.options.contextWindowTargetTokens ?? 8_000) },
+            }
+            : { slidingWindow: {} },
           systemInstruction: STREAM_BRAIN_INSTRUCTION,
           tools: [{ functionDeclarations: [EMIT_STREAM_EVENT_DECLARATION] }],
         },
@@ -439,6 +446,27 @@ export class GeminiLiveClient implements StreamBrainClient {
         this.protocolErrorTimes.shift();
       }
       this.resumptionHandle = undefined;
+      // Not every Live model accepts text output; the ones built around native audio reject the
+      // session outright with 1007 rather than negotiating. Perception is the layer everything else
+      // depends on, so an output format the model will not take must degrade to the one it will
+      // instead of retrying the same rejected setup until the circuit opens.
+      // Both of these are settings the service may simply refuse, and perception is what everything
+      // else depends on, so each one degrades to the previously known-good form rather than retrying
+      // a rejected setup until the circuit opens. Modality first, since only some models accept
+      // text output; then the explicit retention bounds.
+      if (this.effectiveResponseModality === 'text') {
+        this.effectiveResponseModality = 'audio';
+        this.protocolErrorTimes.splice(0);
+        this.logger.warn('Live rejected text output; falling back to audio for this session', {
+          code: details.code, reason,
+        });
+      } else if (this.useExplicitContextWindow) {
+        this.useExplicitContextWindow = false;
+        this.protocolErrorTimes.splice(0);
+        this.logger.warn('Live rejected the explicit context window; falling back to service defaults', {
+          code: details.code, reason,
+        });
+      }
     } else if (details.source !== 'go_away') {
       this.protocolErrorTimes.splice(0);
     }
