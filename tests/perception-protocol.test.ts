@@ -20,6 +20,7 @@ describe('Gemini Live perception-only protocol', () => {
       sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn(),
     } as unknown as Session;
     const client = new GeminiLiveClient({
+      minFramesBeforeEvents: 0,
       apiKey: 'test-key',
       model: 'gemini-3.1-flash-live-preview',
       logger: new Logger('TEST', 'error'),
@@ -56,6 +57,7 @@ describe('Gemini Live perception-only protocol', () => {
       close: vi.fn(),
     } as unknown as Session;
     const client = new GeminiLiveClient({
+      minFramesBeforeEvents: 0,
       apiKey: 'test-key',
       model: 'gemini-3.1-flash-live-preview',
       logger: new Logger('TEST', 'error'),

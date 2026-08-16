@@ -216,6 +216,40 @@ describe('Gemini Live perception protocol', () => {
     client.stop();
   });
 
+  it('reports nothing until enough of the stream has actually been seen', async () => {
+    // Four seconds into a session, on one delivered frame, the model described a setting — people
+    // sitting indoors, possibly a restaurant — for a group standing outdoors on a bridge, and the
+    // bots answered that. It hedges rather than withholding, so a guess reaches chat as fact.
+    const observed: string[] = [];
+    let parameters: LiveConnectParameters | undefined;
+    const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
+    const client = createClient({
+      connect: async (value) => { parameters = value; return session; },
+      onStreamEvent: async (event) => { observed.push(event.summary); return { accepted: true }; },
+      minFramesBeforeEvents: 3,
+    });
+    await client.start();
+    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+
+    const emit = (summary: string): void => {
+      parameters?.callbacks?.onmessage?.({ toolCall: { functionCalls: [{
+        id: `e-${summary}`, name: EMIT_STREAM_EVENT_TOOL,
+        args: { type: 'visual', summary, importance: 0.6, confidence: 0.8 },
+      }] } } as LiveServerMessage);
+    };
+
+    client.sendVideo(Buffer.from([1]));
+    emit('Сидят в помещении, возможно, в ресторане.');
+    await vi.waitFor(() => expect(session.sendToolResponse).toHaveBeenCalledTimes(1));
+    expect(observed).toEqual([]);
+
+    client.sendVideo(Buffer.from([2]));
+    client.sendVideo(Buffer.from([3]));
+    emit('Компания стоит на мосту.');
+    await vi.waitFor(() => expect(observed).toEqual(['Компания стоит на мосту.']));
+    client.stop();
+  });
+
   it('declares exactly one tool with supported Live JSON Schema keywords', async () => {
     let parameters: LiveConnectParameters | undefined;
     const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
@@ -401,6 +435,7 @@ interface ClientOverrides {
   reconnectMaximumMs?: number;
   usage?: UsageTracker;
   responseModality?: 'text' | 'audio';
+  minFramesBeforeEvents?: number;
 }
 
 function createClient(overrides: ClientOverrides): GeminiLiveClient {
@@ -413,6 +448,8 @@ function createClient(overrides: ClientOverrides): GeminiLiveClient {
     ...(overrides.reconnectMinimumMs !== undefined ? { reconnectMinimumMs: overrides.reconnectMinimumMs } : {}),
     ...(overrides.reconnectMaximumMs !== undefined ? { reconnectMaximumMs: overrides.reconnectMaximumMs } : {}),
     ...(overrides.responseModality ? { responseModality: overrides.responseModality } : {}),
+    // Off unless a test is about the warm-up gate itself, so unrelated cases need not feed frames.
+    minFramesBeforeEvents: overrides.minFramesBeforeEvents ?? 0,
     handlers: {
       onStreamEvent: (event) => overrides.onStreamEvent?.(event) ?? Promise.resolve({ accepted: true }),
       ...(overrides.onTranscript ? { onTranscript: overrides.onTranscript } : {}),

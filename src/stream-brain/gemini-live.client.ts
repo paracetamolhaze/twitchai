@@ -51,6 +51,8 @@ export interface GeminiLiveClientOptions {
   speechEndSensitivity?: 'low' | 'high';
   /** Silence needed before a turn ends. Longer keeps a thinking-out-loud speaker in one turn. */
   speechSilenceMs?: number;
+  /** Frames that must arrive before an emitted event is trusted, so nothing is reported unseen. */
+  minFramesBeforeEvents?: number;
   connect?: (parameters: LiveConnectParameters) => Promise<Session>;
 }
 
@@ -120,9 +122,11 @@ export class GeminiLiveClient implements StreamBrainClient {
   /** How many times the service reported usage, and how many model turns completed. */
   private usageReports = 0;
   private modelTurns = 0;
+  private readonly minFramesBeforeEvents: number;
 
   constructor(private readonly options: GeminiLiveClientOptions) {
     this.effectiveResponseModality = options.responseModality ?? 'audio';
+    this.minFramesBeforeEvents = options.minFramesBeforeEvents ?? 3;
     this.ai = new GoogleGenAI({ apiKey: options.apiKey });
     this.logger = options.logger.child('PERCEPTION');
     this.backoff = new ExponentialBackoff(
@@ -466,7 +470,17 @@ export class GeminiLiveClient implements StreamBrainClient {
       try {
         let output: unknown;
         const args = call.args ?? {};
-        if (name === EMIT_STREAM_EVENT_TOOL) {
+        if (name === EMIT_STREAM_EVENT_TOOL && this.videoFramesSent < this.minFramesBeforeEvents) {
+          // Four seconds into a session, with one frame delivered and audio barely started, the
+          // model still described a setting — "sitting indoors, possibly a restaurant" — for people
+          // standing outdoors on a bridge, and the bots answered that. It hedges rather than
+          // withholding, so the guess reaches chat as fact. Nothing is reported until enough of the
+          // stream has actually been seen to have an opinion about it.
+          output = { error: 'perception_warming_up' };
+          this.logger.info('Ignored stream event emitted before enough of the stream was seen', {
+            framesSent: this.videoFramesSent, required: this.minFramesBeforeEvents,
+          });
+        } else if (name === EMIT_STREAM_EVENT_TOOL) {
           output = await this.options.handlers.onStreamEvent(args as unknown as StreamEventCandidate);
         } else {
           output = { error: 'unknown_tool' };
