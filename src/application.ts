@@ -192,6 +192,7 @@ export class Application {
       observesChat: () => this.botManager.hasChatReader(),
     });
 
+    const transcriptionMode = this.config.transcription.mode;
     // OpenRouter wins when both are configured: it is the deliberate choice, and a leftover Gemini
     // key should not quietly keep billing an account the operator has moved off.
     const brainClient = this.config.openRouter.apiKey
@@ -230,9 +231,11 @@ export class Application {
       });
     }
 
-    // Live needs Gemini's own key and nothing else does any more. Once hearing and seeing move
-    // off it entirely this block, and the client behind it, go away.
-    if (this.config.gemini.apiKey) {
+    // Live needs Gemini's own key and nothing else does any more. Once hearing moves off it there
+    // is nothing left for it to do that is worth a session: it would sit reconnecting against an
+    // account that may not even be funded, reporting a red state for a layer nobody is using.
+    const liveRetired = transcriptionMode === 'whisper';
+    if (this.config.gemini.apiKey && !liveRetired) {
       this.gemini = new GeminiLiveClient({
         apiKey: this.config.gemini.apiKey,
         model: this.config.gemini.liveModel,
@@ -288,7 +291,6 @@ export class Application {
       });
     }
 
-    const transcriptionMode = this.config.transcription.mode;
     const backend = this.buildTranscriptionBackend();
     if (transcriptionMode !== 'gemini' && backend) {
       this.transcriber = new SpeechTranscriber({
