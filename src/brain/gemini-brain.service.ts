@@ -667,7 +667,7 @@ function isInvalidPreviousInteraction(cause: unknown): boolean {
 /** A prompt the service refuses to accept at all — a filter decision, not a temporary failure. */
 function isBlockedPromptError(cause: unknown): boolean {
   const message = cause instanceof Error ? cause.message : String(cause);
-  return /input blocked|blocked by|safety|prohibited_content|400/i.test(message);
+  return /input blocked|blocked by|safety|prohibited_content|status 400/i.test(message);
 }
 
 function isTransientBrainError(cause: unknown): boolean {
