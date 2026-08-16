@@ -519,6 +519,23 @@ describe('single-session reaction protocol', () => {
     await coordinator.stop();
   });
 
+  it('rejects a typographic dash outright rather than asking the model not to use one', async () => {
+    // Nobody types an em dash into a chat box; it is the clearest tell that a message was written
+    // rather than typed, and three separate instructions failed to stop it appearing.
+    const { coordinator } = await setup();
+    await coordinator.prepareBrainEvent(event, 0);
+    const result = await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [
+        { username: 'bot-one', message: 'работает — не трогай, золотое правило' },
+        { username: 'bot-three', message: 'работает, не трогай' },
+      ],
+    });
+    expect(result.rejected).toContainEqual({ username: 'bot-one', reason: 'typographic_dash' });
+    expect(result.accepted.map((item) => item.username)).toEqual(['bot-three']);
+    await coordinator.stop();
+  });
+
   it('never spends a Brain call when the named account is unavailable', async () => {
     const { coordinator, setCandidates } = await setup();
     const traces: ReactionTraceRecord[] = [];

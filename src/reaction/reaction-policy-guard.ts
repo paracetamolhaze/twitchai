@@ -98,6 +98,10 @@ export class ReactionPolicyGuard {
       }
       if (!message) { reject('empty_message'); continue; }
       if (isControlValue(message)) { reject('control_value'); continue; }
+      // Nobody types an em dash into a chat box; it is the clearest tell that a message was
+      // written rather than typed. Three separate instructions failed to stop it, so it is a
+      // rule here instead of a request.
+      if (/[—–]/.test(message)) { reject('typographic_dash'); continue; }
       if (hasInternalMetadataLeak(message)) { reject('internal_metadata'); continue; }
       if (Buffer.byteLength(message, 'utf8') > this.maxMessageBytes()) { reject('message_too_long'); continue; }
       if (candidate.lastReactionAt && now - candidate.lastReactionAt < candidate.persona.behavior.minimumIntervalMs) {

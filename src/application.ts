@@ -141,6 +141,7 @@ export class Application {
     this.runtimeSettings = await this.repository.getSettings();
     this.config.twitch.channel = normalizeChannel(stringSetting(this.runtimeSettings.channel, this.config.twitch.channel));
     this.config.stream.visionFps = boundedNumberSetting(this.runtimeSettings.visionFps, this.config.stream.visionFps, 0.05, 1);
+    this.paused = this.runtimeSettings.paused === true;
     const streamContext = stringSetting(this.runtimeSettings.streamContext, this.config.stream.context);
     this.contextStore.configure({
       channel: this.config.twitch.channel,
@@ -398,7 +399,15 @@ export class Application {
     this.wireEvents();
     await this.api.start();
     if (!this.config.app.dashboardToken) this.logger.warn('DASHBOARD_TOKEN is missing; protected dashboard API and realtime connections are unavailable');
-    await Promise.allSettled([this.perception.start(), this.botManager.start()]);
+    if (this.paused) {
+      // Perception still has to be started so it is 'running' and a later resume can hand it a
+      // channel again, but it is given no channel to open, and the accounts stay out of chat.
+      await this.perception.start();
+      await this.perception.reconfigureMedia('', this.config.stream.visionFps);
+      this.logger.warn('Starting in the operator-stopped state; nothing runs until it is resumed from the dashboard');
+    } else {
+      await Promise.allSettled([this.perception.start(), this.botManager.start()]);
+    }
     this.startCategoryMonitor();
     this.usageTimer = setInterval(() => { void this.persistUsage(); }, 60_000);
     this.healthTimer = setInterval(() => { void this.refreshDatabaseHealth(); }, 30_000);
@@ -912,6 +921,7 @@ export class Application {
       streamContext: this.contextStore.snapshot().streamContext,
       visionFps: this.config.stream.visionFps,
       learnEnabled: this.config.learning.enabled,
+      paused: this.paused,
     };
   }
 
@@ -928,10 +938,24 @@ export class Application {
       this.paused = settings.paused;
       persisted.paused = settings.paused;
       if (this.paused) {
+        // Everything, not just media: the accounts leave chat so nothing can be sent by any path,
+        // the autonomous layer stops, and the Brain session is closed rather than left paying to
+        // hold a conversation nobody is feeding.
         this.personaDrive?.stop();
+        if (this.mediaOfflineGraceTimer) {
+          clearTimeout(this.mediaOfflineGraceTimer);
+          this.mediaOfflineGraceTimer = undefined;
+          this.mediaOfflineGraceState = undefined;
+        }
+        this.mediaStreaming = false;
+        this.coordinator.clearPendingContexts();
+        this.clearTranscriptAccumulator();
         await this.perception.reconfigureMedia('', this.config.stream.visionFps);
-        this.logger.info('Paused by operator; media and autonomous layer stopped');
+        await this.geminiBrain?.stopStream();
+        await this.botManager.stop();
+        this.logger.info('Stopped by operator: chat accounts, perception, Brain and autonomous layer');
       } else {
+        await this.botManager.start();
         await this.perception.reconfigureMedia(this.config.twitch.channel, this.config.stream.visionFps);
         this.logger.info('Resumed by operator');
       }
@@ -952,6 +976,11 @@ export class Application {
       }
       persisted.channel = nextChannel;
       persisted.visionFps = nextVisionFps;
+    }
+    if (mediaChanged && this.paused) {
+      // Editing the channel or the frame rate while stopped stores the new value; it must not be
+      // what quietly brings perception back up.
+      await this.perception.reconfigureMedia('', this.config.stream.visionFps);
     }
     this.runtimeSettings = { ...this.runtimeSettings, ...persisted };
     await this.repository.setSettings(persisted);
