@@ -200,7 +200,8 @@ export class Application {
         logger: this.logger,
         usage: this.usage,
         responseModality: this.config.gemini.liveResponseModality,
-        speechSensitivity: this.config.gemini.liveSpeechSensitivity,
+        speechStartSensitivity: this.config.gemini.liveSpeechStartSensitivity,
+        speechEndSensitivity: this.config.gemini.liveSpeechEndSensitivity,
         speechSilenceMs: this.config.gemini.liveSpeechSilenceMs,
         handlers: {
           onStreamEvent: async (candidate) => {

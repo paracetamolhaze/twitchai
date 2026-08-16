@@ -31,7 +31,8 @@ export interface AppConfig {
     apiKey?: string;
     liveModel: string;
     liveResponseModality: 'text' | 'audio';
-    liveSpeechSensitivity: 'low' | 'high';
+    liveSpeechStartSensitivity: 'low' | 'high';
+    liveSpeechEndSensitivity: 'low' | 'high';
     liveSpeechSilenceMs: number;
     brainModel: string;
     brainThinkingLevel: 'low' | 'medium' | 'high';
@@ -110,7 +111,11 @@ const envSchema = z.object({
   // a pause mid-sentence ends a turn, and every turn re-bills the whole retained context, so one
   // thought spoken with pauses is billed several times. Low merges them; the cost is about a
   // second of added latency, which nobody is waiting on here.
-  GEMINI_LIVE_SPEECH_SENSITIVITY: z.enum(['low', 'high']).default('low'),
+  // Split on purpose: setting both low cost transcription outright — an outdoor stream is speech
+  // over wind and crowd, so a low start threshold missed it entirely and perception was left
+  // describing what it saw while guessing at what was said.
+  GEMINI_LIVE_SPEECH_START_SENSITIVITY: z.enum(['low', 'high']).default('high'),
+  GEMINI_LIVE_SPEECH_END_SENSITIVITY: z.enum(['low', 'high']).default('low'),
   GEMINI_LIVE_SPEECH_SILENCE_MS: z.coerce.number().int().min(200).max(5_000).default(1_200),
   GEMINI_BRAIN_MODEL: z.string().trim().default('gemini-3.7-flash'),
   GEMINI_BRAIN_THINKING_LEVEL: z.enum(['low', 'medium', 'high']).default('low'),
@@ -227,7 +232,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       apiKey: parsed.GEMINI_API_KEY,
       liveModel: parsed.GEMINI_LIVE_MODEL,
       liveResponseModality: parsed.GEMINI_LIVE_RESPONSE_MODALITY,
-      liveSpeechSensitivity: parsed.GEMINI_LIVE_SPEECH_SENSITIVITY,
+      liveSpeechStartSensitivity: parsed.GEMINI_LIVE_SPEECH_START_SENSITIVITY,
+      liveSpeechEndSensitivity: parsed.GEMINI_LIVE_SPEECH_END_SENSITIVITY,
       liveSpeechSilenceMs: parsed.GEMINI_LIVE_SPEECH_SILENCE_MS,
       brainModel: parsed.GEMINI_BRAIN_MODEL,
       brainThinkingLevel: parsed.GEMINI_BRAIN_THINKING_LEVEL,

@@ -45,8 +45,10 @@ export interface GeminiLiveClientOptions {
   contextWindowTargetTokens?: number;
   /** Perception output modality. 'text' is the cheap default; 'audio' exists as a fallback. */
   responseModality?: 'text' | 'audio';
-  /** How eagerly speech starts and ends a turn. 'low' merges pauses into fewer, cheaper turns. */
-  speechSensitivity?: 'low' | 'high';
+  /** How readily speech is detected at all. Low misses quiet speech over background noise. */
+  speechStartSensitivity?: 'low' | 'high';
+  /** How readily a pause ends the turn. Low merges a thinking-out-loud speaker into one turn. */
+  speechEndSensitivity?: 'low' | 'high';
   /** Silence needed before a turn ends. Longer keeps a thinking-out-loud speaker in one turn. */
   speechSilenceMs?: number;
   connect?: (parameters: LiveConnectParameters) => Promise<Session>;
@@ -289,10 +291,16 @@ export class GeminiLiveClient implements StreamBrainClient {
           // about a second of latency, which is irrelevant when nobody is waiting on an answer.
           realtimeInputConfig: {
             automaticActivityDetection: {
-              startOfSpeechSensitivity: this.options.speechSensitivity === 'high'
-                ? StartSensitivity.START_SENSITIVITY_HIGH
-                : StartSensitivity.START_SENSITIVITY_LOW,
-              endOfSpeechSensitivity: this.options.speechSensitivity === 'high'
+              // The two ends are not the same trade-off, and setting both low cost transcription:
+              // an outdoor stream is speech over wind and crowd, so a low start threshold simply
+              // missed it — three transcripts in six minutes, leaving perception to describe what
+              // it saw and guess at what was said. Start stays sensitive so speech is caught; the
+              // end stays insensitive so a pause mid-thought does not close the turn and re-bill
+              // the retained context.
+              startOfSpeechSensitivity: this.options.speechStartSensitivity === 'low'
+                ? StartSensitivity.START_SENSITIVITY_LOW
+                : StartSensitivity.START_SENSITIVITY_HIGH,
+              endOfSpeechSensitivity: this.options.speechEndSensitivity === 'high'
                 ? EndSensitivity.END_SENSITIVITY_HIGH
                 : EndSensitivity.END_SENSITIVITY_LOW,
               silenceDurationMs: this.options.speechSilenceMs ?? 1_200,
