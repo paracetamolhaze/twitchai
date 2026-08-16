@@ -90,6 +90,7 @@ export class GeminiLiveClient implements StreamBrainClient {
   private connectPromise?: Promise<void>;
   private reconnectTimer?: NodeJS.Timeout;
   private stabilityTimer?: NodeJS.Timeout;
+  private heartbeatTimer?: NodeJS.Timeout;
   private resumptionHandle?: string;
   private lastContext?: StreamContextSnapshot;
   private contextDirty = false;
@@ -187,6 +188,7 @@ export class GeminiLiveClient implements StreamBrainClient {
     // one, which otherwise persisted for the lifetime of the process.
     this.effectiveResponseModality = this.options.responseModality ?? 'audio';
     this.useExplicitContextWindow = true;
+    this.startHeartbeat();
     this.lastSentContextText = undefined;
     await this.connect(this.generation);
   }
@@ -196,6 +198,7 @@ export class GeminiLiveClient implements StreamBrainClient {
     this.generation += 1;
     this.clearReconnectTimer();
     this.clearStabilityTimer();
+    this.clearHeartbeat();
     this.activeConnectionId = undefined;
     const session = this.session;
     this.session = undefined;
@@ -680,6 +683,23 @@ export class GeminiLiveClient implements StreamBrainClient {
   private clearReconnectTimer(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+  }
+
+  /**
+   * Counters only reach the dashboard when a status is pushed, and pushes happen on state changes
+   * — the last of which is the stability timer at thirty seconds. Everything after that froze on
+   * screen: audio and video appeared stuck at exactly thirty seconds worth regardless of how long
+   * the session had run, which reads as media having stopped when it had not.
+   */
+  private startHeartbeat(): void {
+    this.clearHeartbeat();
+    this.heartbeatTimer = setInterval(() => this.notifyStatus(), 5_000);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private clearHeartbeat(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
   }
 
   private clearStabilityTimer(): void {
