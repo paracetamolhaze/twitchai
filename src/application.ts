@@ -28,6 +28,7 @@ import { GeminiLiveClient } from './stream-brain/gemini-live.client';
 import { MediaPipeline } from './stream-brain/media-pipeline';
 import { StreamBrainService } from './stream-brain/stream-brain.service';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from './stream-brain/types';
+import { SpeechEventSynthesizer } from './stream-brain/speech-event-synthesizer';
 import { SpeechTranscriber } from './transcription/speech-transcriber';
 import {
   GroqWhisperBackend,
@@ -79,6 +80,7 @@ export class Application {
   private personaDrive?: PersonaDriveService;
   private deliveryProbe!: DeliveryProbe;
   private transcriber?: SpeechTranscriber;
+  private speechEvents?: SpeechEventSynthesizer;
   private twitchOAuth?: TwitchOAuthService;
   private categoryTimer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
@@ -306,6 +308,13 @@ export class Application {
           if (transcriptionMode === 'whisper') this.handleSpokenTranscript(text);
         },
       });
+      if (transcriptionMode === 'whisper') {
+        this.speechEvents = new SpeechEventSynthesizer({
+          botUsernames: () => this.contextStore.snapshot().botUsernames,
+          emit: (candidate) => { void this.perception.acceptCandidate(candidate, 'transcription'); },
+          logger: this.logger,
+        });
+      }
       this.logger.info('Speech transcription enabled', {
         mode: transcriptionMode, via: backend.name, model: this.transcriptionModel(),
       });
@@ -500,6 +509,7 @@ export class Application {
     await this.coordinator?.stop();
     await this.memory.stop();
     this.transcriber?.flush();
+    this.speechEvents?.stop();
     this.personaDrive?.stop();
     await this.geminiBrain?.stopStream();
     await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
@@ -803,6 +813,9 @@ export class Application {
 
   private handleSpokenTranscript(text: string): void {
     if (!text.trim()) return;
+    // With Live retired this is the only thing that turns a stream into decisions, so the words
+    // are paced into moments here rather than by a model watching alongside.
+    this.speechEvents?.accept(text);
     // Kept verbatim for the decision layer, separately from the spoken-mention detection below,
     // which only ever looked for a bot name and discarded everything else that was said.
     this.contextStore.addSpeech(text);

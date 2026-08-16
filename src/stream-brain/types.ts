@@ -26,7 +26,13 @@ export const STREAM_EVENT_TYPES = [
 
 export type StreamEventType = (typeof STREAM_EVENT_TYPES)[number];
 
-export type StreamEventSource = 'gemini-live' | 'chat' | 'fallback-transcription';
+export type StreamEventSource =
+  | 'gemini-live'
+  | 'chat'
+  /** Speech heard by the transcription layer, which is the primary source once Live is retired. */
+  | 'transcription'
+  /** Historic value, kept so events stored before the rename still read back. */
+  | 'fallback-transcription';
 
 export interface StreamEvent {
   id: string;
