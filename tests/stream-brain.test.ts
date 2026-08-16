@@ -1,5 +1,39 @@
 import { describe, expect, it } from 'vitest';
 import { EventDetector } from '../src/stream-brain/event-detector';
+import { ContextStore } from '../src/stream-brain/context-store';
+import { StreamBrainService } from '../src/stream-brain/stream-brain.service';
+import { Logger } from '../src/logger';
+import { UsageTracker } from '../src/usage/usage-tracker';
+
+describe('perception media flow', () => {
+  it('does not hold the tool call open waiting for the event to be persisted', async () => {
+    // Realtime media is dropped, not buffered, for as long as a tool batch is outstanding, so a
+    // database round trip inside the tool call silenced the stream: production delivered about 9%
+    // of both audio and video, and perception was left describing scenes it had barely seen.
+    let releaseSave = (): void => {};
+    const saved = new Promise<void>((resolve) => { releaseSave = resolve; });
+    const service = new StreamBrainService({
+      channel: 'streamer',
+      contextStore: new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 100, maxEvents: 100 }),
+      eventDetector: new EventDetector({ minimumConfidence: 0.4 }),
+      eventSink: { saveStreamEvent: async () => saved } as never,
+      usage: new UsageTracker(),
+      logger: new Logger('TEST', 'error'),
+      contextRefreshMs: 30_000,
+      enabled: false,
+      eventDeduplicationWindowMs: 0,
+    });
+
+    const accepted = await Promise.race([
+      service.acceptCandidate({
+        type: 'visual', summary: 'Стример показал экран.', importance: 0.7, confidence: 0.9,
+      }),
+      new Promise((resolve) => setTimeout(() => resolve('still-waiting'), 50)),
+    ]);
+    expect(accepted).not.toBe('still-waiting');
+    releaseSave();
+  });
+});
 
 describe('StreamBrain event normalization', () => {
   const detector = new EventDetector({ minimumConfidence: 0.2 });

@@ -244,8 +244,15 @@ export class StreamBrainService extends EventEmitter {
       ...(deduplicated.event.visualContext ? { visualContext: deduplicated.event.visualContext } : {}),
     });
     this.queueEventEmission(deduplicated);
+    // Deliberately not awaited. This runs inside the perception tool call, and realtime media is
+    // dropped rather than buffered for as long as a tool batch is outstanding — so waiting on a
+    // database round trip here silenced the stream itself. Production delivered roughly 9% of both
+    // audio and video: 750 chunks of an expected 8100, 9 frames of an expected 97, which is also
+    // why perception was left describing scenes it had barely seen. The event is already in the
+    // context store and already queued for delivery; persistence only feeds history and the next
+    // bootstrap, and nothing in the live path waits on it.
     if (this.options.eventSink) {
-      await this.options.eventSink.saveStreamEvent(deduplicated.event)
+      void this.options.eventSink.saveStreamEvent(deduplicated.event)
         .catch((cause: unknown) => this.logger.warn('Stream event persistence failed', { eventId: deduplicated.event.id, cause }));
     }
     return deduplicated.event;
