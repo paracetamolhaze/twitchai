@@ -406,11 +406,32 @@ export class ReactionCoordinator extends EventEmitter {
       messages: (await this.options.history.recent(candidate.username)).slice(-3).map((record) => record.message),
     })));
 
+    // Two memories per candidate, and the streamer facts that bear on what was just said. The full
+    // targeted context above is built only for direct mentions because it is large; this is the
+    // cheap half of it, and it is the half that carries opinions. Without it every ordinary moment
+    // was answered by accounts with no history of their own in front of them.
+    const [recalledMemories, streamerMemories] = await Promise.all([
+      Promise.all(candidates.map(async (candidate) => ({
+        username: candidate.username,
+        memories: (await this.options.personaMemory.recall(candidate.persona.id, {
+          limit: 2, excludeViewerTagged: true,
+        })).map((item) => ({ type: item.type, summary: item.summary })),
+      }))),
+      this.options.globalMemory.retrieve({
+        channel: snapshot.channel,
+        query: [event.summary, event.speech].filter(Boolean).join(' '),
+        limit: 3,
+      }).then((memories) => memories.map((memory) => ({ type: memory.type, summary: memory.summary })))
+        .catch(() => []),
+    ]);
+
     return {
       event,
       triggerKind: 'external_stream_event',
       availableBots: candidates.map((candidate) => candidate.username),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
+      recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
+      ...(streamerMemories.length > 0 ? { streamerMemories } : {}),
       // Only what was said around this moment: older lines belong to a part of the stream the
       // event is not about, and the chain already carries them from earlier turns.
       recentSpeech: snapshot.recentSpeech.filter((line) => line.timestamp > chatAfter).slice(-8),

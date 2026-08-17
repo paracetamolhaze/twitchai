@@ -94,7 +94,8 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
     now,
   });
   return {
-    coordinator, globalMemory, history, policy, sent, usage,
+    coordinator, globalMemory, history, policy, sent, usage, personaMemory,
+    candidatesFor: (username: string) => candidates.find((candidate) => candidate.username === username)!,
     setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; },
     setObservesChat: (value: boolean) => { observesChat = value; },
     contextStore,
@@ -120,7 +121,13 @@ describe('single-session reaction protocol', () => {
     expect(prepared.reactionExamples.length).toBeLessThanOrEqual(3);
     expect(prepared).not.toHaveProperty('personas');
     expect(prepared).not.toHaveProperty('globalStreamerMemories');
-    expect(JSON.stringify(prepared)).not.toContain('Стример промахнулся решающим ультимейтом.');
+    // Small still means small: full profiles and the whole memory store stay out. What does travel
+    // is a handful of streamer facts matched against what was just said — memory is where opinions
+    // live, and an ordinary moment used to be answered with none of it in front of the model.
+    expect(prepared.streamerMemories?.length ?? 0).toBeLessThanOrEqual(3);
+    expect(prepared.streamerMemories).toEqual([
+      expect.objectContaining({ summary: 'Стример промахнулся решающим ультимейтом.' }),
+    ]);
     await coordinator.stop();
   });
 
@@ -536,6 +543,35 @@ describe('single-session reaction protocol', () => {
     });
     expect(result.rejected).toContainEqual({ username: 'bot-one', reason: 'typographic_dash' });
     expect(result.accepted.map((item) => item.username)).toEqual(['bot-three']);
+    await coordinator.stop();
+  });
+
+  it('puts what each account personally remembers in front of the model on an ordinary moment', async () => {
+    // Memory is where a character's opinions live, and it used to reach the model only when the
+    // stream said that account's name. Every ordinary moment was answered by accounts with no
+    // history of their own, which is most of why the messages read as commentary.
+    const { coordinator, personaMemory, candidatesFor } = await setup();
+    const persona = candidatesFor('bot-two');
+    await personaMemory.remember({
+      personaId: persona.persona.id,
+      type: 'preference',
+      summary: 'Терпеть не может, когда в такси громко играет музыка.',
+      importance: 0.8,
+      tags: ['такси'],
+      // Recall deliberately ignores something stored moments ago, so this one is from earlier.
+      createdAt: event.timestamp - 3_600_000,
+    });
+
+    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'ordinary-event' }, 0);
+    const recalled = prepared.recalledMemories?.find((item) => item.username === 'bot-two');
+    expect(recalled?.memories).toEqual([
+      expect.objectContaining({ summary: 'Терпеть не может, когда в такси громко играет музыка.' }),
+    ]);
+    // Nobody else's memory travels with it.
+    for (const entry of prepared.recalledMemories ?? []) {
+      if (entry.username === 'bot-two') continue;
+      expect(entry.memories).toEqual([]);
+    }
     await coordinator.stop();
   });
 

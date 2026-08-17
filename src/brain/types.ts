@@ -95,6 +95,21 @@ export interface BrainEventInput {
    */
   recentSpeech?: Array<{ timestamp: number; text: string }>;
   recentChatDelta: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
+  /**
+   * A couple of things each available account personally remembers.
+   *
+   * Their full profile arrives once at bootstrap, but memory is where a character's opinions
+   * actually live, and it used to reach the model only when the stream said that account's name.
+   * On every ordinary moment the accounts were writing with no history of their own in front of
+   * them, which is most of why the messages read as commentary rather than as somebody talking.
+   */
+  recalledMemories?: Array<{ username: string; memories: Array<{ type: string; summary: string }> }>;
+  /**
+   * What is known about this streamer that bears on this particular moment, looked up by the words
+   * that were just said. Session start loads a handful of memories and nothing re-reads them
+   * against the topic at hand.
+   */
+  streamerMemories?: Array<{ type: string; summary: string }>;
   targetedPersonaContext: BrainTargetedPersonaContext[];
   reactionExamples: ReactionExample[];
   deltas: BrainDynamicDelta[];
