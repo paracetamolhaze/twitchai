@@ -230,7 +230,7 @@ export class SpeechTranscriber {
         audioSeconds: audioMs / 1000,
         failed: false,
       });
-      const text = result.text;
+      const text = withoutRepeatedTail(this.stats.lastTranscript, result.text);
       if (!text) return;
       this.stats.transcriptsReceived += 1;
       this.stats.lastTranscript = text;
@@ -273,4 +273,39 @@ function wav(pcm: Buffer): Buffer {
   header.write('data', 36);
   header.writeUInt32LE(pcm.length, 40);
   return Buffer.concat([header, pcm]);
+}
+
+/**
+ * Removes the words the overlap made the model say twice.
+ *
+ * Windows deliberately repeat a second and a half of audio so a word cut by the clock survives, and
+ * the model duly transcribes that second twice: one window ended "Не знаю, всё нормально" and the
+ * next began with the same phrase, which reached the decision layer as a stutter. The audio overlap
+ * is worth keeping; its echo in the text is not.
+ */
+export function withoutRepeatedTail(previous: string | undefined, next: string | undefined): string | undefined {
+  const text = next?.trim();
+  if (!text) return undefined;
+  const tail = previous?.trim();
+  if (!tail) return text;
+  const normalise = (value: string): string => value.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '').replace(/\s+/g, ' ').trim();
+  const flatTail = normalise(tail);
+  const flatText = normalise(text);
+  // Longest overlap first, so "Не знаю, всё нормально" wins over the single word "нормально".
+  for (let length = Math.min(120, flatTail.length, flatText.length); length >= 12; length -= 1) {
+    const candidate = flatTail.slice(-length);
+    if (!flatText.startsWith(candidate)) continue;
+    // Walk the original text until the same number of comparable characters has been consumed, so
+    // punctuation and casing survive on whatever is left.
+    let seen = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      if (normalise(text[index]!).length > 0) seen += 1;
+      if (seen >= candidate.replace(/ /g, '').length) {
+        const rest = text.slice(index + 1).replace(/^[\s,.!?:;-]+/u, '').trim();
+        return rest.length >= 3 ? rest : undefined;
+      }
+    }
+    return undefined;
+  }
+  return text;
 }

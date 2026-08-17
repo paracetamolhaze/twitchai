@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Logger } from '../src/logger';
-import { SpeechTranscriber } from '../src/transcription/speech-transcriber';
+import { SpeechTranscriber, withoutRepeatedTail } from '../src/transcription/speech-transcriber';
 
 const SAMPLE_RATE = 16_000;
 
@@ -31,6 +31,33 @@ function transcriber(overrides: Partial<ConstructorParameters<typeof SpeechTrans
   });
   return { instance, heard, created, hints };
 }
+
+describe('withoutRepeatedTail', () => {
+  it('drops the words the audio overlap made the model say twice', () => {
+    // The overlap is deliberate so a word cut by the clock survives; its echo in the text is not.
+    // Production sent the decision layer "Не знаю, всё нормально. Не знаю, всё нормально."
+    expect(withoutRepeatedTail(
+      'Закажи. Тебе надо, ты выбирай. Не знаю, всё нормально.',
+      'Не знаю, всё нормально. Сервис по факту не понравился.',
+    )).toBe('Сервис по факту не понравился.');
+  });
+
+  it('keeps a window that simply continues the sentence', () => {
+    expect(withoutRepeatedTail('Хочется просто стейк', 'какого-то, да, вкусного'))
+      .toBe('какого-то, да, вкусного');
+  });
+
+  it('drops a window that repeated the previous one outright', () => {
+    expect(withoutRepeatedTail('Инициатива, как говорится, наказуема.', 'Инициатива, как говорится, наказуема.'))
+      .toBeUndefined();
+  });
+
+  it('ignores a coincidental short overlap rather than eating real speech', () => {
+    // Two windows both containing "да" is not an echo, and treating it as one would delete a line.
+    expect(withoutRepeatedTail('ну да', 'да ладно, поехали уже отсюда'))
+      .toBe('да ладно, поехали уже отсюда');
+  });
+});
 
 describe('SpeechTranscriber', () => {
   it('sends nothing while the stream is dead silent', async () => {

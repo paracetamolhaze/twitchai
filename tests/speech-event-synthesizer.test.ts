@@ -30,6 +30,29 @@ describe('SpeechEventSynthesizer', () => {
     expect(emitted[0]?.type).toBe('speech');
   });
 
+  it('makes the moment the latest lines, not everything said since the last decision', async () => {
+    // Everything between two decisions used to become one event: 400 characters of several people
+    // talking across each other, and a reply to that can only be vague. The rest is history and
+    // already reaches the decision layer as recentSpeech.
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer({ maxMomentCharacters: 120 });
+    instance.accept('ага');
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(emitted).toHaveLength(1);
+
+    // Three lines gathered inside one pacing interval, so they arrive as a single moment.
+    instance.accept('короче я щас доем и поедем в центр, там бар нормальный есть возле отеля недалеко');
+    instance.accept('повербанк только надо взять, а то опять сядет на полпути');
+    instance.accept('и вообще неплохо было бы уже поесть где-нибудь по-человечески за столом');
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(emitted).toHaveLength(2);
+
+    const speech = emitted[1]?.speech ?? '';
+    expect(speech).toContain('поесть где-нибудь по-человечески');
+    expect(speech).not.toContain('поедем в центр');
+    expect(speech.length).toBeLessThanOrEqual(260);
+  });
+
   it('answers a line naming an account immediately, whatever the pacing says', async () => {
     // A question to one of the accounts that waits twenty seconds has already failed.
     vi.useFakeTimers();

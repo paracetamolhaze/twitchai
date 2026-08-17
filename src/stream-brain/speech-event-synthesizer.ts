@@ -15,6 +15,15 @@ export interface SpeechEventSynthesizerOptions {
   maxWaitMs?: number;
   /** Material worth waking the decision layer for, in characters of speech. */
   minCharacters?: number;
+  /**
+   * Longest the moment itself may be.
+   *
+   * Everything said between two decisions used to become one event: 400 characters of several
+   * people talking across each other, and a reply to that can only be vague. A viewer reacts to
+   * the last thing said, not to the last minute — the rest still reaches the decision layer as
+   * recentSpeech, which is where history belongs.
+   */
+  maxMomentCharacters?: number;
   /** Silence a changed scene must follow before it becomes a moment on its own. */
   quietBeforeVisualMs?: number;
   now?: () => number;
@@ -39,6 +48,7 @@ export class SpeechEventSynthesizer {
   private readonly quickIntervalMs: number;
   private readonly maxWaitMs: number;
   private readonly minCharacters: number;
+  private readonly maxMomentCharacters: number;
   private readonly quietBeforeVisualMs: number;
   private currentScene?: string;
   private buffer: string[] = [];
@@ -60,6 +70,7 @@ export class SpeechEventSynthesizer {
     this.quickIntervalMs = options.quickIntervalMs ?? 12_000;
     this.maxWaitMs = options.maxWaitMs ?? 40_000;
     this.minCharacters = options.minCharacters ?? 90;
+    this.maxMomentCharacters = options.maxMomentCharacters ?? 200;
     this.quietBeforeVisualMs = options.quietBeforeVisualMs ?? 40_000;
   }
 
@@ -154,14 +165,15 @@ export class SpeechEventSynthesizer {
 
   private flush(reason: 'direct_mention' | 'asked' | 'paced' | 'waited'): void {
     this.clearTimer();
-    const speech = this.bufferedText();
+    const speech = this.moment();
+    const buffered = this.bufferedText().length;
     this.buffer = [];
     this.firstBufferedAt = undefined;
     if (!speech) return;
     this.lastEmittedAt = this.now();
     const mention = this.mentionsBot(speech);
     this.logger.info('Speech became a moment worth deciding on', {
-      reason, characters: speech.length, directMention: mention,
+      reason, characters: speech.length, buffered, directMention: mention,
     });
     this.options.emit({
       type: mention ? 'direct_mention' : speechType(speech),
@@ -178,6 +190,24 @@ export class SpeechEventSynthesizer {
 
   private bufferedText(): string {
     return this.buffer.join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * The part of what was said that is actually the moment: the latest lines, from the end back.
+   * Whatever came before is history, and history already travels as recentSpeech.
+   */
+  private moment(): string {
+    const lines: string[] = [];
+    let length = 0;
+    for (const line of [...this.buffer].reverse()) {
+      if (lines.length > 0 && length + line.length > this.maxMomentCharacters) break;
+      lines.unshift(line);
+      length += line.length + 1;
+    }
+    const moment = lines.join(' ').replace(/\s+/g, ' ').trim();
+    return moment.length > this.maxMomentCharacters * 2
+      ? moment.slice(-this.maxMomentCharacters * 2).replace(/^\S*\s/u, '')
+      : moment;
   }
 
   private mentionsBot(text: string): boolean {
