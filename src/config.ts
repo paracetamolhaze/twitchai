@@ -47,6 +47,7 @@ export interface AppConfig {
     brainEventMergeWindowMs: number;
     brainContextRolloverTokens: number;
     brainInteractionTimeoutMs: number;
+    momentFreshnessMs: number;
   };
   openRouter: {
     /** Set to route the Brain through OpenRouter instead of Gemini's stateful Interactions API. */
@@ -162,6 +163,10 @@ const envSchema = z.object({
   BRAIN_CONTEXT_ROLLOVER_TOKENS: z.coerce.number().int().min(20_000).max(1_048_576).default(60_000),
   // Must stay below the 45s reaction context TTL: a decision arriving after its context expired is
   // discarded anyway, so waiting longer only holds up every event queued behind it.
+  // How long a moment stays worth answering. Past this it is left alone rather than answered late:
+  // a reply about something the stream has moved on from reads as not having watched. Held above
+  // the model's own latency so an ordinary decision is never caught by it.
+  MOMENT_FRESHNESS_SECONDS: z.coerce.number().int().min(5).max(120).default(25),
   BRAIN_INTERACTION_TIMEOUT_SECONDS: z.coerce.number().int().min(5).max(40).default(35),
   STREAM_CONTEXT: z.string().default(''),
   // One frame per second is far more than an IRL stream needs — a moment worth reacting to lasts
@@ -299,6 +304,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       brainEventMergeWindowMs: parsed.BRAIN_EVENT_MERGE_WINDOW_MS,
       brainContextRolloverTokens: parsed.BRAIN_CONTEXT_ROLLOVER_TOKENS,
       brainInteractionTimeoutMs: parsed.BRAIN_INTERACTION_TIMEOUT_SECONDS * 1000,
+      momentFreshnessMs: parsed.MOMENT_FRESHNESS_SECONDS * 1000,
     },
     openRouter: {
       apiKey: parsed.OPENROUTER_API_KEY,

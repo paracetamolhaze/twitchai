@@ -58,6 +58,8 @@ export interface GeminiBrainServiceOptions {
   usage: UsageTracker;
   logger: Logger;
   eventMergeWindowMs: number;
+  /** Past this age a moment is no longer what the stream is talking about and is left unanswered. */
+  momentFreshnessMs?: number;
   contextRolloverTokens: number;
   /** Deadline for a single interaction. Must stay below the reaction context TTL; 0 disables. */
   interactionTimeoutMs?: number;
@@ -213,6 +215,8 @@ export class GeminiBrainService extends EventEmitter {
   private startPromise?: Promise<void>;
   private previousInteractionId?: string;
   private rolloverRequired = false;
+  /** Whether a decision is running. Moments arriving now merge into the next one, not a queue. */
+  private decisionInFlight = false;
   private sessionGeneration = 0;
   private chatCursor = 0;
   private pendingDeltas: BrainDynamicDelta[] = [];
@@ -307,6 +311,17 @@ export class GeminiBrainService extends EventEmitter {
   private flushPendingBurst(): void {
     const burst = this.pendingBurst;
     if (!burst) return;
+    // Decisions run one at a time, so anything flushed while one is in flight would simply wait
+    // behind it — and waiting is what produced replies a minute late: events arrived every five
+    // seconds against an eight-second call, and the queue grew for as long as the stream talked.
+    // Held open instead, the moments merge into one decision and the rate becomes whatever the
+    // model can actually keep up with. Nothing is discarded, and nothing is ever more than one
+    // call behind.
+    if (this.decisionInFlight) {
+      clearTimeout(burst.timer);
+      burst.timer = setTimeout(() => this.flushPendingBurst(), this.options.eventMergeWindowMs);
+      return;
+    }
     this.pendingBurst = undefined;
     clearTimeout(burst.timer);
     const event = mergeBrainEvents(burst.events);
@@ -331,7 +346,16 @@ export class GeminiBrainService extends EventEmitter {
   ): Promise<BrainDecision | undefined> {
     const queueGeneration = this.sessionGeneration;
     let result: BrainDecision | undefined;
-    const run = async (): Promise<void> => { result = await this.processEvent(event, burstEvents, emittedAt); };
+    const run = async (): Promise<void> => {
+      this.decisionInFlight = true;
+      try {
+        result = await this.processEvent(event, burstEvents, emittedAt);
+      } finally {
+        this.decisionInFlight = false;
+        // Whatever gathered while this ran is answered now, as one moment.
+        if (this.pendingBurst) this.flushPendingBurst();
+      }
+    };
     const queued = this.queueTail.then(run, run);
     this.queueTail = queued.catch((cause: unknown) => {
       if (queueGeneration === this.sessionGeneration) {
@@ -410,6 +434,18 @@ export class GeminiBrainService extends EventEmitter {
     // Media lifecycle is the only authority allowed to start a Brain session.
     // Events observed while Twitch is offline are persisted by perception but do not spend Brain tokens.
     if (this.status.state === 'OFFLINE') return undefined;
+    // Nothing is better than late. A reply written about a moment the stream has already left reads
+    // as not having watched — a remark about the driver's mirror once answered a question about
+    // which actor someone resembled — and noticing here costs nothing, while noticing after the
+    // decision means having paid for it.
+    const age = this.now() - event.timestamp;
+    const freshnessMs = this.options.momentFreshnessMs ?? 25_000;
+    if (freshnessMs > 0 && age > freshnessMs) {
+      this.logger.info('Moment passed before its turn came; no decision made', {
+        eventId: event.id, ageMs: age,
+      });
+      return undefined;
+    }
     if (this.startPromise) await this.startPromise;
     if (this.rolloverRequired) await this.rollover();
     const generation = this.sessionGeneration;

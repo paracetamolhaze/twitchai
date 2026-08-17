@@ -237,6 +237,7 @@ export class Application {
         eventMergeWindowMs: this.config.gemini.brainEventMergeWindowMs,
         contextRolloverTokens: this.config.gemini.brainContextRolloverTokens,
         interactionTimeoutMs: this.config.gemini.brainInteractionTimeoutMs,
+        momentFreshnessMs: this.config.gemini.momentFreshnessMs,
       });
     }
 

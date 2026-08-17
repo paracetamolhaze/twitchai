@@ -89,6 +89,9 @@ describe('Gemini 3.7 stateful Brain', () => {
       logger: new Logger('TEST', 'error'),
       eventMergeWindowMs: 0,
       contextRolloverTokens: 800_000,
+      // This case is about chaining, and its fixture timestamps are from 2023: every one of them
+      // would otherwise be a moment the stream had long since left.
+      momentFreshnessMs: 0,
     });
 
     await service.startStream();
@@ -255,6 +258,67 @@ describe('Gemini 3.7 stateful Brain', () => {
     const carried = JSON.parse(requests[3]!.input) as BrainBootstrap;
     expect(carried.previousSessionSummary).toContain('голубя');
     expect(service.getStatus().rollovers).toBe(1);
+  });
+
+  it('leaves a moment the stream has already left unanswered instead of paying for it', async () => {
+    // A reply about something the stream moved on from reads as not having watched, and noticing
+    // after the decision means having paid for it.
+    const requests: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        requests.push(structuredClone(request));
+        return {
+          id: `R${requests.length}`, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+        };
+      },
+    };
+    const service = brainService(client, { momentFreshnessMs: 10_000 });
+    await service.startStream();
+    await service.enqueueEvent({ ...firstEvent, id: 'stale', timestamp: Date.now() - 60_000 });
+    expect(requests.filter((request) => request.kind === 'decision')).toHaveLength(0);
+
+    await service.enqueueEvent({ ...firstEvent, id: 'fresh', timestamp: Date.now() });
+    expect(requests.filter((request) => request.kind === 'decision')).toHaveLength(1);
+  });
+
+  it('merges moments arriving during a decision instead of queueing them behind it', async () => {
+    // Events arrived every five seconds against an eight-second call and the queue grew for as long
+    // as the stream talked: one reply went out 75 seconds after the words it answered.
+    let release: (() => void) | undefined;
+    const decisions: BrainInteractionRequest[] = [];
+    const client: BrainInteractionClient = {
+      create: async (request) => {
+        if (request.kind === 'decision') {
+          decisions.push(structuredClone(request));
+          if (decisions.length === 1) await new Promise<void>((resolve) => { release = resolve; });
+        }
+        return {
+          id: `R${decisions.length + 1}`, status: 'completed',
+          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
+        };
+      },
+    };
+    const service = brainService(client, { eventMergeWindowMs: 10 });
+    await service.startStream();
+
+    const first = service.enqueueEvent({ ...firstEvent, id: 'a' });
+    await vi.waitFor(() => expect(decisions).toHaveLength(1));
+    // Three more moments while the first decision is still in flight.
+    const rest = [
+      service.enqueueEvent({ ...firstEvent, id: 'b' }),
+      service.enqueueEvent({ ...firstEvent, id: 'c' }),
+      service.enqueueEvent({ ...firstEvent, id: 'd' }),
+    ];
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(decisions).toHaveLength(1);
+
+    release?.();
+    await Promise.all([first, ...rest]);
+    // One more decision covering all three, not three waiting in line.
+    expect(decisions).toHaveLength(2);
   });
 
   it('queues an initial event that arrives while the one-time bootstrap is still running', async () => {
@@ -854,6 +918,9 @@ function brainService(
     logger: new Logger('TEST', 'error'),
     eventMergeWindowMs: 0,
     contextRolloverTokens: 800_000,
+    // Off unless a case is about freshness itself: these fixtures use a fixed timestamp from 2023,
+    // and every one of them would otherwise be a moment the stream had long left.
+    momentFreshnessMs: 0,
     ...overrides,
   });
 }
