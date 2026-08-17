@@ -106,6 +106,7 @@ export interface AppConfig {
     model: string;
     groqModel: string;
     windowMs: number;
+    overlapMs: number;
     language: string;
   };
   database: {
@@ -199,6 +200,7 @@ const envSchema = z.object({
   // How much audio goes in one request. An hour of audio is about ninety thousand tokens, three
   // cents, so windows exist to shape latency and request count rather than to save money.
   TRANSCRIPTION_WINDOW_SECONDS: z.coerce.number().int().min(4).max(30).default(12),
+  TRANSCRIPTION_OVERLAP_SECONDS: z.coerce.number().min(0).max(5).default(1.5),
   GROQ_API_KEY: z.string().trim().optional(),
   ORIGINAL_STREAM_LANGUAGE: z.string().trim().default('ru'),
   DATABASE_URL: z.string().trim().optional(),
@@ -358,6 +360,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       model: parsed.TRANSCRIPTION_MODEL,
       groqModel: parsed.TRANSCRIPTION_GROQ_MODEL,
       windowMs: parsed.TRANSCRIPTION_WINDOW_SECONDS * 1000,
+      overlapMs: Math.round(parsed.TRANSCRIPTION_OVERLAP_SECONDS * 1000),
       groqApiKey: parsed.GROQ_API_KEY,
       language: parsed.ORIGINAL_STREAM_LANGUAGE,
     },

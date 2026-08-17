@@ -312,6 +312,9 @@ export class Application {
         },
         onUsage: (usage) => this.usage.recordHearingUsage(usage),
         windowMs: this.config.transcription.windowMs,
+        overlapMs: this.config.transcription.overlapMs,
+        streamContext: () => this.contextStore.snapshot().streamContext,
+        currentScene: () => this.sceneWatcher?.currentScene(),
         onTranscript: (text, meta) => {
           // In shadow mode this is a measurement, not a source: both layers hear the same stream
           // and both write down what they heard, so they can be compared on one real run before

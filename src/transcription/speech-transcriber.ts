@@ -15,6 +15,10 @@ export interface SpeechTranscriberOptions {
    * its own loses against a session that listens continuously.
    */
   vocabulary?: () => string[];
+  /** What the stream is about, in the operator's own words. */
+  streamContext?: () => string;
+  /** What the watching layer last described, so a heard word can be matched to a seen thing. */
+  currentScene?: () => string | undefined;
   onTranscript: (text: string, meta: { audioMs: number; latencyMs: number }) => void | Promise<void>;
   /** Every attempt, transcript or not, so the bill is counted where it is actually incurred. */
   onUsage?: (usage: { costUsd?: number; audioSeconds: number; failed: boolean }) => void;
@@ -32,6 +36,15 @@ export interface SpeechTranscriberOptions {
   minSegmentMs?: number;
   /** How much audio goes in one request. Longer is cheaper per second and slower to arrive. */
   windowMs?: number;
+  /**
+   * Audio repeated from the end of the previous window.
+   *
+   * A window that closes on the clock rather than on a pause cuts a word in half, and both halves
+   * come back wrong: production windows ended "ты платишь там 300 баксов за" and the next began
+   * "вкусна. Хочется один раз попробовать". Overlapping costs a second of audio per window — a
+   * fraction of a cent an hour — and makes the word whole in at least one of them.
+   */
+  overlapMs?: number;
 }
 
 export interface SpeechTranscriberStats {
@@ -64,6 +77,11 @@ export class SpeechTranscriber {
   private readonly hangoverMs: number;
   private readonly minSegmentMs: number;
   private readonly windowMs: number;
+  private readonly overlapFrames: number;
+  /** Tail of the window just sent, prepended to the next one so a cut word survives somewhere. */
+  private overlap: Buffer[] = [];
+  /** The last few windows of text, for the hint and for spotting the words this stream repeats. */
+  private readonly recentTranscripts: string[] = [];
 
   private window: Buffer[] = [];
   private windowMsFilled = 0;
@@ -82,9 +100,13 @@ export class SpeechTranscriber {
   constructor(private readonly options: SpeechTranscriberOptions) {
     this.logger = options.logger.child('TRANSCRIPTION');
     this.audibleRms = options.audibleRms ?? 0.004;
-    this.hangoverMs = options.hangoverMs ?? 900;
     this.minSegmentMs = options.minSegmentMs ?? 600;
     this.windowMs = options.windowMs ?? 12_000;
+    this.overlapFrames = Math.max(0, Math.round((options.overlapMs ?? 1_500) / FRAME_MS));
+    // Shorter than the pause that ends a sentence, because the point is to cut at any gap at all
+    // rather than only at a deliberate one: in continuous conversation there is no 900ms silence
+    // inside twelve seconds, so every window closed on the clock and every stitch lost a word.
+    this.hangoverMs = options.hangoverMs ?? 450;
   }
 
   getStats(): SpeechTranscriberStats { return { ...this.stats }; }
@@ -105,6 +127,7 @@ export class SpeechTranscriber {
   }
 
   reset(): void {
+    this.overlap = [];
     this.window = [];
     this.windowMsFilled = 0;
     this.audibleMs = 0;
@@ -130,8 +153,10 @@ export class SpeechTranscriber {
   }
 
   private closeWindow(): void {
-    const pcm = Buffer.concat(this.window);
+    const frames = this.window;
+    const pcm = Buffer.concat([...this.overlap, ...frames]);
     const { audibleMs, windowMsFilled } = this;
+    this.overlap = this.overlapFrames > 0 ? frames.slice(-this.overlapFrames) : [];
     this.window = [];
     this.windowMsFilled = 0;
     this.audibleMs = 0;
@@ -154,13 +179,42 @@ export class SpeechTranscriber {
     void this.transcribe(pcm, windowMsFilled);
   }
 
+  /**
+   * What a listener would already know before hearing this window.
+   *
+   * Names alone were not enough: a stream about carrying a power bank around Shanghai produced
+   * "Парис" for a nickname, "Тайкофф", "по скрбе", and павербанк spelled two different ways in
+   * consecutive windows. Given the subject, what is on screen, and the words this conversation
+   * keeps using, those stop being guesses.
+   */
   private buildHint(): string {
     const names = (this.options.vocabulary?.() ?? []).filter(Boolean).slice(0, 40);
-    const previous = this.stats.lastTranscript?.slice(-200);
+    const previous = this.recentTranscripts.slice(-2).join(' ').slice(-300);
     return [
+      this.options.streamContext?.() ? `Stream: ${this.options.streamContext?.()}` : '',
+      this.options.currentScene?.() ? `On screen: ${this.options.currentScene?.()}` : '',
       names.length > 0 ? `Names: ${names.join(', ')}` : '',
-      previous ? `Previous line: ${previous}` : '',
-    ].filter(Boolean).join('. ');
+      this.recurringWords().length > 0 ? `Words this conversation keeps using: ${this.recurringWords().join(', ')}` : '',
+      previous ? `Said just before this: ${previous}` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  /**
+   * Words the last few minutes kept returning to, which is where the mishearing hurts most: a term
+   * the stream says ten times should not be spelled three ways.
+   */
+  private recurringWords(): string[] {
+    const counts = new Map<string, number>();
+    for (const line of this.recentTranscripts) {
+      for (const word of line.toLowerCase().match(/[\p{L}\p{N}-]{4,}/gu) ?? []) {
+        counts.set(word, (counts.get(word) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()]
+      .filter(([, count]) => count >= 3)
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 12)
+      .map(([word]) => word);
   }
 
   private async transcribe(pcm: Buffer, audioMs: number): Promise<void> {
@@ -180,6 +234,8 @@ export class SpeechTranscriber {
       if (!text) return;
       this.stats.transcriptsReceived += 1;
       this.stats.lastTranscript = text;
+      this.recentTranscripts.push(text);
+      if (this.recentTranscripts.length > 12) this.recentTranscripts.shift();
       this.stats.lastLatencyMs = latencyMs;
       await this.options.onTranscript(text, { audioMs, latencyMs });
     } catch (cause) {

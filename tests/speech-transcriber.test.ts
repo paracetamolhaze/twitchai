@@ -43,6 +43,43 @@ describe('SpeechTranscriber', () => {
     expect(instance.getStats().silenceSecondsSkipped).toBeGreaterThan(10);
   });
 
+  it('repeats the tail of the previous window so a word cut by the clock survives somewhere', async () => {
+    // A window closing on the clock rather than on a pause splits a word and both halves come back
+    // wrong: production ended one with "ты платишь там 300 баксов за" and began the next with
+    // "вкусна. Хочется один раз попробовать".
+    const sizes: number[] = [];
+    const { instance } = transcriber({
+      windowMs: 2_000,
+      overlapMs: 1_000,
+      backend: {
+        name: 'test',
+        transcribe: async (wav) => { sizes.push(wav.length); return { text: 'слышно' }; },
+      },
+    });
+    instance.acceptPcm(pcm(6_000, 0.2));
+    await vi.waitFor(() => expect(sizes.length).toBeGreaterThanOrEqual(2));
+    // 44 bytes of WAV header, then a second of carried audio on top of the two-second window.
+    const seconds = (bytes: number): number => (bytes - 44) / (SAMPLE_RATE * 2);
+    expect(seconds(sizes[0]!)).toBeCloseTo(2, 1);
+    expect(seconds(sizes[1]!)).toBeCloseTo(3, 1);
+  });
+
+  it('tells the listener what the stream is about and what is on screen', async () => {
+    // Names alone left "Парис" for a nickname and павербанк spelled two ways in consecutive
+    // windows. The subject and the picture are what a human listener would already have.
+    const { instance, hints } = transcriber({
+      streamContext: () => 'ИРЛ Шанхай, дота кэмп, едим',
+      currentScene: () => 'Мужчина держит павербанк над стабилизатором.',
+      vocabulary: () => ['gudini_younger'],
+    });
+    instance.acceptPcm(pcm(2_000, 0.2));
+    instance.acceptPcm(pcm(1_000, 0));
+    await vi.waitFor(() => expect(hints).toHaveLength(1));
+    expect(hints[0]).toContain('ИРЛ Шанхай');
+    expect(hints[0]).toContain('павербанк');
+    expect(hints[0]).toContain('gudini_younger');
+  });
+
   it('hears quiet speech under constant background instead of measuring the room first', async () => {
     // The adaptive floor this replaces measured the room and then measured the speech too: in a
     // restaurant with continuous conversation the quietest moment of any six-second window was
@@ -111,7 +148,7 @@ describe('SpeechTranscriber', () => {
     instance.acceptPcm(pcm(1_000, 0));
     await vi.waitFor(() => expect(usage).toHaveLength(1));
     expect(usage[0]).toMatchObject({ costUsd: 0.0004, failed: false });
-    // Two seconds of speech plus the pause that closed the window.
-    expect(usage[0]?.audioSeconds).toBeCloseTo(2.9, 2);
+    // Two seconds of speech plus the short pause that closed the window.
+    expect(usage[0]?.audioSeconds).toBeCloseTo(2.46, 2);
   });
 });
