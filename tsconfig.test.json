@@ -5,5 +5,14 @@
     "rootDir": ".",
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts"],
+  // KNOWN HOLE, deliberate for now: the base config excludes "tests", and exclude filters include
+  // rather than the other way round, so this project checks src twice here and has never checked a
+  // single test file. It surfaced when a required field was added to BrainBootstrap and two fixtures
+  // kept a field that no longer existed while `npm run typecheck` reported nothing.
+  //
+  // Dropping "tests" from exclude turns on 48 errors, 45 of which are old fixture debris — stub
+  // payloads missing fields added since, `as` casts onto SDK types, assignments to read-only
+  // properties on fake child processes. That is its own change, not a rider on a behaviour fix.
+  "exclude": ["node_modules", "dist", "tests"]
 }

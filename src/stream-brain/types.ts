@@ -34,6 +34,23 @@ export type StreamEventSource =
   /** Historic value, kept so events stored before the rename still read back. */
   | 'fallback-transcription';
 
+/**
+ * Who the speech in a moment was aimed at.
+ *
+ * `S:`/`O:` says who talked; it says nothing about who was being talked to, and on this channel
+ * that is the difference that matters. A measured stream had 173 of 206 transcripts containing `O:`
+ * — teammates on voice comms — and the synthesiser typed 56% of moments as `question`, so
+ * "вы где там, Артём?" and "СК норм?" reached the decision layer looking exactly like an opening
+ * for chat. An account answering those is talking over a conversation it is not part of.
+ *
+ * Three values because three are what a transcript can actually support. A person in the room and a
+ * teammate in Discord are the same class of listener here and cannot be told apart from words
+ * alone, so they are one value rather than two that would be guessed.
+ */
+export const SPEECH_AUDIENCES = ['twitch_chat', 'people_with_streamer', 'unclear'] as const;
+
+export type SpeechAudience = (typeof SPEECH_AUDIENCES)[number];
+
 export interface StreamEvent {
   id: string;
   timestamp: number;
@@ -48,6 +65,10 @@ export interface StreamEvent {
   confidence: number;
   source: StreamEventSource;
   directMentions: string[];
+  /** Who the words were addressed to, when anything was said. Absent for a purely visual moment. */
+  audience?: SpeechAudience;
+  /** How much the audience reading is worth. Perception guesses here and may be wrong. */
+  audienceConfidence?: number;
   /** Present only for chat-originated direct questions and follow-up threads. */
   viewerUsername?: string;
 }

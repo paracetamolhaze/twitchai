@@ -32,7 +32,8 @@ describe('what the brain is told about writing like a viewer', () => {
   it('counts feeling as reason enough, not only information', () => {
     // A rule requiring every message to add something the stream did not contain forbids laughing,
     // which is one of the most common real things in a chat.
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('it carries information, or it carries feeling');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('or it carries feeling');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('one alone is enough');
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('does not have to be witty or complete');
     expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain('earns its place only by adding something');
   });
@@ -105,10 +106,18 @@ describe('what the brain is told about writing like a viewer', () => {
   });
 
   it('stays short enough to be read as principles rather than skimmed as a rulebook', () => {
-    // It reached 11k characters by accretion. Whatever the ceiling should be, it is not that.
-    // Measured without the interpolated style rules, which are capped separately by their own count
-    // — sharing one budget meant a principle and a typing rule competed for the same room.
-    expect(BRAIN_SYSTEM_INSTRUCTION.length - REACTION_NATURALNESS_PROMPT.length).toBeLessThan(8_000);
+    // It reached 11k characters as a list of one-off prohibitions with a restaurant example each.
+    // The real guard against that is the no-bugfix-examples case below and the cap on style rules;
+    // this one only catches gross regression, so the number is deliberately loose and was raised
+    // once, when grounding, addressee and evaluator principles were added — three ideas the
+    // instruction genuinely did not contain before, not three more examples of an old one.
+    //
+    // Measured without the interpolated style rules, which have their own cap: sharing one budget
+    // meant a principle and a typing rule competed for the same room.
+    const instructionOnly = BRAIN_SYSTEM_INSTRUCTION.length - REACTION_NATURALNESS_PROMPT.length;
+    expect(instructionOnly).toBeLessThan(10_000);
+    // And it stays a set of principles rather than a growing enumeration.
+    expect(BRAIN_SYSTEM_INSTRUCTION.split('\n\n').length).toBeLessThanOrEqual(22);
   });
 
   it('keeps the mechanical rules apart from the judgement, and says each thing once', () => {
@@ -193,7 +202,8 @@ describe('what the live run showed', () => {
 
   it('lets a situational joke stand as a whole reaction with nothing factual in it', () => {
     // "в шанхае шаурму искать это сильно" adds no information and is exactly right.
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('it carries information, or it carries feeling');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('or it carries feeling');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('one alone is enough');
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('one alone is enough');
   });
 
@@ -202,6 +212,86 @@ describe('what the live run showed', () => {
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('a correction');
     expect(REACTION_NATURALNESS_PROMPT).toContain('A fragment, a single word, an emote, or nothing at all');
     expect(REACTION_NATURALNESS_PROMPT).toContain('Length follows the thought');
+  });
+});
+
+/**
+ * The second live run, on c926efa: 72 moments, 83 decisions, 11 messages. The laugh anchoring was
+ * gone; five messages failed in new ways. Each case below is one of those failures reduced to the
+ * layer it actually lived in — a payload shape, a perception label, or a stated principle.
+ */
+describe('what the second live run showed', () => {
+  it('separates what this session saw from what an earlier stream saw', () => {
+    // "доехали до компов наконец-то" arrived nine seconds after bootstrap, on a session whose only
+    // observation was a Dota draft screen. The bootstrap had handed it 25 events from a previous
+    // evening in a field called recentMeaningfulEvents, and it wrote the journey between them.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Only this session\'s own observations show what is happening');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('They never establish that anything happened in between');
+    expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain('recentMeaningfulEvents');
+  });
+
+  it('forbids an unobserved change of state without banning the words for one', () => {
+    // Arriving, returning, getting there at last: the rule is about evidence, not vocabulary, so it
+    // names the class and leaves the phrasing alone.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('write a change of state only if this session saw it or someone said it');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('no story leading up to it');
+  });
+
+  it('rejects a restatement with a verdict attached, by function and not by adjective', () => {
+    // "Топ-200 Китая это солидно" and "в шанхае шаурму искать это сильно" are the same construction:
+    // repeat the fact, grade it. No word is banned — солидно and сильно are ordinary Russian.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Repeating what was just said and adding a verdict to it');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('is a grade, not a reaction');
+    for (const word of ['солидно', 'сильно', 'мощно', 'не мудри']) {
+      expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain(word);
+      expect(REACTION_NATURALNESS_PROMPT).not.toContain(word);
+    }
+  });
+
+  it('asks a message to come from a point of view rather than to sound conversational', () => {
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('must come from somewhere in the person sending it');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('not whether it sounds conversational');
+  });
+
+  it('holds actionable advice to what the stream showed or the account knows', () => {
+    // "в настройках интерфейса галка на миникарту" — a confident menu path from an account whose
+    // profile has no such expertise, about an interface nobody on the stream could read.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('is a factual claim');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('On a weakTopic, an unknownTopic, or anything nothing supports, stay out');
+    // And hedging is not the escape hatch: an invented path is invented either way.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Do not soften a guess with "maybe"');
+  });
+
+  it('says a question mark is not an invitation and the audience decides', () => {
+    // "тут мы, смотрим" answered "Вы где там, Артём?" — a teammate being called, not the chat.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('not the question mark, is what decides whether a question was an opening');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('twitch_chat');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('people_with_streamer');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('unclear means perception could not tell');
+  });
+
+  it('still allows a factual answer from an account that genuinely knows the subject', () => {
+    // The rule is a grounding threshold, not a ban on being useful — an account with real expertise
+    // and a moment that supports it may answer plainly.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('what this stream has shown or from what that account genuinely knows');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('its expertise');
+  });
+
+  it('keeps the two accounts that spoke on a weak topic pointed away from it', () => {
+    // Both authors of the two worst live messages carry Dota as a weak topic, and one of them is
+    // told in its own style instructions not to play the analyst. The profile was never the problem.
+    for (const username of ['supercser2', 'novostro1ka']) {
+      const persona = generatePersonaV3(username);
+      const weak = persona.knowledge.weakTopics.join(' ').toLowerCase();
+      expect(weak).toContain('dota');
+      expect(persona.knowledge.expertise.join(' ').toLowerCase()).not.toContain('dota');
+    }
+  });
+
+  it('refuses a trait as a way of talking', () => {
+    // "Бери СК и не мудри" is not a catchphrase lifted from a profile; it is bluntness performed.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('The traits in a profile are not a way of talking');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Nobody talks in mottoes');
   });
 });
 

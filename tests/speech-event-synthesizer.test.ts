@@ -193,3 +193,59 @@ describe('SpeechEventSynthesizer', () => {
     expect(emitted).toHaveLength(0);
   });
 });
+
+/**
+ * Who the words were for.
+ *
+ * A measured stream had 173 of 206 transcripts containing "O:" — four people on voice comms — and
+ * 56% of moments typed as `question`, so a teammate being called reached the decision layer looking
+ * like an opening for chat. One account answered "Вы где там, Артём?" with "тут мы, смотрим".
+ */
+describe('who the speech was addressed to', () => {
+  const emit = async (speech: string) => {
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer();
+    instance.accept(speech);
+    await vi.advanceTimersByTimeAsync(45_000);
+    return emitted[0];
+  };
+
+  it('reads a question spoken only by someone other than the streamer as theirs to answer', async () => {
+    const asked = await emit('O: Лох ебаный, блядь. O: Вы где там, Артём?');
+    expect(asked?.audience).toBe('people_with_streamer');
+    expect(asked?.audienceConfidence).toBeGreaterThan(0.5);
+
+    const draft = await emit('O: в коре? Влад, да? Кто у тебя сигнатурки вообще? СК норм? СК?');
+    expect(draft?.audience).toBe('people_with_streamer');
+  });
+
+  it('claims the chat only when the chat is actually named', async () => {
+    for (const line of ['S: чат, кого брать?', 'S: ребят а вы бы что взяли', 'S: чатик что думаете']) {
+      const addressed = await emit(line);
+      expect(addressed?.audience).toBe('twitch_chat');
+      expect(addressed?.audienceConfidence).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
+  it('says it does not know rather than guessing, when the streamer is the one talking', async () => {
+    // The fact is real and the moment may be worth answering; who it was aimed at is simply not
+    // established, and a guess dressed as a fact is worse than an honest unclear.
+    const narrated = await emit('O: А, это китаец? S: Да, да. Топ-200 Китая, если что.');
+    expect(narrated?.audience).toBe('unclear');
+    expect(narrated?.audienceConfidence).toBeLessThan(0.8);
+  });
+
+  it('treats being named as the chat being addressed, whatever else was said', async () => {
+    const named = await emit('O: gigantiuz ты видел вообще?');
+    expect(named?.type).toBe('direct_mention');
+    expect(named?.audience).toBe('twitch_chat');
+  });
+
+  it('leaves a purely visual moment without an audience at all', async () => {
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer();
+    await vi.advanceTimersByTimeAsync(120_000);
+    instance.acceptScene('На экране меню выбора персонажей в Dota 2.', true);
+    expect(emitted[0]?.audience).toBeUndefined();
+  });
+});

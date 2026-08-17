@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import {
+  SPEECH_AUDIENCES,
   STREAM_EVENT_TYPES,
   StreamEvent,
   StreamEventCandidate,
@@ -18,6 +19,8 @@ const candidateSchema = z.object({
   confidence: z.coerce.number().finite().min(0).max(1),
   timestamp: z.coerce.number().finite().positive().optional(),
   directMentions: z.array(z.string().trim().min(1).max(50)).max(20).optional(),
+  audience: z.enum(SPEECH_AUDIENCES).optional(),
+  audienceConfidence: z.coerce.number().finite().min(0).max(1).optional(),
 }).strict();
 
 export interface EventDetectorOptions {
@@ -84,6 +87,16 @@ export class EventDetector {
       confidence: candidate.confidence,
       source: context.source ?? 'gemini-live',
       directMentions: [...directMentions],
+      // Being named is itself the strongest possible evidence of who was being addressed, and the
+      // matcher above may have found a name the synthesiser did not.
+      ...(directMentions.size > 0
+        ? { audience: 'twitch_chat' as const, audienceConfidence: 0.95 }
+        : {
+          ...(candidate.audience ? { audience: candidate.audience } : {}),
+          ...(candidate.audienceConfidence !== undefined
+            ? { audienceConfidence: candidate.audienceConfidence }
+            : {}),
+        }),
     };
   }
 

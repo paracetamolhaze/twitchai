@@ -69,7 +69,7 @@ describe('Live perception → stateful Brain → Twitch integration', () => {
       bootstrap: async () => ({
         channel: 'streamer', category: 'Dota 2', streamContext: 'ranked', startedAt: Date.now(),
         availableBots: ['gigantiuz'], personas: [personaContext.buildBrainSnapshot('gigantiuz', persona)],
-        globalMemories: [], recentMeaningfulEvents: [], recentChat: [],
+        globalMemories: [], currentSessionEvents: [], earlierStreamEvents: [], recentChat: [],
       }),
       prepareEvent: (streamEvent, chatAfter, emittedAt) =>
         coordinator.prepareBrainEvent(streamEvent, chatAfter, emittedAt),

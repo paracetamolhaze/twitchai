@@ -38,8 +38,22 @@ function bot(username: string, index: number): ReactionBotCandidate {
 
 type SenderResult = boolean | ((username: string, message: string) => boolean | Promise<boolean>);
 
-async function setup(senderResult: SenderResult = true, now: () => number = () => event.timestamp) {
+async function setup(
+  senderResult: SenderResult = true,
+  now: () => number = () => event.timestamp,
+  captureLogs = false,
+) {
   const sendResult = senderResult;
+  // Most cases here silence the logger; the ones asserting on what a decision records need to read
+  // it, and the log line is the only place the addressee and grounding classification appear.
+  const written: Array<Record<string, unknown>> = [];
+  if (captureLogs) {
+    vi.spyOn(console, 'log').mockImplementation((line: unknown) => {
+      if (typeof line === 'string') {
+        try { written.push(JSON.parse(line) as Record<string, unknown>); } catch { /* not ours */ }
+      }
+    });
+  }
   const repository = new MemoryRepository();
   await repository.initialize();
   const history = new BotHistory(repository);
@@ -86,7 +100,7 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
     personaRuntime,
     contextStore,
     usage,
-    logger: new Logger('TEST', 'error'),
+    logger: new Logger('TEST', captureLogs ? 'info' : 'error'),
     retrievalLimit: 4,
     candidates: () => candidates,
     contextTtlMs: 60_000,
@@ -96,6 +110,7 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
   });
   return {
     coordinator, globalMemory, history, policy, sent, usage, personaMemory,
+    logged: () => written,
     candidatesFor: (username: string) => candidates.find((candidate) => candidate.username === username)!,
     setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; },
     setObservesChat: (value: boolean) => { observesChat = value; },
@@ -599,6 +614,35 @@ describe('single-session reaction protocol', () => {
     // the backend had already cleared, and it never once told two of them apart.
     expect(JSON.stringify(states)).not.toContain('selectivity');
     await coordinator.stop();
+  });
+
+  it('carries the addressee and what was observable into the decision it logs', async () => {
+    // "тут мы, смотрим" answered a teammate being called by name, and "в настройках интерфейса галка
+    // на миникарту" invented a menu path. Neither is diagnosable after the fact unless the decision
+    // line says who perception thought was being addressed and what the moment actually contained.
+    const { coordinator, logged } = await setup(true, () => event.timestamp, true);
+    await coordinator.prepareBrainEvent({
+      ...event,
+      id: 'addressed-event',
+      type: 'question',
+      summary: 'O: Вы где там, Артём?',
+      speech: 'O: Вы где там, Артём?',
+      visualContext: 'Стример за монитором с приостановленной игрой.',
+      audience: 'people_with_streamer',
+      audienceConfidence: 0.8,
+    }, 0);
+    await coordinator.submitBatch({ eventId: 'addressed-event', reactions: [] });
+
+    const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated');
+    expect(decision).toMatchObject({
+      audience: 'people_with_streamer',
+      audienceConfidence: 0.8,
+      grounding: 'speech+scene',
+      selected: [],
+      eventType: 'question',
+    });
+    await coordinator.stop();
+    vi.restoreAllMocks();
   });
 
   it('notices a moment about what an account actually cares about, however choosy it is', async () => {

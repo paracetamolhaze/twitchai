@@ -28,7 +28,7 @@ function bootstrap(): BrainBootstrap {
       shortIdentity: `Постоянный зритель ${index + 1}`,
       character: `Характер ${index + 1}`,
       flaws: ['слишком долго терпит неудобные процессы'],
-      activityPattern: { chatFrequency: 'low', directReplyLikelihood: 0.8, eventSelectivity: 0.7 },
+      activityPattern: { chatFrequency: 'low', directReplyLikelihood: 0.8 },
       speechFingerprint: `Стиль речи ${index + 1}`,
       expertise: ['игры'],
       weakTopics: ['актуальная мета'],
@@ -41,7 +41,8 @@ function bootstrap(): BrainBootstrap {
       disclosureBoundaries: 'личное не раскрывать без прямого вопроса',
     })),
     globalMemories: [],
-    recentMeaningfulEvents: [],
+    currentSessionEvents: [],
+    earlierStreamEvents: [],
     recentChat: [],
   };
 }

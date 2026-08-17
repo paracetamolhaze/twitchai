@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ApiServer, createApiServer } from './api/server';
+import { partitionBootstrapEvents } from './brain/bootstrap-events';
 import { GeminiBrainService } from './brain/gemini-brain.service';
 import { GoogleInteractionsClient } from './brain/google-interactions.client';
 import { OpenRouterBrainClient } from './brain/openrouter-brain.client';
@@ -709,13 +710,20 @@ export class Application {
       .filter((candidate) => candidate.enabled && candidate.connectionState === 'CONNECTED' && candidate.chatConnected);
     const [globalMemories, recentEvents] = await Promise.all([
       this.globalMemory.startupSnapshot(snapshot.channel, this.config.globalMemory.snapshotLimit),
-      this.repository.listStreamEvents(50),
+      this.repository.listStreamEvents(80),
     ]);
+    const startedAt = this.usage.snapshot().currentStream.startedAt ?? Date.now();
+    // Two lists, not one, split on the session boundary. See partitionBootstrapEvents for why.
+    //
+    // The channel is not filterable here: a stored event carries a category but not the channel it
+    // came from, so the test channel's events do land in this query. They land in the background
+    // list, which is where a different evening's events belong anyway.
+    const events = partitionBootstrapEvents(recentEvents, startedAt);
     const bootstrap: BrainBootstrap = {
       channel: snapshot.channel,
       category: snapshot.category,
       streamContext: snapshot.streamContext,
-      startedAt: this.usage.snapshot().currentStream.startedAt ?? Date.now(),
+      startedAt,
       availableBots: availableCandidates.map((candidate) => candidate.username),
       personas: availableCandidates.map((candidate) => this.personaContext.buildBrainSnapshot(candidate.username, candidate.persona)),
       globalMemories: globalMemories.map((memory) => ({
@@ -725,11 +733,7 @@ export class Application {
         confidence: memory.confidence,
         entities: memory.entities,
       })),
-      recentMeaningfulEvents: recentEvents
-        .filter((event) => event.importance >= 0.6)
-        .slice(0, 25)
-        .reverse()
-        .map(({ id, timestamp, type, summary, importance }) => ({ id, timestamp, type, summary, importance })),
+      ...events,
       recentChat: snapshot.recentChat.slice(-40)
         .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
     };
@@ -738,7 +742,8 @@ export class Application {
       personas: bootstrap.personas.length,
       availableBots: bootstrap.availableBots.length,
       globalMemories: bootstrap.globalMemories.length,
-      recentEvents: bootstrap.recentMeaningfulEvents.length,
+      currentSessionEvents: bootstrap.currentSessionEvents.length,
+      earlierStreamEvents: bootstrap.earlierStreamEvents.length,
       characters: JSON.stringify(bootstrap).length,
     });
     return bootstrap;

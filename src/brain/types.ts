@@ -63,7 +63,25 @@ export interface BrainBootstrap {
     confidence: number;
     entities: string[];
   }>;
-  recentMeaningfulEvents: Array<Pick<StreamEvent, 'id' | 'timestamp' | 'type' | 'summary' | 'importance'>>;
+  /**
+   * What this session has already observed. Evidence: it happened, on this stream, tonight.
+   *
+   * Empty at the start of a stream and populated only on a rollover or recovery bootstrap, which is
+   * the whole point of separating it from the field below.
+   */
+  currentSessionEvents: Array<Pick<StreamEvent, 'id' | 'timestamp' | 'type' | 'summary' | 'importance'>>;
+  /**
+   * What happened on earlier streams. Background, never evidence.
+   *
+   * This used to be one field called recentMeaningfulEvents, read from the last 50 rows of
+   * stream_events with no filter on session, channel or age. At 20:35:38 a stream started, the
+   * bootstrap carried 25 events from a previous evening under that name, the first observation of
+   * the new session was a Dota draft screen, and nine seconds later an account wrote "доехали до
+   * компов наконец-то" — a journey nobody had seen, invented to bridge two states the payload
+   * presented as adjacent. Same data, honest label, and the instruction can now say what each one
+   * is worth.
+   */
+  earlierStreamEvents: Array<Pick<StreamEvent, 'id' | 'timestamp' | 'type' | 'summary' | 'importance'>>;
   /**
    * What the stream has been about so far, written by the session being replaced.
    *
@@ -261,8 +279,15 @@ export interface GeminiBrainStatus {
   sessionStartedAt?: number;
   interactionStartedAt?: number;
   previousInteractionId?: string;
+  /** Every call to the model, decisions plus bootstraps and session handovers. */
   interactions: number;
+  /**
+   * Calls that decided something: every observed moment plus every Persona Drive opportunity,
+   * whether or not a message came out. `decisions - silentDecisions` is the number that produced
+   * one, and must never be negative — it was, when a silent drive call counted below but not here.
+   */
   decisions: number;
+  /** Decisions that returned no message at all. A subset of `decisions`, never larger than it. */
   silentDecisions: number;
   generatedReactions: number;
   averageLatencyMs: number;

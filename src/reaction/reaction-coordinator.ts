@@ -280,6 +280,14 @@ export class ReactionCoordinator extends EventEmitter {
           importance: trigger.event.importance,
           eventAgeMs: this.now() - trigger.event.timestamp,
           allowedReactions: this.options.policy.maxReactionsFor(pending.candidateCount, trigger.event.importance),
+          // Who the speech was aimed at, and whether the account could have been grounded in
+          // anything at all. A message answering game comms or inventing a menu path is only
+          // diagnosable after the fact if the log says what perception thought it was hearing.
+          ...(trigger.event.audience ? { audience: trigger.event.audience } : {}),
+          ...(trigger.event.audienceConfidence !== undefined
+            ? { audienceConfidence: trigger.event.audienceConfidence }
+            : {}),
+          grounding: groundingOf(trigger.event),
         }
         : {}),
     });
@@ -854,6 +862,21 @@ export class ReactionCoordinator extends EventEmitter {
       reactions: trace.reactions.map((reaction) => ({ ...reaction })),
     } satisfies ReactionTraceRecord);
   }
+}
+
+/**
+ * What the account could have been standing on when it answered.
+ *
+ * Not a judgement of the message — that needs reading it — but the observable half: whether this
+ * moment carried words, a picture, or both. "в настройках интерфейса галка на миникарту" came from a
+ * moment with speech and no relevant expertise behind it, and nothing in the log said so.
+ */
+function groundingOf(event: StreamEvent): 'speech' | 'scene' | 'speech+scene' | 'none' {
+  const spoken = Boolean(event.speech);
+  const seen = Boolean(event.visualContext);
+  if (spoken && seen) return 'speech+scene';
+  if (spoken) return 'speech';
+  return seen ? 'scene' : 'none';
 }
 
 /**

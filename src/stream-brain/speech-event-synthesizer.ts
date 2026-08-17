@@ -1,6 +1,6 @@
 import { Logger } from '../logger';
 import { BotMentionMatcher } from '../shared/bot-mention-matcher';
-import { StreamEventCandidate } from './types';
+import { SpeechAudience, StreamEventCandidate } from './types';
 
 export interface SpeechEventSynthesizerOptions {
   /** Names that make a line worth answering immediately, whatever the pacing says. */
@@ -172,8 +172,16 @@ export class SpeechEventSynthesizer {
     if (!speech) return;
     this.lastEmittedAt = this.now();
     const mention = this.mentionsBot(speech);
+    const addressee = mention
+      ? { audience: 'twitch_chat' as const, audienceConfidence: 0.95 }
+      : audienceOf(speech);
     this.logger.info('Speech became a moment worth deciding on', {
-      reason, characters: speech.length, buffered, directMention: mention,
+      reason,
+      characters: speech.length,
+      buffered,
+      directMention: mention,
+      audience: addressee.audience,
+      audienceConfidence: addressee.audienceConfidence,
     });
     this.options.emit({
       type: mention ? 'direct_mention' : speechType(speech),
@@ -185,6 +193,7 @@ export class SpeechEventSynthesizer {
       importance: mention ? 0.85 : speechImportance(speech),
       // Heard, not inferred: the only uncertainty left is the transcription itself.
       confidence: 0.9,
+      ...addressee,
     });
   }
 
@@ -263,6 +272,38 @@ function speechImportance(speech: string): number {
  * that happens to contain one.
  */
 function invitesAnAnswer(speech: string): boolean {
-  if (/(?:^|\s)(?:чат|ребят|народ|парни|пацаны|guys|chat)/iu.test(speech)) return true;
+  if (ADDRESSES_CHAT.test(speech)) return true;
   return /[?？]/.test(speech) && speech.length <= 120;
+}
+
+/** The words that mean the chat itself is being spoken to, not whoever is in the room. */
+const ADDRESSES_CHAT = /(?:^|[^\p{L}])(?:чат|чатик|чатики|чатла|ребят|ребята|народ|парни|пацаны|зрител\p{L}*|guys|chat)(?![\p{L}])/iu;
+
+/** Someone in the conversation is named or spoken to: a vocative, or an invitation to a person. */
+const ADDRESSES_A_PERSON = /(?:^|[^\p{L}])(?:давай|пойд[её]м|иди|подожди|смотри|слышишь|ало|э[йё])(?![\p{L}])/iu;
+
+/**
+ * Who the words were meant for.
+ *
+ * Deliberately conservative and deliberately not a model call: this runs on every moment and its
+ * job is to stop one specific mistake, not to understand the room. The chat is only claimed when
+ * the chat is actually named. A question spoken entirely by someone other than the streamer is
+ * being asked of whoever they are playing with — that is where "тут мы, смотрим" came from, in
+ * answer to "Вы где там, Артём?". Everything else says so rather than guessing.
+ */
+function audienceOf(speech: string): { audience: SpeechAudience; audienceConfidence: number } {
+  if (ADDRESSES_CHAT.test(speech)) return { audience: 'twitch_chat', audienceConfidence: 0.9 };
+  const asksSomething = /[?？]/.test(speech);
+  const streamerSpoke = /(?:^|\s)S:/u.test(speech);
+  const otherSpoke = /(?:^|\s)O:/u.test(speech);
+  if (asksSomething && otherSpoke && !streamerSpoke) {
+    return { audience: 'people_with_streamer', audienceConfidence: 0.8 };
+  }
+  if (otherSpoke && !streamerSpoke && ADDRESSES_A_PERSON.test(speech)) {
+    return { audience: 'people_with_streamer', audienceConfidence: 0.6 };
+  }
+  // The streamer talking, or both of them, or nobody addressed in particular. A stream is watched,
+  // so this is not "nobody" — it is simply not established, and the decision layer is told that
+  // rather than being handed a guess dressed as a fact.
+  return { audience: 'unclear', audienceConfidence: asksSomething ? 0.5 : 0.4 };
 }

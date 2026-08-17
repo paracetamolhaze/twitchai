@@ -1678,7 +1678,7 @@ onBeforeUnmount(() => {
           <section class="panel metric-strip">
             <div><span>Событий распознано</span><strong>{{ usage.currentStream.perception.events }}</strong></div>
             <div><span>Решения Brain</span><strong>{{ overview.geminiBrain.decisions }}</strong></div>
-            <div><span>Осознанная тишина</span><strong>{{ overview.geminiBrain.silentDecisions }}</strong></div>
+            <div><span>Тишина / с ответом</span><strong>{{ overview.geminiBrain.silentDecisions }} / {{ overview.geminiBrain.decisions - overview.geminiBrain.silentDecisions }}</strong></div>
             <div><span>Создано / отправлено</span><strong>{{ overview.geminiBrain.generatedReactions }} / {{ usage.currentStream.sentResponses }}</strong></div>
             <div><span>Подтверждено в чате</span><strong>{{ usage.currentStream.confirmedDeliveries }}</strong></div>
             <div><span>Twitch не показал</span><strong>{{ usage.currentStream.undeliveredMessages }}</strong></div>
