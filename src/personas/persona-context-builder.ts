@@ -153,7 +153,7 @@ export class PersonaContextBuilder {
     const textFilter = modelTextFilter(persona);
     const safeText = (value: string): string => modelSafeText(value, textFilter);
     const safeTexts = (values: string[], limit: number): string[] => modelSafeTexts(values, limit, textFilter);
-    // Shape first, vocabulary second, signature phrases last and explicitly rare.
+    // Shape first, vocabulary second, signature phrases last, explicitly rare, and never twice.
     //
     // This used to be one blob that put "любимые формы" and six message examples next to the
     // statistics, and the model read the whole thing as a specification: the character came out
@@ -161,15 +161,25 @@ export class PersonaContextBuilder {
     // measurable properties are what actually distinguish people across an evening — how long they
     // type, whether they punctuate, how much slang and swearing they use — so those lead, and the
     // quotable material is named for what it is.
+    //
+    // Naming it was not enough on its own. A live run produced "ХА. Это ещё постараться надо" from
+    // an account whose canon carries laughStyles ["ХА","хех"] and whose first message example is
+    // "ХА. вот это учёт" — the same token arriving by three routes at once, since favourites are
+    // also copied verbatim into vocabulary by the persona factory. A short marker sitting in the
+    // payload is a marker that gets used, however it is labelled, so the literal laugh list is gone
+    // (the canon keeps it; this describes how the person laughs instead), the duplicate is removed
+    // from the vocabulary line, and examples that lead with a signature phrase are held back.
+    const favouriteExpressions = safeTexts(persona.speech.favoriteExpressions, 2);
+    const signatures = new Set(favouriteExpressions.map(normalizedPhrase));
     const speechParts = [
       `в среднем ${persona.speech.averageMessageWords} слов, обычно ${persona.behavior.verbosity.minWords}–${persona.behavior.verbosity.maxWords}`,
       persona.speech.punctuationStyle,
       persona.speech.capitalizationStyle,
       `сарказм ${persona.behavior.sarcasmLevel}, сленг ${persona.behavior.slangLevel}, мат ${persona.speech.profanityLevel}`,
-      `лексика: ${safeTexts(persona.speech.vocabulary, 6).join(', ')}`,
-      `изредка, далеко не в каждом сообщении: ${safeTexts(persona.speech.favoriteExpressions, 2).join(', ')}`,
-      `смеётся так, когда правда смешно: ${safeTexts(persona.speech.laughStyles, 2).join(', ')}`,
-      `как выглядят его сообщения в среднем, не что писать: ${selectDiverseExamples(persona.speech.messageExamples, 3, textFilter).join(' / ')}`,
+      `лексика: ${safeTexts(persona.speech.vocabulary.filter((word) => !signatures.has(normalizedPhrase(word))), 6).join(', ')}`,
+      `изредка, далеко не в каждом сообщении: ${favouriteExpressions.join(', ')}`,
+      laughTendency(persona),
+      `как выглядят его сообщения в среднем, не что писать: ${selectShapeExamples(persona, 3, textFilter).join(' / ')}`,
     ].filter(Boolean);
     return {
       username,
@@ -193,10 +203,14 @@ export class PersonaContextBuilder {
         persona.behavior.styleInstructions,
       ].join('; ')),
       flaws: safeTexts(persona.character.flaws, 4),
+      // eventSelectivity is deliberately absent. It stays in the canon and in the audit tooling,
+      // but as a number in the payload it read as a probability of staying quiet, and it arrived
+      // twice — here for the whole session, and again on every single event inside candidateStates.
+      // Four accounts averaging 0.79 answered five of thirty-one moments. chatFrequency says the
+      // same thing about a person qualitatively without doubling as a second cooldown.
       activityPattern: {
         chatFrequency: persona.behavior.activity.chatFrequency,
         directReplyLikelihood: persona.behavior.activity.directReplyLikelihood,
-        eventSelectivity: persona.behavior.activity.eventSelectivity,
         preferredEventTypes: persona.behavior.activity.preferredEventTypes.slice(0, 8),
         ignoredEventTypes: persona.behavior.activity.ignoredEventTypes.slice(0, 8),
       },
@@ -524,6 +538,78 @@ function canonDocuments(persona: BotPersona): CanonDocument[] {
 }
 
 /**
+ * The examples that show how a person types, chosen so they do not double as a phrasebook.
+ *
+ * Diversity alone was not enough. Authors put the signature line first — "на складе бы не приняли",
+ * "ссылка не ведёт", "это в смету не входило" — and the greedy pass always keeps the first survivor,
+ * so the most quotable line in the profile was guaranteed a slot, and the second pick often landed
+ * on a laugh opener ("ХА. вот это учёт", "АХА кабель победил"). Across the four accounts in one live
+ * run, two of the three examples shown were signature lines. They go to the back of the pool now,
+ * used only when there is nothing else, so what the model sees first is length, rhythm, punctuation
+ * and register — the things that actually differ between people.
+ */
+function selectShapeExamples(persona: BotPersona, limit: number, filter: ModelTextFilter): string[] {
+  const ordinary: string[] = [];
+  const signature: string[] = [];
+  for (const example of persona.speech.messageExamples) {
+    (leadsWithSignature(example, persona) ? signature : ordinary).push(example);
+  }
+  const picked = selectDiverseExamples(ordinary, limit, filter);
+  return picked.length >= limit
+    ? picked
+    : [...picked, ...selectDiverseExamples(signature, limit - picked.length, filter)];
+}
+
+/**
+ * Whether an example opens with the character's own catchphrase, laugh or opener — anything the
+ * model can lift whole and paste in front of an unrelated thought.
+ */
+function leadsWithSignature(example: string, persona: BotPersona): boolean {
+  const value = example.trim();
+  if (!value) return false;
+  if (LAUGH_OPENING.test(value)) return true;
+  return [
+    ...persona.speech.laughStyles,
+    ...persona.speech.favoriteExpressions,
+    ...persona.speech.rareExpressions,
+    ...persona.speech.openingPatterns,
+  ]
+    .map((marker) => marker.trim())
+    .filter(Boolean)
+    .some((marker) => new RegExp(`^${escapeRegExp(marker)}(?![\\p{L}\\p{N}])`, 'iu').test(value));
+}
+
+/** "ХА." / "АХА " / "ахах," — a laugh in any spelling, at the very front of a line. */
+const LAUGH_OPENING = /^[аa]*[хx](?:[аaеeиiя]+[хx]?)+(?![\p{L}\p{N}])/iu;
+
+/**
+ * How this person laughs, said rather than quoted.
+ *
+ * The canon keeps the literal forms; the generation payload must not, because a two-character token
+ * labelled "смеётся так" is still a two-character token available for pasting, and that is exactly
+ * what "ХА. Это ещё постараться надо" was. Derived from the canon so it still varies per character:
+ * length says whether the laugh is clipped or drawn out, and shouting it is its own trait.
+ */
+function laughTendency(persona: BotPersona): string {
+  const laughs = persona.speech.laughStyles.map((laugh) => laugh.trim()).filter(Boolean);
+  if (laughs.length === 0) return 'смех в чате почти не показывает';
+  const hasWords = laughs.some((laugh) => /\p{L}/u.test(laugh));
+  if (!hasWords) return 'вместо смеха ставит скобку или знак';
+  const longest = Math.max(...laughs.map((laugh) => laugh.length));
+  const shouts = laughs.some((laugh) => laugh.length > 1 && /\p{Lu}/u.test(laugh) && laugh === laugh.toUpperCase());
+  const base = longest <= 2
+    ? 'смеётся почти незаметно, одной короткой отметкой'
+    : longest <= 4
+      ? 'смеётся коротко и сухо, не растягивая'
+      : 'смеётся открыто, иногда в голос';
+  return shouts ? `${base}; когда правда смешно, делает это громко` : base;
+}
+
+function normalizedPhrase(value: string): string { return value.trim().toLowerCase(); }
+
+function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+/**
  * Picks style examples that differ from each other rather than the first N that survive filtering.
  * A persona authors ~16 examples spanning distinct situations (a game read, a dry technical aside,
  * a personal deflection, a joke), but they are grouped by situation in the source, so taking the
@@ -532,6 +618,7 @@ function canonDocuments(persona: BotPersona): CanonDocument[] {
  * the fewest words with everything already picked. Deterministic — no randomness.
  */
 function selectDiverseExamples(examples: string[], limit: number, filter: ModelTextFilter): string[] {
+  if (limit <= 0) return [];
   const pool = examples
     .map((example) => modelSafeText(example, filter))
     .filter(Boolean)

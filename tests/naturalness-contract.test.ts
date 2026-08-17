@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { BRAIN_SYSTEM_INSTRUCTION } from '../src/brain/gemini-brain.service';
+import { generatePersonaV3 } from '../src/personas/generator-v3';
+import { PersonaContextBuilder } from '../src/personas/persona-context-builder';
+import { PersonaMemory } from '../src/personas/persona-memory';
+import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
+import { MemoryRepository } from '../src/persistence/memory-repository';
 import { REACTION_NATURALNESS_INSTRUCTIONS, REACTION_NATURALNESS_PROMPT } from '../src/reaction/natural-writing-policy';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
+
+const snapshotBuilder = new PersonaContextBuilder(
+  new PersonaMemory(new MemoryRepository(), { now: () => 1_700_000_000_000 }),
+  new PersonaRuntimeStore(() => 1_700_000_000_000),
+);
 
 /**
  * What the decision layer is told, asserted as a contract.
@@ -15,25 +25,48 @@ describe('what the brain is told about writing like a viewer', () => {
   it('puts the moment before the person, and never the person before the line', () => {
     // The failure this prevents: reaching for a personality and producing a line that displays it.
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Decide in this order');
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('is there a reason for anyone to answer this moment');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('whether anyone watching would have a reaction to it');
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Never work the other way round');
   });
 
   it('counts feeling as reason enough, not only information', () => {
     // A rule requiring every message to add something the stream did not contain forbids laughing,
     // which is one of the most common real things in a chat.
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('information or by carrying feeling');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('it carries information, or it carries feeling');
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('does not have to be witty or complete');
     expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain('earns its place only by adding something');
   });
 
   it('treats silence as the ordinary outcome for every account, including on a quiet chat', () => {
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Silence is the normal answer to most moments');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('reactions: [] is a complete answer');
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('silence here is frequent and correct');
     // The framing that produced filler: a supplied opportunity read as an obligation.
     for (const removed of ['turn to speak, not a question of whether to', 'quiet is the failure', 'never as the safe default']) {
       expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain(removed);
     }
+  });
+
+  it('does not make a moment earn the right to be reacted to', () => {
+    // The overcorrection the first rewrite produced: silence was framed as needing no reason and a
+    // message as needing one, so five of thirty-one moments got an answer over ten live minutes.
+    // Ordinary chat is mostly unremarkable and that is not a defect in it.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('not whether the moment was special enough to deserve it');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('allowed to be small, obvious and unremarkable');
+  });
+
+  it('forbids filler by where the message came from, not by how small it is', () => {
+    // Both failures produce a short line. The difference is whether the moment or the empty chat
+    // came first, and that is the only thing the instruction is allowed to test on.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('because the chat looked empty and something had to go in it');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('whether the moment came first');
+  });
+
+  it('never lets a candidate state read as an instruction to stay quiet', () => {
+    // candidateStates used to carry a raw eventSelectivity next to the fit signal — 0.96 for one of
+    // the live accounts — which is a second cooldown applied to a candidate the backend had already
+    // cleared. Fit may argue for speaking; nothing in that block may argue against it.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('never as a reason for everyone to stay quiet');
+    expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain('how selective they are');
   });
 
   it('refuses having been quiet as a reason to be chosen', () => {
@@ -73,7 +106,9 @@ describe('what the brain is told about writing like a viewer', () => {
 
   it('stays short enough to be read as principles rather than skimmed as a rulebook', () => {
     // It reached 11k characters by accretion. Whatever the ceiling should be, it is not that.
-    expect(BRAIN_SYSTEM_INSTRUCTION.length).toBeLessThan(8_000);
+    // Measured without the interpolated style rules, which are capped separately by their own count
+    // — sharing one budget meant a principle and a typing rule competed for the same room.
+    expect(BRAIN_SYSTEM_INSTRUCTION.length - REACTION_NATURALNESS_PROMPT.length).toBeLessThan(8_000);
   });
 
   it('keeps the mechanical rules apart from the judgement, and says each thing once', () => {
@@ -91,6 +126,82 @@ describe('what the brain is told about writing like a viewer', () => {
     // "ахахахах", "не", "??????" are ordinary chat and must not be ruled out by construction.
     expect(REACTION_NATURALNESS_PROMPT).toContain('A fragment, a single word, an emote, or nothing at all');
     expect(REACTION_NATURALNESS_PROMPT).toContain('never force a greeting, a complete sentence, a question or a joke');
+  });
+});
+
+/**
+ * Cases taken from a ten-minute live run on a real channel: four connected accounts, thirty-one
+ * moments, five messages. Two of those messages were the target quality ("в шанхае шаурму искать
+ * это сильно", "Баранина"); one opened with a canonical laugh token lifted out of its own profile.
+ *
+ * None of these assert an exact generated string — generation is probabilistic and pinning its
+ * output would be a test of the sampler. They assert what the layers underneath hand it, which is
+ * where each of these failures actually lived.
+ */
+describe('what the live run showed', () => {
+  it('does not hand the model a literal laugh token to paste in front of a thought', () => {
+    // "ХА. Это ещё постараться надо" — canon has laughStyles ["ХА","хех"] and a message example
+    // "ХА. вот это учёт", so the same two characters arrived twice and came back as a prefix.
+    const persona = generatePersonaV3('supercser2');
+    expect(persona.speech.laughStyles).toContain('ХА');
+
+    const fingerprint = snapshotBuilder.buildBrainSnapshot('supercser2', persona).speechFingerprint;
+    expect(fingerprint).not.toContain('ХА');
+    expect(fingerprint).not.toContain('хех');
+    // The tendency survives; only the quotable form is gone.
+    expect(fingerprint).toContain('смеётся');
+  });
+
+  it('keeps every account free of a signature phrase in its own examples', () => {
+    // The greedy diverse pick always kept the first survivor, and authors write the catchphrase
+    // first, so the most anchoring line in a profile was guaranteed a slot for every character.
+    for (const username of ['supercser2', 'gigantiuz', 'novostro1ka', '404notf0und404']) {
+      const persona = generatePersonaV3(username);
+      const shown = snapshotBuilder.buildBrainSnapshot(username, persona).speechFingerprint
+        .split('как выглядят его сообщения в среднем, не что писать: ')[1] ?? '';
+      expect(shown).not.toBe('');
+      for (const example of shown.split(' / ')) {
+        for (const marker of [...persona.speech.laughStyles, ...persona.speech.favoriteExpressions]) {
+          expect(example.toLowerCase().startsWith(marker.toLowerCase())).toBe(false);
+        }
+      }
+    }
+  });
+
+  it('does not duplicate a signature phrase into the ordinary vocabulary line', () => {
+    // The persona factory builds vocabulary as favourites ∪ fillers ∪ abbreviations, so a phrase
+    // labelled "изредка" was also listed as everyday vocabulary a line earlier.
+    const persona = generatePersonaV3('supercser2');
+    const fingerprint = snapshotBuilder.buildBrainSnapshot('supercser2', persona).speechFingerprint;
+    const vocabulary = fingerprint.split('лексика: ')[1]?.split(';')[0] ?? '';
+    for (const favourite of persona.speech.favoriteExpressions) {
+      expect(vocabulary).not.toContain(favourite);
+    }
+  });
+
+  it('sends no numeric selectivity anywhere the model can read it', () => {
+    // Canon keeps it; the payload must not. 0.96 next to a cooldown the backend already applied is
+    // the same refusal counted twice.
+    const persona = generatePersonaV3('404notf0und404');
+    expect(persona.behavior.activity.eventSelectivity).toBeGreaterThan(0.9);
+    const serialized = JSON.stringify(snapshotBuilder.buildBrainSnapshot('404notf0und404', persona));
+    expect(serialized).not.toContain('eventSelectivity');
+    expect(serialized).not.toContain(String(persona.behavior.activity.eventSelectivity));
+    // What replaces it is the same trait said in words.
+    expect(serialized).toContain('very-low');
+  });
+
+  it('lets a situational joke stand as a whole reaction with nothing factual in it', () => {
+    // "в шанхае шаурму искать это сильно" adds no information and is exactly right.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('it carries information, or it carries feeling');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('one alone is enough');
+  });
+
+  it('allows a one-word correction and does not ask for it to be explained', () => {
+    // "Баранина" and "баранина это, свинина pork" — a correction is complete at one word.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('a correction');
+    expect(REACTION_NATURALNESS_PROMPT).toContain('A fragment, a single word, an emote, or nothing at all');
+    expect(REACTION_NATURALNESS_PROMPT).toContain('Length follows the thought');
   });
 });
 

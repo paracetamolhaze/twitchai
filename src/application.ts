@@ -551,6 +551,7 @@ export class Application {
     this.mediaOfflineGraceTimer = undefined;
     this.mediaOfflineGraceState = undefined;
     await this.api?.stop();
+    this.coordinator?.logSessionSummary('shutdown');
     await this.coordinator?.stop();
     await this.memory.stop();
     this.transcriber?.flush();
@@ -633,6 +634,7 @@ export class Application {
           this.mediaStreaming = false;
           this.brainSessionReady = Promise.resolve();
           this.coordinator.clearPendingContexts();
+          this.coordinator.logSessionSummary(finalState === 'OFFLINE' ? 'stream_ended' : 'stream_interrupted');
           this.personaDrive?.stop();
           this.sceneWatcher?.stop();
           void this.geminiBrain?.stopStream();
@@ -1124,6 +1126,7 @@ export class Application {
         }
         this.mediaStreaming = false;
         this.coordinator.clearPendingContexts();
+        this.coordinator.logSessionSummary('stopped_by_operator');
         this.clearTranscriptAccumulator();
         await this.perception.reconfigureMedia('', this.config.stream.visionFps);
         await this.geminiBrain?.stopStream();

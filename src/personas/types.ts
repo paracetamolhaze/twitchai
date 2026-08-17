@@ -190,7 +190,19 @@ export interface PersonaImperfections {
 export interface PersonaActivityPattern {
   chatFrequency: 'very-low' | 'low' | 'medium' | 'high';
   directReplyLikelihood: number;
+  /**
+   * Canon and audit only; deliberately not in the generation payload. A number the model is shown
+   * is a number it obeys, and a catalogue averaging 0.73 stacked on top of a cooldown the backend
+   * had already enforced meant a moment could be refused twice for the same reason. chatFrequency
+   * says how talkative a person is without reading as a per-event probability of silence.
+   */
   eventSelectivity: number;
+  /**
+   * Free-text labels the catalogue authors chose ('football', 'gossip', 'dota-analysis'), not
+   * StreamEventType values, so they line up with an emitted event type only by coincidence. The
+   * fit signal that actually fires is a topical match against interests and expertise; see
+   * `attentionFor` in the reaction coordinator.
+   */
   preferredEventTypes: string[];
   ignoredEventTypes: string[];
   /** @deprecated Retained only to read existing v3 persona records; reaction scheduling ignores it. */
@@ -205,8 +217,8 @@ export interface PersonaBehavior {
    * live path: one Brain call decides for every account at once, so a per-persona temperature or
    * emoji probability has nowhere to apply, and a probability the model is merely shown is a
    * probability it ignores. What actually shapes behaviour is minimumIntervalMs (enforced by the
-   * policy guard), activity.eventSelectivity and activity.preferred/ignoredEventTypes (turned into
-   * candidate fit), and the speech statistics in the generation snapshot.
+   * policy guard), activity.chatFrequency, the topical fit derived from interests and expertise,
+   * and the speech statistics in the generation snapshot.
    */
   reactionProbability: number;
   uppercaseProbability: number;

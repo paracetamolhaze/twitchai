@@ -21,10 +21,14 @@ export interface BrainPersonaSnapshot {
   character: string;
   /** Character's own weaknesses and rough edges — the model should let these show, not smooth them over. */
   flaws: string[];
+  /**
+   * eventSelectivity is deliberately not here. It remains canon and remains in the audit tooling,
+   * but a bare 0.82 in the payload reads as a standing instruction to stay quiet, and it used to
+   * arrive here and again on every event. chatFrequency carries the same trait qualitatively.
+   */
   activityPattern: {
     chatFrequency: 'very-low' | 'low' | 'medium' | 'high';
     directReplyLikelihood: number;
-    eventSelectivity: number;
     preferredEventTypes?: string[];
     ignoredEventTypes?: string[];
   };
@@ -125,13 +129,15 @@ export interface BrainEventInput {
     engagement: number;
     sessionMessageCount: number;
     /**
-     * Whether this kind of moment is one they usually pay attention to, taken from their own
+     * Whether this particular moment is one they would pay attention to, taken from their own
      * profile rather than from how long they have been quiet. Fit is a reason to speak; a turn in
      * a rotation is not, and the instruction that replaced this used to say the opposite.
+     *
+     * Only ever a reason to speak. There is no numeric selectivity beside it any more: the two
+     * together meant a candidate arrived carrying both "this is not your kind of moment" and "you
+     * skip most moments anyway", on top of a cooldown the backend had already applied.
      */
     attention: 'notices' | 'passes over' | 'no strong pattern';
-    /** How choosy they are in general: high means most moments are not for them. */
-    selectivity: number;
   }>;
   /**
    * What is known about this streamer that bears on this particular moment, looked up by the words

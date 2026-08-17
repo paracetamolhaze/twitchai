@@ -6,7 +6,7 @@ import { ReactionMemory } from '../learning/reaction-memory';
 import { GlobalStreamerMemory } from '../global-memory/global-streamer-memory';
 import { BotHistory } from '../personas/bot-history';
 import { PersonaContextBuilder } from '../personas/persona-context-builder';
-import { PersonaMemory } from '../personas/persona-memory';
+import { PersonaMemory, relevanceScore, semanticTokens } from '../personas/persona-memory';
 import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
 import { ContextStore } from '../stream-brain/context-store';
 import { StreamEvent } from '../stream-brain/types';
@@ -82,6 +82,32 @@ interface PendingContext {
   timer: NodeJS.Timeout;
 }
 
+/**
+ * Running totals for one stream, so a finished session can be read as a few numbers instead of
+ * four hundred log lines. Everything here is a count of something the decision path already does;
+ * none of it changes behaviour.
+ */
+interface SessionDecisionStats {
+  events: number;
+  eventsWithoutCandidate: number;
+  eligibleSum: number;
+  candidateSum: number;
+  excludedByCooldown: number;
+  decisions: number;
+  silentDecisions: number;
+  selectedReactions: number;
+  rejectedReactions: number;
+  attention: Record<'notices' | 'passes over' | 'no strong pattern', number>;
+}
+
+function emptySessionStats(): SessionDecisionStats {
+  return {
+    events: 0, eventsWithoutCandidate: 0, eligibleSum: 0, candidateSum: 0, excludedByCooldown: 0,
+    decisions: 0, silentDecisions: 0, selectedReactions: 0, rejectedReactions: 0,
+    attention: { notices: 0, 'passes over': 0, 'no strong pattern': 0 },
+  };
+}
+
 const batchEnvelopeSchema = z.object({
   eventId: z.string().trim().min(1).max(100),
   reactions: z.array(z.unknown()).max(REACTION_BATCH_PROTOCOL_MAX_ITEMS),
@@ -100,6 +126,7 @@ export class ReactionCoordinator extends EventEmitter {
   private readonly pendingDeliveries = new Map<string, PendingDelivery>();
   private readonly deliveryEchoTimeoutMs: number;
   private readonly traces = new Map<string, ReactionTraceRecord>();
+  private session = emptySessionStats();
   private stopped = false;
 
   constructor(private readonly options: ReactionCoordinatorOptions) {
@@ -157,10 +184,15 @@ export class ReactionCoordinator extends EventEmitter {
         terminalReason: 'gemini_selected_silence',
         ...(selectedTrace ? { timing: { ...selectedTrace.timing, decisionAt, completedAt: decisionAt } } : {}),
       });
-      this.emitDecision({
+      const silentDecision: ReactionDecisionRecord = {
         eventId: parsed.eventId, timestamp: decisionAt, selected: [], rejected: itemRejections,
         candidateCount: pending.candidateCount, silentCandidateCount: pending.candidateCount,
-      });
+      };
+      this.emitDecision(silentDecision);
+      // Silence used to leave no line at all, so the only evidence a moment had been considered
+      // and passed over was a trace stage; reading a quiet stream meant reconstructing it from
+      // outcome codes. A deliberate silence is a decision and gets the same line as any other.
+      this.logDecision(pending, silentDecision);
       return { eventId: parsed.eventId, accepted: [], rejected: itemRejections };
     }
 
@@ -212,12 +244,27 @@ export class ReactionCoordinator extends EventEmitter {
       silentCandidateCount: Math.max(0, pending.candidateCount - parsed.reactions.length),
     };
     this.emitDecision(decision);
-    // One line that answers "why did this moment produce what it produced" without exposing the
-    // model's private reasoning: what kind of trigger it was, who could have spoken, who did, how
-    // many stayed silent, whether anything was thrown away, and how old the moment was by then.
-    const trigger = pending.trigger;
-    this.logger.info('Gemini reaction batch validated', {
+    this.logDecision(pending, decision);
+    return {
       eventId: parsed.eventId,
+      accepted: result.accepted.map((plan) => ({ username: plan.bot.username, delayMs: plan.delayMs })),
+      rejected: allRejections,
+    };
+  }
+
+  /**
+   * One line that answers "why did this moment produce what it produced" without exposing the
+   * model's private reasoning: what kind of trigger it was, who could have spoken, who did, how
+   * many stayed silent, whether anything was thrown away, and how old the moment was by then.
+   */
+  private logDecision(pending: PendingContext, decision: ReactionDecisionRecord): void {
+    const trigger = pending.trigger;
+    this.session.decisions += 1;
+    this.session.selectedReactions += decision.selected.length;
+    this.session.rejectedReactions += decision.rejected.length;
+    if (decision.selected.length === 0) this.session.silentDecisions += 1;
+    this.logger.info('Gemini reaction batch validated', {
+      eventId: decision.eventId,
       triggerKind: trigger.kind,
       candidates: pending.candidateCount,
       selected: decision.selected.map((item) => item.username),
@@ -228,6 +275,7 @@ export class ReactionCoordinator extends EventEmitter {
         : {}),
       ...(trigger.kind === 'stream_event'
         ? {
+          eventType: trigger.event.type,
           directMention: trigger.event.directMentions.length > 0,
           importance: trigger.event.importance,
           eventAgeMs: this.now() - trigger.event.timestamp,
@@ -235,11 +283,44 @@ export class ReactionCoordinator extends EventEmitter {
         }
         : {}),
     });
-    return {
-      eventId: parsed.eventId,
-      accepted: result.accepted.map((plan) => ({ username: plan.bot.username, delayMs: plan.delayMs })),
-      rejected: allRejections,
-    };
+  }
+
+  /**
+   * The whole session as one line, emitted when a stream ends.
+   *
+   * Reading the last run meant pulling five hundred log lines and counting by hand to find that
+   * thirty-one moments had produced five messages. These are the numbers that answer why: how many
+   * moments there were, how many accounts each one could actually have used, what the cooldown took
+   * away before anyone decided, and how the decisions split between speaking and silence.
+   */
+  logSessionSummary(reason: string): void {
+    const stats = this.session;
+    const drive = this.options.usage.snapshot().currentStream.drive;
+    this.session = emptySessionStats();
+    if (stats.events === 0 && stats.decisions === 0) return;
+    const average = (total: number, count: number): number =>
+      (count === 0 ? 0 : Number((total / count).toFixed(2)));
+    this.logger.info('Stream decision summary', {
+      reason,
+      events: stats.events,
+      eventsWithoutCandidate: stats.eventsWithoutCandidate,
+      averageEligible: average(stats.eligibleSum, stats.events),
+      averageCandidates: average(stats.candidateSum, stats.events),
+      excludedByCooldown: stats.excludedByCooldown,
+      decisions: stats.decisions,
+      silentDecisions: stats.silentDecisions,
+      selectedReactions: stats.selectedReactions,
+      rejectedReactions: stats.rejectedReactions,
+      attentionNotices: stats.attention.notices,
+      attentionPassesOver: stats.attention['passes over'],
+      attentionNoPattern: stats.attention['no strong pattern'],
+      driveTicks: drive.ticks,
+      driveEligibleTicks: drive.eligibleTicks,
+      driveLocalSkips: drive.localSkips,
+      driveBrainCalls: drive.brainCalls,
+      driveSilentDecisions: drive.silentDecisions,
+      driveMessages: drive.messages,
+    });
   }
 
   clearPendingContexts(): void {
@@ -303,6 +384,10 @@ export class ReactionCoordinator extends EventEmitter {
     const directTargetUnavailable = [...directTargets]
       .filter((username) => !candidates.some((candidate) => candidate.username.toLowerCase() === username))
       .map((username) => ({ username, reason: directTargetUnavailableReason(username, allCandidates) }));
+    this.session.events += 1;
+    this.session.eligibleSum += eligibleCandidates.length;
+    this.session.candidateSum += candidates.length;
+    this.session.excludedByCooldown += Math.max(0, named.length - candidates.length);
     const trace: ReactionTraceRecord = {
       eventId: event.id,
       timestamp: event.timestamp,
@@ -334,6 +419,7 @@ export class ReactionCoordinator extends EventEmitter {
     // availableBots and skips the call entirely, instead of paying for a decision that could only
     // be silence and then reporting it as an expired context 45 seconds later.
     if (candidates.length === 0) {
+      this.session.eventsWithoutCandidate += 1;
       this.updateTrace(event.id, {
         stage: 'STOPPED',
         outcome: 'FAILED',
@@ -444,7 +530,8 @@ export class ReactionCoordinator extends EventEmitter {
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
       candidateStates: candidates.map((candidate) => {
         const state = this.options.personaRuntime.get(candidate.persona.id);
-        const activity = candidate.persona.behavior.activity;
+        const attention = attentionFor(candidate.persona, event);
+        this.session.attention[attention] += 1;
         return {
           username: candidate.username,
           mood: state.mood,
@@ -454,12 +541,7 @@ export class ReactionCoordinator extends EventEmitter {
           // an account which had been quiet was the stronger choice, which is a rotation wearing
           // the clothes of a judgement: a moment nobody cares about does not become interesting
           // because it is somebody's turn.
-          attention: activity.ignoredEventTypes.includes(event.type)
-            ? 'passes over' as const
-            : activity.preferredEventTypes.includes(event.type)
-              ? 'notices' as const
-              : 'no strong pattern' as const,
-          selectivity: activity.eventSelectivity,
+          attention,
         };
       }),
       ...(streamerMemories.length > 0 ? { streamerMemories } : {}),
@@ -772,6 +854,37 @@ export class ReactionCoordinator extends EventEmitter {
       reactions: trace.reactions.map((reaction) => ({ ...reaction })),
     } satisfies ReactionTraceRecord);
   }
+}
+
+/**
+ * Whether this moment is one this character would look at.
+ *
+ * Matching `event.type` against the profile's own event labels sounded right and did nothing. The
+ * two vocabularies barely meet: the catalogue calls things 'football', 'dota-analysis', 'gossip',
+ * 'music', 'routine', while the perception layer emits 'speech', 'question', 'conversation',
+ * 'visual'. Across a measured stream that left `attention` at 'no strong pattern' for 28 of 31
+ * moments and identical for all four accounts on the other three — a fit signal that never once
+ * told two candidates apart, while the numeric selectivity beside it suppressed all of them.
+ *
+ * What the profiles do carry in the same language as the stream is what the person is into, so a
+ * topical hit on interests or expertise is the signal that actually fires. The event-type lists are
+ * still honoured where they happen to line up.
+ */
+function attentionFor(persona: ReactionBotCandidate['persona'], event: StreamEvent): 'notices' | 'passes over' | 'no strong pattern' {
+  const activity = persona.behavior.activity;
+  if (activity.ignoredEventTypes.includes(event.type)) return 'passes over';
+  if (activity.preferredEventTypes.includes(event.type)) return 'notices';
+  const moment = semanticTokens([event.summary, event.speech, event.visualContext, event.gameContext]
+    .filter(Boolean).join(' '));
+  if (moment.size === 0) return 'no strong pattern';
+  const subjects = [
+    ...persona.interests.games, ...persona.interests.music,
+    ...persona.interests.food, ...persona.interests.other,
+    ...persona.knowledge.expertise, ...persona.knowledge.familiarTopics,
+  ];
+  return subjects.some((subject) => relevanceScore(moment, subject) > 0)
+    ? 'notices'
+    : 'no strong pattern';
 }
 
 function rawUsername(value: unknown, index: number): string {

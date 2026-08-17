@@ -577,9 +577,9 @@ describe('single-session reaction protocol', () => {
   });
 
   it('tells the brain how a moment sits with each account, not who is due a turn', async () => {
-    // Fit comes from the character: what they usually notice, what they pass over, how choosy they
-    // are. Selection used to be told that an account which had been quiet was the stronger choice,
-    // which is a rotation dressed as a judgement.
+    // Fit comes from the character: what they usually notice and what they pass over. Selection
+    // used to be told that an account which had been quiet was the stronger choice, which is a
+    // rotation dressed as a judgement.
     const { coordinator, candidatesFor, setCandidates } = await setup();
     const noticesFails = candidatesFor('bot-one');
     noticesFails.persona.behavior.activity.preferredEventTypes = ['fail'];
@@ -595,7 +595,42 @@ describe('single-session reaction protocol', () => {
     expect(states.find((state) => state.username === 'bot-one')?.attention).toBe('notices');
     expect(states.find((state) => state.username === 'bot-two')?.attention).toBe('passes over');
     expect(states.find((state) => state.username === 'bot-three')?.attention).toBe('no strong pattern');
-    for (const state of states) expect(typeof state.selectivity).toBe('number');
+    // No number beside it. A raw eventSelectivity here was a second cooldown applied to candidates
+    // the backend had already cleared, and it never once told two of them apart.
+    expect(JSON.stringify(states)).not.toContain('selectivity');
+    await coordinator.stop();
+  });
+
+  it('notices a moment about what an account actually cares about, however choosy it is', async () => {
+    // The event-type lists are catalogue labels — 'football', 'gossip', 'dota-analysis' — and the
+    // perception layer emits 'speech', 'question', 'conversation'. Over a measured stream the two
+    // vocabularies met three times in thirty-one moments, so fit was decided by a field that was
+    // almost always the same value for everybody. Interests are written in the language the stream
+    // is actually spoken in, and that is what carries the signal now.
+    const { coordinator, candidatesFor, setCandidates } = await setup();
+    const archivist = candidatesFor('bot-three');
+    expect(archivist.persona.behavior.activity.eventSelectivity).toBeGreaterThan(0.9);
+    expect(archivist.persona.interests.other).toContain('плёночная фотография');
+    setCandidates([archivist, candidatesFor('bot-one')]);
+
+    const relevant = await coordinator.prepareBrainEvent({
+      ...event,
+      id: 'topical-event',
+      type: 'speech',
+      summary: 'S: смотри, тут плёночная фотография на стене висит',
+    }, 0);
+    expect(relevant.candidateStates?.find((state) => state.username === 'bot-three')?.attention)
+      .toBe('notices');
+
+    // And an unrelated one stays unremarkable for them, which is equally correct.
+    const unrelated = await coordinator.prepareBrainEvent({
+      ...event,
+      id: 'off-topic-event',
+      type: 'speech',
+      summary: 'S: короче я вчера колесо менял полтора часа',
+    }, 0);
+    expect(unrelated.candidateStates?.find((state) => state.username === 'bot-three')?.attention)
+      .toBe('no strong pattern');
     await coordinator.stop();
   });
 
