@@ -48,10 +48,6 @@ export interface ReactionCoordinatorOptions {
   retrievalLimit: number;
   candidates: () => ReactionBotCandidate[];
   contextTtlMs?: number;
-  /** Past this age a moment is no longer what the stream is talking about, and a reply is dropped. */
-  freshnessMs?: number;
-  /** How the operator judged earlier messages, so taste travels as examples rather than as rules. */
-  taste?: () => Promise<BrainEventInput['channelTaste']>;
   /** Per-account record of what the channel actually shows, kept from real traffic. */
   onDelivery?: (outcome: { username: string; result: 'sent' | 'shown' | 'hidden'; reason?: string }) => void;
   /** How long to wait for a sent message to echo back from Twitch before calling it undelivered. */
@@ -103,7 +99,6 @@ export class ReactionCoordinator extends EventEmitter {
   private readonly pendingContexts = new Map<string, PendingContext>();
   private readonly pendingDeliveries = new Map<string, PendingDelivery>();
   private readonly deliveryEchoTimeoutMs: number;
-  private readonly freshnessMs: number;
   private readonly traces = new Map<string, ReactionTraceRecord>();
   private stopped = false;
 
@@ -112,7 +107,6 @@ export class ReactionCoordinator extends EventEmitter {
     this.logger = options.logger.child('DECISION');
     this.now = options.now ?? Date.now;
     this.contextTtlMs = options.contextTtlMs ?? 45_000;
-    this.freshnessMs = options.freshnessMs ?? 12_000;
     this.deliveryEchoTimeoutMs = options.deliveryEchoTimeoutMs ?? 10_000;
   }
 
@@ -265,11 +259,6 @@ export class ReactionCoordinator extends EventEmitter {
     });
   }
 
-  /** How long ago the thing being answered actually happened. */
-  private momentAge(trigger: PlannedReaction['trigger']): number {
-    return trigger.kind === 'stream_event' ? this.now() - trigger.event.timestamp : 0;
-  }
-
   /** Builds the small delta sent to the stateful Brain. Full persona profiles live in bootstrap. */
   async prepareBrainEvent(event: StreamEvent, chatAfter: number, emittedAt = this.now()): Promise<BrainEventInput> {
     if (this.stopped) throw new Error('reaction_coordinator_stopped');
@@ -414,7 +403,7 @@ export class ReactionCoordinator extends EventEmitter {
     // targeted context above is built only for direct mentions because it is large; this is the
     // cheap half of it, and it is the half that carries opinions. Without it every ordinary moment
     // was answered by accounts with no history of their own in front of them.
-    const [recalledMemories, streamerMemories, taste] = await Promise.all([
+    const [recalledMemories, streamerMemories] = await Promise.all([
       Promise.all(candidates.map(async (candidate) => ({
         username: candidate.username,
         memories: (await this.options.personaMemory.recall(candidate.persona.id, {
@@ -427,7 +416,6 @@ export class ReactionCoordinator extends EventEmitter {
         limit: 3,
       }).then((memories) => memories.map((memory) => ({ type: memory.type, summary: memory.summary })))
         .catch(() => []),
-      this.options.taste?.() ?? Promise.resolve(undefined),
     ]);
 
     return {
@@ -436,7 +424,6 @@ export class ReactionCoordinator extends EventEmitter {
       availableBots: candidates.map((candidate) => candidate.username),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
-      ...(taste ? { channelTaste: taste } : {}),
       candidateStates: candidates.map((candidate) => {
         const state = this.options.personaRuntime.get(candidate.persona.id);
         return {
@@ -525,19 +512,6 @@ export class ReactionCoordinator extends EventEmitter {
     const eventId = triggerId(plan.trigger);
     this.logger.info('Reaction scheduler fired', { bot: plan.bot.username, eventId });
     try {
-      // A reply is about the moment it answers, and on a talkative stream that moment lasts
-      // seconds. Production showed the cost of ignoring this: a remark about the driver watching
-      // through his mirror went out in answer to a question about which actor someone resembled,
-      // because by then the conversation had moved twice. Late is worse than silent.
-      const staleBy = this.momentAge(plan.trigger) - this.freshnessMs;
-      if (staleBy > 0) {
-        this.options.usage.recordSkipped();
-        this.recordSendFailure(eventId, plan.bot.username, 'moment_passed');
-        this.logger.info('Reaction dropped because the moment had passed', {
-          bot: plan.bot.username, eventId, lateByMs: staleBy,
-        });
-        return;
-      }
       const current = this.options.candidates().find((candidate) => candidate.username === plan.bot.username);
       if (!current?.enabled || current.connectionState !== 'CONNECTED' || !current.chatConnected) {
         this.options.usage.recordSkipped();

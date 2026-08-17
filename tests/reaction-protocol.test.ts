@@ -8,7 +8,7 @@ import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { MemoryRepository } from '../src/persistence/memory-repository';
-import { ReactionCoordinator, ReactionCoordinatorOptions } from '../src/reaction/reaction-coordinator';
+import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
 import { ReactionBotCandidate, ReactionTraceRecord } from '../src/reaction/types';
 import { ContextStore } from '../src/stream-brain/context-store';
@@ -38,14 +38,8 @@ function bot(username: string, index: number): ReactionBotCandidate {
 
 type SenderResult = boolean | ((username: string, message: string) => boolean | Promise<boolean>);
 
-async function setup(
-  senderResult: SenderResult | { taste: ReactionCoordinatorOptions['taste'] } = true,
-  now: () => number = () => event.timestamp,
-) {
-  const overrides = typeof senderResult === 'object' && senderResult !== null && 'taste' in senderResult
-    ? senderResult
-    : undefined;
-  const sendResult: SenderResult = overrides ? true : senderResult as SenderResult;
+async function setup(senderResult: SenderResult = true, now: () => number = () => event.timestamp) {
+  const sendResult = senderResult;
   const repository = new MemoryRepository();
   await repository.initialize();
   const history = new BotHistory(repository);
@@ -99,7 +93,6 @@ async function setup(
     observesChat: () => observesChat,
     deliveryEchoTimeoutMs: 10_000,
     now,
-    ...overrides,
   });
   return {
     coordinator, globalMemory, history, policy, sent, usage, personaMemory,
@@ -583,20 +576,21 @@ describe('single-session reaction protocol', () => {
     await coordinator.stop();
   });
 
-  it('carries the operator’s own verdicts into the decision as examples', async () => {
-    // Rules carry taste badly — an em dash survived three separate attempts to forbid it — while a
-    // message the operator marked, with their reason, says what no instruction managed to.
-    const { coordinator } = await setup({
-      taste: async () => ({
-        wanted: ['в тарелку камеру наведи, не видно же'],
-        unwanted: [{ message: 'Понял он всё, дал провод.', why: 'пересказ того, что видно' }],
-      }),
-    });
-    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'taste-event' }, 0);
-    expect(prepared.channelTaste?.wanted).toEqual(['в тарелку камеру наведи, не видно же']);
-    expect(prepared.channelTaste?.unwanted).toEqual([
-      { message: 'Понял он всё, дал провод.', why: 'пересказ того, что видно' },
-    ]);
+  it('teaches where a question’s answer has to live, not a list of banned phrases', async () => {
+    // The operator's verdicts are distilled into the instruction rather than shipped as examples
+    // with every decision: a rolling window of forty messages is not understanding, and rules of
+    // the "do not write this" kind have failed here before — an em dash survived three of them.
+    const { BRAIN_SYSTEM_INSTRUCTION } = await import('../src/brain/gemini-brain.service');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('adding something the stream does not already contain');
+    // The distinction that separates a good question from a bad one on the same visible subject.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('does not run along what is visible');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('что за суп там в центре кипит');
+    // A wrong premise, which is the one mistake that cannot be answered at all.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('опять кого-то ждём');
+    // And no channelTaste travels with a decision any more.
+    const { coordinator } = await setup();
+    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'no-taste-event' }, 0);
+    expect(prepared).not.toHaveProperty('channelTaste');
     await coordinator.stop();
   });
 
@@ -660,23 +654,23 @@ describe('single-session reaction protocol', () => {
     await coordinator.stop();
   });
 
-  it('drops a reply once the moment it answers has passed', async () => {
-    // A remark about the driver watching through his mirror went out in answer to a question about
-    // which actor someone resembled, because by then the conversation had moved on twice.
+  it('sends a reply the queue delayed rather than throwing it away', async () => {
+    // A freshness gate used to bin anything older than twelve seconds, and a backed-up queue made
+    // that five of fourteen messages: paid for, written, discarded. Lateness is a queue problem and
+    // gets fixed there; a good message is worth more late than never.
     vi.useFakeTimers();
     let clock = event.timestamp;
     const { coordinator, sent } = await setup(true, () => clock);
     await coordinator.prepareBrainEvent(event, 0);
     const result = await coordinator.submitBatch({
       eventId: event.id,
-      reactions: [{ username: 'bot-one', message: 'ну это уже неважно' }],
+      reactions: [{ username: 'bot-one', message: 'картошку хоть не испортили?' }],
     });
     expect(result.accepted).toHaveLength(1);
 
-    // The stream has moved on well past the freshness window before the scheduler fires.
     clock += 30_000;
     await vi.runAllTimersAsync();
-    expect(sent).toEqual([]);
+    expect(sent).toEqual([{ username: 'bot-one', message: 'картошку хоть не испортили?' }]);
     await coordinator.stop();
   });
 

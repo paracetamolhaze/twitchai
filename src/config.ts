@@ -71,8 +71,6 @@ export interface AppConfig {
     globalMessagesPer30Seconds: number;
     maxReactionsPerEvent: number;
     reactionShareOfCandidates: number;
-    /** Past this age a moment is no longer what the stream is talking about. */
-    freshnessMs: number;
     batchStaggerMs: number;
   };
   learning: {
@@ -179,10 +177,6 @@ const envSchema = z.object({
   // so four connected accounts get one voice and thirty get four or five.
   MAX_REACTIONS_PER_EVENT: z.coerce.number().int().min(1).max(10).default(5),
   REACTION_SHARE_OF_CANDIDATES: z.coerce.number().min(0.02).max(1).default(0.15),
-  // How long after the moment a reply is still about that moment. Past this the conversation has
-  // moved on, and answering anyway is what produced a remark about the driver's mirror in reply to
-  // a question about an actor.
-  REACTION_FRESHNESS_SECONDS: z.coerce.number().int().min(3).max(120).default(12),
   // Spacing between accounts answering the same event. The first still replies immediately; this
   // only stops two accounts hitting Twitch in the same instant, which it can drop silently.
   REACTION_BATCH_STAGGER_MS: z.coerce.number().int().min(0).max(10_000).default(900),
@@ -327,7 +321,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       globalMessagesPer30Seconds: parsed.CHAT_MESSAGES_PER_30_SECONDS,
       maxReactionsPerEvent: parsed.MAX_REACTIONS_PER_EVENT,
       reactionShareOfCandidates: parsed.REACTION_SHARE_OF_CANDIDATES,
-      freshnessMs: parsed.REACTION_FRESHNESS_SECONDS * 1000,
       batchStaggerMs: parsed.REACTION_BATCH_STAGGER_MS,
     },
     learning: {
