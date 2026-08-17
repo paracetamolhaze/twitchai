@@ -11,7 +11,10 @@ import {
 
 export interface ReactionPolicyOptions {
   globalMessagesPer30Seconds: number;
+  /** Ceiling. The number actually allowed scales with how many accounts are available. */
   maxReactionsPerEvent: number;
+  /** Share of available accounts that may answer one moment. */
+  reactionShareOfCandidates?: number;
   maxMessageBytes?: number;
   /** Spacing between accounts in one batch so two never reach Twitch in the same instant. */
   batchStaggerMs?: number;
@@ -43,6 +46,20 @@ export class ReactionPolicyGuard {
   }
 
   maxReactions(): number { return this.options.maxReactionsPerEvent; }
+
+  /**
+   * How many accounts may answer one moment, as a share of who is actually available.
+   *
+   * A fixed three was written for a full chat and reads as a pile-up on a small one: with four
+   * accounts connected, two of them answered the same event one second apart with two wordings of
+   * the same thought, three times in seven minutes. A share keeps the crowd proportional — four
+   * accounts get one voice, thirty get four or five — and never exceeds the configured ceiling.
+   */
+  maxReactionsFor(availableCandidates: number): number {
+    if (availableCandidates <= 0) return 0;
+    const share = Math.round(availableCandidates * (this.options.reactionShareOfCandidates ?? 0.15));
+    return Math.max(1, Math.min(this.options.maxReactionsPerEvent, share));
+  }
   maxMessageBytes(): number { return this.options.maxMessageBytes ?? 450; }
 
   globalSlotsAvailable(): number {
@@ -90,7 +107,7 @@ export class ReactionPolicyGuard {
       }
       if (seen.has(username)) { reject('duplicate_username'); continue; }
       seen.add(username);
-      if (accepted.length >= this.options.maxReactionsPerEvent) {
+      if (accepted.length >= this.maxReactionsFor(input.currentCandidates.length)) {
         reject('too_many_reactions'); continue;
       }
       if (!candidate?.enabled || candidate.connectionState !== 'CONNECTED' || !candidate.chatConnected) {

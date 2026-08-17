@@ -48,6 +48,8 @@ export interface ReactionCoordinatorOptions {
   retrievalLimit: number;
   candidates: () => ReactionBotCandidate[];
   contextTtlMs?: number;
+  /** Past this age a moment is no longer what the stream is talking about, and a reply is dropped. */
+  freshnessMs?: number;
   /** How long to wait for a sent message to echo back from Twitch before calling it undelivered. */
   deliveryEchoTimeoutMs?: number;
   /**
@@ -97,6 +99,7 @@ export class ReactionCoordinator extends EventEmitter {
   private readonly pendingContexts = new Map<string, PendingContext>();
   private readonly pendingDeliveries = new Map<string, PendingDelivery>();
   private readonly deliveryEchoTimeoutMs: number;
+  private readonly freshnessMs: number;
   private readonly traces = new Map<string, ReactionTraceRecord>();
   private stopped = false;
 
@@ -105,6 +108,7 @@ export class ReactionCoordinator extends EventEmitter {
     this.logger = options.logger.child('DECISION');
     this.now = options.now ?? Date.now;
     this.contextTtlMs = options.contextTtlMs ?? 45_000;
+    this.freshnessMs = options.freshnessMs ?? 12_000;
     this.deliveryEchoTimeoutMs = options.deliveryEchoTimeoutMs ?? 10_000;
   }
 
@@ -257,6 +261,11 @@ export class ReactionCoordinator extends EventEmitter {
     });
   }
 
+  /** How long ago the thing being answered actually happened. */
+  private momentAge(trigger: PlannedReaction['trigger']): number {
+    return trigger.kind === 'stream_event' ? this.now() - trigger.event.timestamp : 0;
+  }
+
   /** Builds the small delta sent to the stateful Brain. Full persona profiles live in bootstrap. */
   async prepareBrainEvent(event: StreamEvent, chatAfter: number, emittedAt = this.now()): Promise<BrainEventInput> {
     if (this.stopped) throw new Error('reaction_coordinator_stopped');
@@ -266,9 +275,20 @@ export class ReactionCoordinator extends EventEmitter {
     const eligibleCandidates = allCandidates
       .filter((candidate) => candidate.enabled && candidate.connectionState === 'CONNECTED' && candidate.chatConnected);
     const directTargets = new Set(event.directMentions.map((username) => username.toLowerCase()));
-    const candidates = directTargets.size > 0
+    const named = directTargets.size > 0
       ? eligibleCandidates.filter((candidate) => directTargets.has(candidate.username.toLowerCase()))
       : eligibleCandidates;
+    // An account still inside its own interval cannot send anything, and offering it anyway meant
+    // paying for a message the guard then binned: a measured fourteen minutes threw away 37
+    // reactions to account_cooldown, and thirteen of thirty-four decisions ended up entirely empty
+    // while the dashboard reported them as deliberate silence. Being named is the one exception —
+    // leaving a question to a specific account unanswered is worse than answering it early.
+    const candidates = directTargets.size > 0
+      ? named
+      : named.filter((candidate) => {
+        const limit = this.options.policy.candidateRateLimit(candidate);
+        return limit.cooldownRemainingMs <= 0 && !limit.busy;
+      });
     const directTargetUnavailable = [...directTargets]
       .filter((username) => !candidates.some((candidate) => candidate.username.toLowerCase() === username))
       .map((username) => ({ username, reason: directTargetUnavailableReason(username, allCandidates) }));
@@ -323,7 +343,7 @@ export class ReactionCoordinator extends EventEmitter {
         reactionExamples: [],
         deltas: [],
         constraints: {
-          maxReactions: this.options.policy.maxReactions(),
+          maxReactions: this.options.policy.maxReactionsFor(0),
           maxMessageBytes: this.options.policy.maxMessageBytes(),
           globalSlotsAvailable: this.options.policy.globalSlotsAvailable(),
           expiresAt: this.now(),
@@ -402,7 +422,7 @@ export class ReactionCoordinator extends EventEmitter {
       reactionExamples: reactionExamples.slice(0, 3),
       deltas: [],
       constraints: {
-        maxReactions: this.options.policy.maxReactions(),
+        maxReactions: this.options.policy.maxReactionsFor(candidates.length),
         maxMessageBytes: this.options.policy.maxMessageBytes(),
         globalSlotsAvailable: this.options.policy.globalSlotsAvailable(),
         expiresAt,
@@ -469,6 +489,19 @@ export class ReactionCoordinator extends EventEmitter {
     const eventId = triggerId(plan.trigger);
     this.logger.info('Reaction scheduler fired', { bot: plan.bot.username, eventId });
     try {
+      // A reply is about the moment it answers, and on a talkative stream that moment lasts
+      // seconds. Production showed the cost of ignoring this: a remark about the driver watching
+      // through his mirror went out in answer to a question about which actor someone resembled,
+      // because by then the conversation had moved twice. Late is worse than silent.
+      const staleBy = this.momentAge(plan.trigger) - this.freshnessMs;
+      if (staleBy > 0) {
+        this.options.usage.recordSkipped();
+        this.recordSendFailure(eventId, plan.bot.username, 'moment_passed');
+        this.logger.info('Reaction dropped because the moment had passed', {
+          bot: plan.bot.username, eventId, lateByMs: staleBy,
+        });
+        return;
+      }
       const current = this.options.candidates().find((candidate) => candidate.username === plan.bot.username);
       if (!current?.enabled || current.connectionState !== 'CONNECTED' || !current.chatConnected) {
         this.options.usage.recordSkipped();

@@ -123,6 +123,7 @@ export class Application {
     this.policy = new ReactionPolicyGuard({
       globalMessagesPer30Seconds: config.reaction.globalMessagesPer30Seconds,
       maxReactionsPerEvent: config.reaction.maxReactionsPerEvent,
+      reactionShareOfCandidates: config.reaction.reactionShareOfCandidates,
       batchStaggerMs: config.reaction.batchStaggerMs,
     });
     this.memory = new ReactionMemory({
@@ -183,6 +184,7 @@ export class Application {
 
     this.coordinator = new ReactionCoordinator({
       policy: this.policy,
+      freshnessMs: this.config.reaction.freshnessMs,
       sender: this.botManager,
       history: this.history,
       memory: this.memory,

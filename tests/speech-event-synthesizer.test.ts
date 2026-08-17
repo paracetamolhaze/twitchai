@@ -64,6 +64,34 @@ describe('SpeechEventSynthesizer', () => {
     expect(emitted.length).toBeLessThanOrEqual(8);
   });
 
+  it('answers a question in seconds instead of holding it for the pacing interval', async () => {
+    // Pacing keeps a talkative minute from becoming forty decisions, but a question is the one
+    // thing that stops being answerable while it waits.
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer({ minIntervalMs: 20_000, quickIntervalMs: 5_000 });
+    instance.accept('ну поехали дальше короче, тут вроде недалеко ехать осталось совсем немного');
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(emitted).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    instance.accept('а вы бы сколько за такое отдали?');
+    // Six seconds after the last decision, not twenty.
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]?.type).toBe('question');
+  });
+
+  it('still holds an ordinary remark to the full interval', async () => {
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer({ minIntervalMs: 20_000, quickIntervalMs: 5_000 });
+    instance.accept('ну поехали дальше короче, тут вроде недалеко ехать осталось совсем немного');
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(emitted).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    instance.accept('да нормально всё, едем спокойно, ничего особенного вокруг не происходит');
+    expect(emitted).toHaveLength(1);
+  });
+
   it('does not leave a short remark unanswered on a quiet stream', async () => {
     // A lone remark never reaches the character threshold, and a quiet stream is exactly where it
     // matters most.

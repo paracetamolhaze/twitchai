@@ -61,6 +61,9 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
   const policy = new ReactionPolicyGuard({
     globalMessagesPer30Seconds: 2,
     maxReactionsPerEvent: 3,
+    // These cases are about staggering, deduplication and terminal state, not about how many
+    // accounts a crowd of three is allowed; the share itself has its own test.
+    reactionShareOfCandidates: 1,
     now,
   });
   const coordinator = new ReactionCoordinator({
@@ -533,6 +536,73 @@ describe('single-session reaction protocol', () => {
     });
     expect(result.rejected).toContainEqual({ username: 'bot-one', reason: 'typographic_dash' });
     expect(result.accepted.map((item) => item.username)).toEqual(['bot-three']);
+    await coordinator.stop();
+  });
+
+  it('scales how many accounts answer one moment with how many are available', async () => {
+    // A fixed three was written for a full chat and reads as a pile-up on a small one: with four
+    // accounts connected, two answered the same event a second apart with two wordings of one
+    // thought, three times in seven minutes.
+    const policy = new ReactionPolicyGuard({
+      globalMessagesPer30Seconds: 60, maxReactionsPerEvent: 5, now: () => event.timestamp,
+    });
+    expect(policy.maxReactionsFor(0)).toBe(0);
+    expect(policy.maxReactionsFor(1)).toBe(1);
+    expect(policy.maxReactionsFor(4)).toBe(1);
+    expect(policy.maxReactionsFor(10)).toBe(2);
+    expect(policy.maxReactionsFor(20)).toBe(3);
+    expect(policy.maxReactionsFor(30)).toBe(5);
+    // Never above the configured ceiling, whatever the crowd.
+    expect(policy.maxReactionsFor(200)).toBe(5);
+  });
+
+  it('keeps an account that cannot send out of the decision entirely', async () => {
+    // Offering a cooling account meant paying for a message the guard then binned: a measured
+    // fourteen minutes threw away 37 reactions to account_cooldown, and thirteen of thirty-four
+    // decisions came back empty while the dashboard called it deliberate silence.
+    const { coordinator, policy, setCandidates } = await setup();
+    const cooling = bot('bot-one', 0);
+    cooling.lastReactionAt = event.timestamp - 1_000;
+    setCandidates([cooling, bot('bot-two', 1), bot('bot-three', 2)]);
+    expect(policy.candidateRateLimit(cooling).cooldownRemainingMs).toBeGreaterThan(0);
+
+    const prepared = await coordinator.prepareBrainEvent(event, 0);
+    expect(prepared.availableBots).toEqual(['bot-two', 'bot-three']);
+    await coordinator.stop();
+  });
+
+  it('still offers a cooling account when the stream said its name', async () => {
+    // Leaving a question addressed to one account unanswered is worse than answering it early.
+    const { coordinator, setCandidates } = await setup();
+    const cooling = bot('bot-one', 0);
+    cooling.lastReactionAt = event.timestamp - 1_000;
+    setCandidates([cooling, bot('bot-two', 1)]);
+
+    const prepared = await coordinator.prepareBrainEvent({
+      ...event, id: 'named-event', summary: 'bot-one а ты что думаешь', speech: 'bot-one а ты что думаешь',
+      directMentions: ['bot-one'],
+    }, 0);
+    expect(prepared.availableBots).toEqual(['bot-one']);
+    await coordinator.stop();
+  });
+
+  it('drops a reply once the moment it answers has passed', async () => {
+    // A remark about the driver watching through his mirror went out in answer to a question about
+    // which actor someone resembled, because by then the conversation had moved on twice.
+    vi.useFakeTimers();
+    let clock = event.timestamp;
+    const { coordinator, sent } = await setup(true, () => clock);
+    await coordinator.prepareBrainEvent(event, 0);
+    const result = await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [{ username: 'bot-one', message: 'ну это уже неважно' }],
+    });
+    expect(result.accepted).toHaveLength(1);
+
+    // The stream has moved on well past the freshness window before the scheduler fires.
+    clock += 30_000;
+    await vi.runAllTimersAsync();
+    expect(sent).toEqual([]);
     await coordinator.stop();
   });
 
