@@ -124,6 +124,14 @@ export interface BrainEventInput {
     mood: string;
     engagement: number;
     sessionMessageCount: number;
+    /**
+     * Whether this kind of moment is one they usually pay attention to, taken from their own
+     * profile rather than from how long they have been quiet. Fit is a reason to speak; a turn in
+     * a rotation is not, and the instruction that replaced this used to say the opposite.
+     */
+    attention: 'notices' | 'passes over' | 'no strong pattern';
+    /** How choosy they are in general: high means most moments are not for them. */
+    selectivity: number;
   }>;
   /**
    * What is known about this streamer that bears on this particular moment, looked up by the words

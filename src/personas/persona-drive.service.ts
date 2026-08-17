@@ -255,7 +255,9 @@ export class PersonaDriveService {
     if (decision.reactions.length === 0) {
       await o.submitReaction(requestId, []);
       o.usage.recordDriveSilentDecision();
-      this.logger.info('PERSONA_DRIVE_SILENT', { requestId });
+      // Not a failure and not rare: the backend offers the floor, and nobody having a reason to
+      // take it is the ordinary outcome of a quiet minute.
+      this.logger.info('PERSONA_DRIVE_SILENT', { requestId, candidates: candidateUsernames.length });
       return;
     }
 

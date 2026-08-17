@@ -3,7 +3,7 @@ import { ApiServer, createApiServer } from './api/server';
 import { GeminiBrainService } from './brain/gemini-brain.service';
 import { GoogleInteractionsClient } from './brain/google-interactions.client';
 import { OpenRouterBrainClient } from './brain/openrouter-brain.client';
-import { BrainBootstrap, BrainDecision, BrainDynamicDelta, BrainEventInput, GeminiBrainStatus } from './brain/types';
+import { BrainBootstrap, BrainDecision, BrainDynamicDelta, GeminiBrainStatus } from './brain/types';
 import { accumulatesMemory, AppConfig, normalizeChannel } from './config';
 import { GlobalStreamerMemory } from './global-memory/global-streamer-memory';
 import { StreamerMemory } from './global-memory/types';

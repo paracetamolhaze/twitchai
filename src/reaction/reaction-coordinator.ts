@@ -212,10 +212,28 @@ export class ReactionCoordinator extends EventEmitter {
       silentCandidateCount: Math.max(0, pending.candidateCount - parsed.reactions.length),
     };
     this.emitDecision(decision);
+    // One line that answers "why did this moment produce what it produced" without exposing the
+    // model's private reasoning: what kind of trigger it was, who could have spoken, who did, how
+    // many stayed silent, whether anything was thrown away, and how old the moment was by then.
+    const trigger = pending.trigger;
     this.logger.info('Gemini reaction batch validated', {
       eventId: parsed.eventId,
+      triggerKind: trigger.kind,
+      candidates: pending.candidateCount,
       selected: decision.selected.map((item) => item.username),
+      silent: decision.silentCandidateCount,
       rejected: decision.rejected.length,
+      ...(decision.rejected.length > 0
+        ? { rejectedReasons: [...new Set(decision.rejected.map((item) => item.reason))] }
+        : {}),
+      ...(trigger.kind === 'stream_event'
+        ? {
+          directMention: trigger.event.directMentions.length > 0,
+          importance: trigger.event.importance,
+          eventAgeMs: this.now() - trigger.event.timestamp,
+          allowedReactions: this.options.policy.maxReactionsFor(pending.candidateCount, trigger.event.importance),
+        }
+        : {}),
     });
     return {
       eventId: parsed.eventId,
@@ -426,11 +444,22 @@ export class ReactionCoordinator extends EventEmitter {
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
       candidateStates: candidates.map((candidate) => {
         const state = this.options.personaRuntime.get(candidate.persona.id);
+        const activity = candidate.persona.behavior.activity;
         return {
           username: candidate.username,
           mood: state.mood,
           engagement: state.engagement,
           sessionMessageCount: state.sessionMessageCount,
+          // Fit taken from the character rather than from the clock. Selection used to be told that
+          // an account which had been quiet was the stronger choice, which is a rotation wearing
+          // the clothes of a judgement: a moment nobody cares about does not become interesting
+          // because it is somebody's turn.
+          attention: activity.ignoredEventTypes.includes(event.type)
+            ? 'passes over' as const
+            : activity.preferredEventTypes.includes(event.type)
+              ? 'notices' as const
+              : 'no strong pattern' as const,
+          selectivity: activity.eventSelectivity,
         };
       }),
       ...(streamerMemories.length > 0 ? { streamerMemories } : {}),
@@ -445,7 +474,9 @@ export class ReactionCoordinator extends EventEmitter {
       reactionExamples: reactionExamples.slice(0, 3),
       deltas: [],
       constraints: {
-        maxReactions: this.options.policy.maxReactionsFor(candidates.length),
+        // The ceiling follows the moment, not just the crowd: an ordinary remark is one voice at
+        // most however many accounts are watching.
+        maxReactions: this.options.policy.maxReactionsFor(candidates.length, event.importance),
         maxMessageBytes: this.options.policy.maxMessageBytes(),
         globalSlotsAvailable: this.options.policy.globalSlotsAvailable(),
         expiresAt,

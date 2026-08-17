@@ -1,15 +1,19 @@
+/**
+ * The mechanical half of writing a message, kept apart from the standing principles in
+ * BRAIN_SYSTEM_INSTRUCTION so that neither restates the other.
+ *
+ * Everything here is a property of the typing rather than a judgement about the moment: what a chat
+ * box looks like, what a profile field is for, and what must never leak through. Whether to write
+ * at all, and what a message is for, belong in the instruction. They used to live in both places,
+ * and duplication is how a prompt gets longer without getting clearer.
+ */
 export const REACTION_NATURALNESS_INSTRUCTIONS = [
-  'Speech lists and messageExamples are descriptive style evidence, never response templates. Infer only high-level rhythm, vocabulary range, casing, punctuation, humor, and restraint from them; do not transplant their content or sentence frame into the current moment.',
-  'Never concatenate openingPatterns, fillerWords, favoriteExpressions, or endingPatterns. They are optional tendencies, not slots that must be filled. Do not attach a greeting, address word, slang marker, or catchphrase at any position — an opener tacked onto the end reads as nonsense, as in "без банки бар отменяется, слушай". A word from those lists belongs only where the sentence would naturally carry it, and most messages carry none.',
-  'recentChatDelta shows what the accounts have just been saying to each other. Read it before writing and do not extend a subject they have already covered two messages running — on a stream about dinner they drifted into six consecutive messages about servers and VPNs, each one answering the last, none of them about anything on screen. The stream is the subject; a thread among the accounts is not one, and letting it die is correct.',
-  'Name things the way the stream just named them. recentSpeech carries the actual words, so when it says повербанк, write повербанк — not a clipped or ambiguous form the listener has to decode. Never invent slang for something that was said plainly.',
-  'A laughStyle is how this character laughs when something is actually funny, not a prefix. Never open a message with it by default, and never open two of a candidate\'s messages the same way in one session — recentAccountMessages shows what they already opened with.',
-  'Never carry a transcript label into a message. "S:" and "O:" mark who was speaking; a viewer typing in chat has no such prefix.',
-  'Type like someone in a chat box, not like edited prose: no em dash or en dash, and no typographic quotes. A plain hyphen, a comma, or a second sentence is what a person actually types.',
-  'Before emitting any reaction, compare the draft against that candidate\'s recentMessages. If it repeats the same two-word opening, address, catchphrase, sentence frame, joke, or a close paraphrase, rewrite it with a genuinely different form.',
-  'These are people watching a live broadcast, not commenters under a finished video. The streamer reads chat and can answer, which is the whole reason to type at all.',
-  'The event summary is evidence, not a caption to paraphrase. Do not narrate an obvious screen action, translate the summary into chat, or default to generic encouragement or tactical commands. A message should add something this particular candidate would naturally choose to add: a specific observation, emotion, question, joke, social reply, or emote.',
-  'Natural variation does not mean random slang. A candidate may use a fragment, question, understated response, emote, or no message; never force a greeting, direct address, exclamation, joke, or complete sentence.',
+  'Type like someone in a chat box, not like edited prose: no em dash or en dash, no typographic quotes. A plain hyphen, a comma, or a second sentence is what a person actually types.',
+  'Length follows the thought, and most thoughts in a chat are short. A fragment, a single word, an emote, or nothing at all are ordinary outcomes; never force a greeting, a complete sentence, a question or a joke into a message that did not need one.',
+  'Speech lists â favourite forms, openings, endings, fillers, laughs â are tendencies, not slots. A message containing none of them is the common case, and a message assembled out of several of them is never right. A laughStyle in particular is how this person laughs when something is genuinely funny, not a prefix.',
+  'Name things the way the stream just named them. recentSpeech carries the actual words, so when it says Ð¿Ð¾Ð²ÐµÑÐ±Ð°Ð½Ðº, write Ð¿Ð¾Ð²ÐµÑÐ±Ð°Ð½Ðº and not a clipped form the reader has to decode. Never invent slang for something that was said plainly.',
+  'Check a draft against that accountâs own recentMessages before emitting it. If it repeats an opening, an address, a catchphrase, a sentence frame, a joke or a close paraphrase they have already used, write it differently.',
+  'Never carry a transcript label into a message. "S:" and "O:" mark who was speaking; nobody typing in chat writes those.',
 ] as const;
 
 export const REACTION_NATURALNESS_PROMPT = REACTION_NATURALNESS_INSTRUCTIONS.join('\n');

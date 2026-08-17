@@ -200,6 +200,14 @@ export interface PersonaActivityPattern {
 export interface PersonaBehavior {
   styleInstructions: string;
   verbosity: { minWords: number; maxWords: number };
+  /**
+   * Canon only. These describe a character on paper and are read by the audit tooling, not by the
+   * live path: one Brain call decides for every account at once, so a per-persona temperature or
+   * emoji probability has nowhere to apply, and a probability the model is merely shown is a
+   * probability it ignores. What actually shapes behaviour is minimumIntervalMs (enforced by the
+   * policy guard), activity.eventSelectivity and activity.preferred/ignoredEventTypes (turned into
+   * candidate fit), and the speech statistics in the generation snapshot.
+   */
   reactionProbability: number;
   uppercaseProbability: number;
   questionProbability: number;

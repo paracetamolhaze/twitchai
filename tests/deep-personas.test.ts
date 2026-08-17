@@ -232,15 +232,17 @@ describe('deep persistent personas', () => {
       'трамвай уехал прямо перед носом',
     ];
     const fingerprint = builder.buildBrainSnapshot('karlbekner', karl).speechFingerprint;
-    for (const distinctRegister of [
+    // Three examples rather than six, because six alongside the favourite forms anchored the model
+    // into producing a marker in every message. The selection still has to spread across registers
+    // instead of taking the near-identical head.
+    const distinctRegisters = [
       'звук будто кабель отходит',
       'сегодня опять сервер перезапускали',
       'гречка закончилась внезапно',
       'трамвай уехал прямо перед носом',
-    ]) {
-      expect(fingerprint).toContain(distinctRegister);
-    }
-    expect((fingerprint.match(/там же бкб/gu) ?? []).length).toBeLessThanOrEqual(2);
+    ].filter((example) => fingerprint.includes(example));
+    expect(distinctRegisters.length).toBeGreaterThanOrEqual(2);
+    expect((fingerprint.match(/там же бкб/gu) ?? []).length).toBeLessThanOrEqual(1);
   });
 
   it('strips inflected Russian authoring labels from model-facing profile text', async () => {

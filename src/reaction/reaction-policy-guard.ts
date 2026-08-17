@@ -48,17 +48,23 @@ export class ReactionPolicyGuard {
   maxReactions(): number { return this.options.maxReactionsPerEvent; }
 
   /**
-   * How many accounts may answer one moment, as a share of who is actually available.
+   * How many accounts may answer one moment: a share of who is available, narrowed by how much the
+   * moment actually carries.
    *
-   * A fixed three was written for a full chat and reads as a pile-up on a small one: with four
-   * accounts connected, two of them answered the same event one second apart with two wordings of
-   * the same thought, three times in seven minutes. A share keeps the crowd proportional — four
-   * accounts get one voice, thirty get four or five — and never exceeds the configured ceiling.
+   * Two things were wrong with a fixed number. It was written for a full chat and read as a pile-up
+   * on a small one, where two of four accounts answered the same event a second apart with two
+   * wordings of one thought. And a crowd share alone still allowed a whole group to answer an
+   * ordinary remark, which no real chat does: several people reply at once when something lands
+   * that way, not because several were available. So an ordinary moment allows one voice however
+   * large the crowd, and only a moment carrying real weight opens up to the full share.
    */
-  maxReactionsFor(availableCandidates: number): number {
+  maxReactionsFor(availableCandidates: number, salience = 1): number {
     if (availableCandidates <= 0) return 0;
-    const share = Math.round(availableCandidates * (this.options.reactionShareOfCandidates ?? 0.15));
-    return Math.max(1, Math.min(this.options.maxReactionsPerEvent, share));
+    const share = Math.max(1, Math.round(availableCandidates * (this.options.reactionShareOfCandidates ?? 0.15)));
+    const ceiling = Math.min(this.options.maxReactionsPerEvent, share);
+    if (salience >= 0.8) return ceiling;
+    if (salience >= 0.6) return Math.min(2, ceiling);
+    return 1;
   }
   maxMessageBytes(): number { return this.options.maxMessageBytes ?? 450; }
 

@@ -153,16 +153,23 @@ export class PersonaContextBuilder {
     const textFilter = modelTextFilter(persona);
     const safeText = (value: string): string => modelSafeText(value, textFilter);
     const safeTexts = (values: string[], limit: number): string[] => modelSafeTexts(values, limit, textFilter);
+    // Shape first, vocabulary second, signature phrases last and explicitly rare.
+    //
+    // This used to be one blob that put "любимые формы" and six message examples next to the
+    // statistics, and the model read the whole thing as a specification: the character came out
+    // performed, every message carrying a marker, which is not how a regular in a chat sounds. The
+    // measurable properties are what actually distinguish people across an evening — how long they
+    // type, whether they punctuate, how much slang and swearing they use — so those lead, and the
+    // quotable material is named for what it is.
     const speechParts = [
-      `${persona.speech.averageMessageWords} слов в среднем`,
+      `в среднем ${persona.speech.averageMessageWords} слов, обычно ${persona.behavior.verbosity.minWords}–${persona.behavior.verbosity.maxWords}`,
       persona.speech.punctuationStyle,
       persona.speech.capitalizationStyle,
-      `лексика: ${safeTexts(persona.speech.vocabulary, 8).join(', ')}`,
-      `любимые формы: ${safeTexts(persona.speech.favoriteExpressions, 4).join(', ')}`,
-      `смех: ${safeTexts(persona.speech.laughStyles, 3).join(', ')}`,
-      `длина реплики: ${persona.behavior.verbosity.minWords}–${persona.behavior.verbosity.maxWords} слов`,
       `сарказм ${persona.behavior.sarcasmLevel}, сленг ${persona.behavior.slangLevel}, мат ${persona.speech.profanityLevel}`,
-      `примеры только как признаки стиля: ${selectDiverseExamples(persona.speech.messageExamples, 6, textFilter).join(' / ')}`,
+      `лексика: ${safeTexts(persona.speech.vocabulary, 6).join(', ')}`,
+      `изредка, далеко не в каждом сообщении: ${safeTexts(persona.speech.favoriteExpressions, 2).join(', ')}`,
+      `смеётся так, когда правда смешно: ${safeTexts(persona.speech.laughStyles, 2).join(', ')}`,
+      `как выглядят его сообщения в среднем, не что писать: ${selectDiverseExamples(persona.speech.messageExamples, 3, textFilter).join(' / ')}`,
     ].filter(Boolean);
     return {
       username,

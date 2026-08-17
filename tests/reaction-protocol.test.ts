@@ -576,34 +576,41 @@ describe('single-session reaction protocol', () => {
     await coordinator.stop();
   });
 
-  it('teaches where a question’s answer has to live, not a list of banned phrases', async () => {
-    // The operator's verdicts are distilled into the instruction rather than shipped as examples
-    // with every decision: a rolling window of forty messages is not understanding, and rules of
-    // the "do not write this" kind have failed here before — an em dash survived three of them.
-    const { BRAIN_SYSTEM_INSTRUCTION } = await import('../src/brain/gemini-brain.service');
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('adding something the stream does not already contain');
-    // The distinction that separates a good question from a bad one on the same visible subject.
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('does not run along what is visible');
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('что за суп там в центре кипит');
-    // A wrong premise, which is the one mistake that cannot be answered at all.
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('опять кого-то ждём');
-    // And no channelTaste travels with a decision any more.
-    const { coordinator } = await setup();
-    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'no-taste-event' }, 0);
-    expect(prepared).not.toHaveProperty('channelTaste');
+  it('tells the brain how a moment sits with each account, not who is due a turn', async () => {
+    // Fit comes from the character: what they usually notice, what they pass over, how choosy they
+    // are. Selection used to be told that an account which had been quiet was the stronger choice,
+    // which is a rotation dressed as a judgement.
+    const { coordinator, candidatesFor, setCandidates } = await setup();
+    const noticesFails = candidatesFor('bot-one');
+    noticesFails.persona.behavior.activity.preferredEventTypes = ['fail'];
+    noticesFails.persona.behavior.activity.ignoredEventTypes = [];
+    const ignoresFails = candidatesFor('bot-two');
+    ignoresFails.persona.behavior.activity.preferredEventTypes = [];
+    ignoresFails.persona.behavior.activity.ignoredEventTypes = ['fail'];
+    setCandidates([noticesFails, ignoresFails, candidatesFor('bot-three')]);
+
+    // The event fixture is a 'fail'.
+    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'fit-event' }, 0);
+    const states = prepared.candidateStates ?? [];
+    expect(states.find((state) => state.username === 'bot-one')?.attention).toBe('notices');
+    expect(states.find((state) => state.username === 'bot-two')?.attention).toBe('passes over');
+    expect(states.find((state) => state.username === 'bot-three')?.attention).toBe('no strong pattern');
+    for (const state of states) expect(typeof state.selectivity).toBe('number');
     await coordinator.stop();
   });
 
-  it('describes every candidate so the choice is made on material, not availability', async () => {
-    // The spontaneous layer always received this and picks whoever has the most to work with; its
-    // messages read better for it. Reactions were handed whoever happened to be off cooldown.
-    const { coordinator } = await setup();
-    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'described-event' }, 0);
-    expect(prepared.candidateStates).toEqual([
-      expect.objectContaining({ username: 'bot-one', mood: expect.any(String), engagement: expect.any(Number) }),
-      expect.objectContaining({ username: 'bot-two' }),
-      expect.objectContaining({ username: 'bot-three' }),
-    ]);
+  it('lets an ordinary moment be answered by one account and a big one by more', async () => {
+    // The ceiling handed to the brain follows the moment, not only the size of the crowd.
+    const { coordinator, policy } = await setup();
+    const ordinary = await coordinator.prepareBrainEvent(
+      { ...event, id: 'ordinary', importance: 0.45 }, 0,
+    );
+    expect(ordinary.constraints.maxReactions).toBe(1);
+
+    const striking = await coordinator.prepareBrainEvent(
+      { ...event, id: 'striking', importance: 0.95 }, 0,
+    );
+    expect(striking.constraints.maxReactions).toBe(policy.maxReactionsFor(3, 0.95));
     await coordinator.stop();
   });
 
