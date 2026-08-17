@@ -5,6 +5,7 @@ import { PersonaMemory, relevanceScore, semanticTokens } from './persona-memory'
 import { PersonaRuntimeStore } from './persona-runtime-store';
 import {
   BotPersona,
+  PersonaActivityPattern,
   PersonaConversationMessage,
   PersonaDisclosureLevel,
   PersonaFactCategory,
@@ -173,6 +174,7 @@ export class PersonaContextBuilder {
     const signatures = new Set(favouriteExpressions.map(normalizedPhrase));
     const speechParts = [
       `в среднем ${persona.speech.averageMessageWords} слов, обычно ${persona.behavior.verbosity.minWords}–${persona.behavior.verbosity.maxWords}`,
+      writesHowOften(persona.behavior.activity.chatFrequency),
       persona.speech.punctuationStyle,
       persona.speech.capitalizationStyle,
       `сарказм ${persona.behavior.sarcasmLevel}, сленг ${persona.behavior.slangLevel}, мат ${persona.speech.profanityLevel}`,
@@ -203,13 +205,13 @@ export class PersonaContextBuilder {
         persona.behavior.styleInstructions,
       ].join('; ')),
       flaws: safeTexts(persona.character.flaws, 4),
-      // eventSelectivity is deliberately absent. It stays in the canon and in the audit tooling,
-      // but as a number in the payload it read as a probability of staying quiet, and it arrived
-      // twice — here for the whole session, and again on every single event inside candidateStates.
-      // Four accounts averaging 0.79 answered five of thirty-one moments. chatFrequency says the
-      // same thing about a person qualitatively without doubling as a second cooldown.
+      // Neither eventSelectivity nor chatFrequency is here any more, for the same reason: the
+      // backend already spaces these accounts out deterministically — minimumIntervalMs in the
+      // policy guard, and CHAT_FREQUENCY_WEIGHT when Persona Drive picks who to offer the floor to —
+      // so a field saying "very-low" in the payload is that same restraint counted a second time,
+      // by a reader who cannot see it has already been applied. How talkative someone is now rides
+      // in the speech fingerprint, where it shapes how they write rather than whether they may.
       activityPattern: {
-        chatFrequency: persona.behavior.activity.chatFrequency,
         directReplyLikelihood: persona.behavior.activity.directReplyLikelihood,
         preferredEventTypes: persona.behavior.activity.preferredEventTypes.slice(0, 8),
         ignoredEventTypes: persona.behavior.activity.ignoredEventTypes.slice(0, 8),
@@ -225,11 +227,16 @@ export class PersonaContextBuilder {
         ...persona.interests.games, ...persona.interests.music,
         ...persona.interests.food, ...persona.interests.other,
       ], 12),
+      // recurringReferences are gone from here, and this is the same bug as the literal laugh list
+      // one round earlier, in a channel that round did not audit. supercser2's canon reads "называет
+      // затянутое обсуждение планёркой"; the payload shipped that sentence verbatim, and on a shot of
+      // three men talking on a street the account wrote "Планёрка на улице пошла". A running joke
+      // that has to be quoted to exist is a catchphrase, and quoting it is what turns a scene into a
+      // label. The relationship itself — how well they know him, how much they tease — stays.
       relationshipToStreamer: safeText([
         `знакомство=${persona.streamerRelationship.familiarity}`,
         `поддержка=${persona.streamerRelationship.supportiveness}`,
         `подколы=${persona.streamerRelationship.teasingLevel}`,
-        ...persona.streamerRelationship.recurringReferences.slice(0, 3),
       ].join('; ')),
       disclosureBoundaries: safeText(
         `по умолчанию ${persona.disclosure.defaultLevel}; `
@@ -603,6 +610,22 @@ function laughTendency(persona: BotPersona): string {
       ? 'смеётся коротко и сухо, не растягивая'
       : 'смеётся открыто, иногда в голос';
   return shouts ? `${base}; когда правда смешно, делает это громко` : base;
+}
+
+/**
+ * How much this person writes over an evening, said as a habit rather than as a permission level.
+ *
+ * The same trait used to arrive as `chatFrequency: 'very-low'` inside activityPattern, next to the
+ * event lists the model reads to decide whether to answer, which made it look like a rule about
+ * this moment. It is not: the backend already enforces the spacing. Here it belongs to the voice.
+ */
+function writesHowOften(frequency: PersonaActivityPattern['chatFrequency']): string {
+  return ({
+    'very-low': 'пишет очень редко, больше читает',
+    low: 'пишет нечасто',
+    medium: 'пишет регулярно, но не в каждый момент',
+    high: 'пишет много',
+  })[frequency];
 }
 
 function normalizedPhrase(value: string): string { return value.trim().toLowerCase(); }

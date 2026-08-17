@@ -213,12 +213,13 @@ export interface PersonaBehavior {
   styleInstructions: string;
   verbosity: { minWords: number; maxWords: number };
   /**
-   * Canon only. These describe a character on paper and are read by the audit tooling, not by the
-   * live path: one Brain call decides for every account at once, so a per-persona temperature or
+   * Mostly canon. One Brain call decides for every account at once, so a per-persona temperature or
    * emoji probability has nowhere to apply, and a probability the model is merely shown is a
    * probability it ignores. What actually shapes behaviour is minimumIntervalMs (enforced by the
-   * policy guard), activity.chatFrequency, the topical fit derived from interests and expertise,
-   * and the speech statistics in the generation snapshot.
+   * policy guard), the topical fit derived from interests and expertise, the speech statistics in
+   * the generation snapshot, and — the exception among the fields below — reactionProbability,
+   * which Persona Drive multiplies into a candidate's weight when it picks whom to offer the floor
+   * to. An earlier note here called all of these unused; that was wrong about this one.
    */
   reactionProbability: number;
   uppercaseProbability: number;

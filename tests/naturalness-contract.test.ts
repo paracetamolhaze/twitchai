@@ -108,9 +108,10 @@ describe('what the brain is told about writing like a viewer', () => {
   it('stays short enough to be read as principles rather than skimmed as a rulebook', () => {
     // It reached 11k characters as a list of one-off prohibitions with a restaurant example each.
     // The real guard against that is the no-bugfix-examples case below and the cap on style rules;
-    // this one only catches gross regression, so the number is deliberately loose and was raised
-    // once, when grounding, addressee and evaluator principles were added — three ideas the
-    // instruction genuinely did not contain before, not three more examples of an old one.
+    // this one is a budget. It was raised once, when grounding, addressee and evaluator principles
+    // arrived, and it is now nearly spent on purpose: adding a principle from here means finding
+    // something redundant to cut, which is the pressure that keeps this a set of principles. If this
+    // case fails, trim — do not move the number again.
     //
     // Measured without the interpolated style rules, which have their own cap: sharing one budget
     // meant a principle and a typing rule competed for the same room.
@@ -188,16 +189,23 @@ describe('what the live run showed', () => {
     }
   });
 
-  it('sends no numeric selectivity anywhere the model can read it', () => {
-    // Canon keeps it; the payload must not. 0.96 next to a cooldown the backend already applied is
-    // the same refusal counted twice.
+  it('sends no restraint the backend has already applied for the model to apply again', () => {
+    // Canon keeps both; the payload must not. eventSelectivity 0.96 next to a cooldown the guard has
+    // already enforced is the same refusal counted twice, and chatFrequency 'very-low' next to the
+    // weighting Persona Drive already did with it is the second instance of the same mistake.
     const persona = generatePersonaV3('404notf0und404');
     expect(persona.behavior.activity.eventSelectivity).toBeGreaterThan(0.9);
-    const serialized = JSON.stringify(snapshotBuilder.buildBrainSnapshot('404notf0und404', persona));
+    expect(persona.behavior.activity.chatFrequency).toBe('very-low');
+
+    const snapshot = snapshotBuilder.buildBrainSnapshot('404notf0und404', persona);
+    const serialized = JSON.stringify(snapshot);
     expect(serialized).not.toContain('eventSelectivity');
     expect(serialized).not.toContain(String(persona.behavior.activity.eventSelectivity));
-    // What replaces it is the same trait said in words.
-    expect(serialized).toContain('very-low');
+    expect(serialized).not.toContain('chatFrequency');
+    expect(serialized).not.toContain('very-low');
+    // The trait survives as a habit, where it shapes how the person writes rather than whether they
+    // are allowed to.
+    expect(snapshot.speechFingerprint).toContain('пишет очень редко');
   });
 
   it('lets a situational joke stand as a whole reaction with nothing factual in it', () => {
@@ -292,6 +300,68 @@ describe('what the second live run showed', () => {
     // "Бери СК и не мудри" is not a catchphrase lifted from a profile; it is bluntness performed.
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('The traits in a profile are not a way of talking');
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Nobody talks in mottoes');
+  });
+});
+
+/**
+ * The third live run, on aadf485: 25 moments, 24 completed stream-event decisions, 7 messages, and
+ * a Persona Drive that made six calls and sent nothing. Grounding, addressee and advice held. Two
+ * messages failed in one new way — "чисто домашний вайб пошел ахах" on a shot of a corridor, and
+ * "Планёрка на улице пошла" on a shot of three men talking outside.
+ */
+describe('what the third live run showed', () => {
+  it('treats naming a scene as the same failure as grading a fact', () => {
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Naming is the same failure in different clothes');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('stopping there is a caption');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('If taking the label out leaves nothing behind');
+  });
+
+  it('does not let a laugh certify a caption', () => {
+    // "чисто домашний вайб пошел ахах" — the laugh was the only thing making it sound like chat.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('A laugh on the end of a caption does not make it a reaction');
+  });
+
+  it('keeps metaphor and comparison available when they have a target', () => {
+    // The fix must not cost visual comedy: a real oddity in frame is fair game.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('A joke or a comparison is welcome when it is aimed at something present');
+    for (const word of ['вайб', 'планёрка', 'планёрк']) {
+      expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain(word);
+      expect(REACTION_NATURALNESS_PROMPT).not.toContain(word);
+    }
+  });
+
+  it('stops handing an account the running joke it is supposed to have', () => {
+    // "Планёрка на улице пошла" was not invented. supercser2's canon says it calls a drawn-out
+    // discussion a планёрка, and the payload shipped that sentence verbatim — the literal-laugh bug
+    // again, through a field the previous round did not audit.
+    const persona = generatePersonaV3('supercser2');
+    expect(persona.streamerRelationship.recurringReferences.join(' ')).toContain('планёрк');
+    const serialized = JSON.stringify(snapshotBuilder.buildBrainSnapshot('supercser2', persona));
+    expect(serialized).not.toContain('планёрк');
+    // The relationship itself is not the problem and stays.
+    expect(serialized).toContain('подколы=');
+  });
+
+  it('asks Persona Drive for a specific reason without demanding a unique one', () => {
+    // Six calls, no messages. One rule said a message another account could also have sent was not
+    // worth sending, which is a demand that every line prove a personality.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('The reason must be specific. It does not have to be unique');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('not disqualified because another account could also have sent it');
+    expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain('could have come from any of the other accounts just as easily');
+  });
+
+  it('keeps the timer an opportunity and never a reason', () => {
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('What is never a reason is the timer');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('silence here is frequent and correct');
+    // The framings that produced filler stay gone.
+    for (const removed of ['quiet is the failure', 'turn to speak, not a question of whether to']) {
+      expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain(removed);
+    }
+  });
+
+  it('points Persona Drive at what the session just heard and saw', () => {
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('recentSpeech and recentEvents are what this session has just heard and seen');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('that is where a reason has to come from');
   });
 });
 

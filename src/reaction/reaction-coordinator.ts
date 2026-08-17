@@ -93,9 +93,12 @@ interface SessionDecisionStats {
   eligibleSum: number;
   candidateSum: number;
   excludedByCooldown: number;
-  decisions: number;
-  silentDecisions: number;
-  selectedReactions: number;
+  /**
+   * Counted per mechanism, because the two are meant to be compared and a combined total made that
+   * a subtraction. Reading the last run took working out that 24 of 30 decisions were stream events
+   * and 17 of 23 silences belonged to them.
+   */
+  byTrigger: Record<'stream_event' | 'persona_drive', { decisions: number; silent: number; selected: number }>;
   rejectedReactions: number;
   attention: Record<'notices' | 'passes over' | 'no strong pattern', number>;
 }
@@ -103,7 +106,11 @@ interface SessionDecisionStats {
 function emptySessionStats(): SessionDecisionStats {
   return {
     events: 0, eventsWithoutCandidate: 0, eligibleSum: 0, candidateSum: 0, excludedByCooldown: 0,
-    decisions: 0, silentDecisions: 0, selectedReactions: 0, rejectedReactions: 0,
+    byTrigger: {
+      stream_event: { decisions: 0, silent: 0, selected: 0 },
+      persona_drive: { decisions: 0, silent: 0, selected: 0 },
+    },
+    rejectedReactions: 0,
     attention: { notices: 0, 'passes over': 0, 'no strong pattern': 0 },
   };
 }
@@ -259,10 +266,11 @@ export class ReactionCoordinator extends EventEmitter {
    */
   private logDecision(pending: PendingContext, decision: ReactionDecisionRecord): void {
     const trigger = pending.trigger;
-    this.session.decisions += 1;
-    this.session.selectedReactions += decision.selected.length;
+    const tally = this.session.byTrigger[trigger.kind];
+    tally.decisions += 1;
+    tally.selected += decision.selected.length;
+    if (decision.selected.length === 0) tally.silent += 1;
     this.session.rejectedReactions += decision.rejected.length;
-    if (decision.selected.length === 0) this.session.silentDecisions += 1;
     this.logger.info('Gemini reaction batch validated', {
       eventId: decision.eventId,
       triggerKind: trigger.kind,
@@ -304,8 +312,10 @@ export class ReactionCoordinator extends EventEmitter {
   logSessionSummary(reason: string): void {
     const stats = this.session;
     const drive = this.options.usage.snapshot().currentStream.drive;
+    const events = stats.byTrigger.stream_event;
+    const driven = stats.byTrigger.persona_drive;
     this.session = emptySessionStats();
-    if (stats.events === 0 && stats.decisions === 0) return;
+    if (stats.events === 0 && events.decisions + driven.decisions === 0) return;
     const average = (total: number, count: number): number =>
       (count === 0 ? 0 : Number((total / count).toFixed(2)));
     this.logger.info('Stream decision summary', {
@@ -315,18 +325,27 @@ export class ReactionCoordinator extends EventEmitter {
       averageEligible: average(stats.eligibleSum, stats.events),
       averageCandidates: average(stats.candidateSum, stats.events),
       excludedByCooldown: stats.excludedByCooldown,
-      decisions: stats.decisions,
-      silentDecisions: stats.silentDecisions,
-      selectedReactions: stats.selectedReactions,
+      // Each mechanism on its own line, so how often either one speaks is read rather than derived.
+      streamEventDecisions: events.decisions,
+      streamEventSilent: events.silent,
+      streamEventSelected: events.selected,
+      personaDriveDecisions: driven.decisions,
+      personaDriveSilent: driven.silent,
+      personaDriveSelected: driven.selected,
       rejectedReactions: stats.rejectedReactions,
       attentionNotices: stats.attention.notices,
       attentionPassesOver: stats.attention['passes over'],
       attentionNoPattern: stats.attention['no strong pattern'],
+      // The gates in front of the drive, which is a different question from what it then decided.
+      // driveBrainCalls minus driveSilentDecisions minus driveCancelledForExternalEvent is what
+      // actually reached a persona; the last of those was invisible here and made three cancelled
+      // calls look like three more silences.
       driveTicks: drive.ticks,
       driveEligibleTicks: drive.eligibleTicks,
       driveLocalSkips: drive.localSkips,
       driveBrainCalls: drive.brainCalls,
       driveSilentDecisions: drive.silentDecisions,
+      driveCancelledForExternalEvent: drive.cancelledForExternalEvent,
       driveMessages: drive.messages,
     });
   }

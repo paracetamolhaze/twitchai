@@ -56,6 +56,9 @@ const HOURLY_WINDOW_MS = 60 * 60_000;
 const MAX_MEMORIES_PER_CANDIDATE = 3;
 const MAX_RECENT_OWN_MESSAGES = 4;
 const MAX_RECENT_CHAT_FOR_DRIVE = 15;
+/** The tail of the session, enough to see whether a subject is still live without resending it all. */
+const MAX_RECENT_SPEECH_FOR_DRIVE = 8;
+const MAX_RECENT_EVENTS_FOR_DRIVE = 4;
 /** How long without any own message before "hasn't spoken in a while" stops adding extra weight. */
 const IDLE_REFERENCE_WINDOW_MS = 30 * 60_000;
 
@@ -212,6 +215,15 @@ export class PersonaDriveService {
       snapshot.recentEvents.at(-1)?.timestamp ?? 0,
       snapshot.recentSpeech.at(-1)?.timestamp ?? 0,
     ) || undefined;
+    // What was just heard and just seen. The drive fires twelve seconds after the last observation,
+    // so the subject is still live — but the payload used to read these two arrays only for their
+    // newest timestamp and throw the content away, leaving the model to answer "does anyone have
+    // something to add" with no idea what there was to add to. Same state, already in memory, no
+    // extra call: the drive now sees the tail of the session it is being asked about.
+    const recentSpeech = snapshot.recentSpeech.slice(-MAX_RECENT_SPEECH_FOR_DRIVE)
+      .map(({ timestamp, text }) => ({ timestamp, text }));
+    const recentEvents = snapshot.recentEvents.slice(-MAX_RECENT_EVENTS_FOR_DRIVE)
+      .map(({ timestamp, type, summary }) => ({ timestamp, type, summary }));
     const input: BrainDriveOpportunityInput = {
       triggerKind: 'persona_drive',
       channel: snapshot.channel,
@@ -220,6 +232,8 @@ export class PersonaDriveService {
       candidates: driveCandidates,
       recentChat: snapshot.recentChat.slice(-MAX_RECENT_CHAT_FOR_DRIVE)
         .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
+      ...(recentSpeech.length > 0 ? { recentSpeech } : {}),
+      ...(recentEvents.length > 0 ? { recentEvents } : {}),
       ...(lastObservationAt !== undefined
         ? { secondsSinceLastObservation: Math.round((now - lastObservationAt) / 1000) }
         : {}),

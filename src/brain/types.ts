@@ -22,12 +22,13 @@ export interface BrainPersonaSnapshot {
   /** Character's own weaknesses and rough edges — the model should let these show, not smooth them over. */
   flaws: string[];
   /**
-   * eventSelectivity is deliberately not here. It remains canon and remains in the audit tooling,
-   * but a bare 0.82 in the payload reads as a standing instruction to stay quiet, and it used to
-   * arrive here and again on every event. chatFrequency carries the same trait qualitatively.
+   * Neither eventSelectivity nor chatFrequency is here. Both remain canon and both are already
+   * applied deterministically by the backend — one as the policy guard's per-account interval, the
+   * other as the weight Persona Drive uses when choosing whom to offer the floor to. Repeating them
+   * to the model is the same restraint counted twice by a reader who cannot see the first count.
+   * How talkative a character is now travels inside speechFingerprint as a habit.
    */
   activityPattern: {
-    chatFrequency: 'very-low' | 'low' | 'medium' | 'high';
     directReplyLikelihood: number;
     preferredEventTypes?: string[];
     ignoredEventTypes?: string[];
@@ -222,6 +223,19 @@ export interface BrainDriveOpportunityInput {
   streamContext: string;
   candidates: BrainDriveCandidate[];
   recentChat: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
+  /**
+   * What this session has just heard and just seen — the only place a reason to speak could come
+   * from, and until now the one thing this payload did not contain.
+   *
+   * The drive was asked whether anybody had something to add while being shown the chat (nearly
+   * empty on an IRL stream), each account's own last few messages, and memories from other
+   * evenings. Twelve seconds after the stream said "вебку вот так делать, чтобы IRL был" a drive
+   * call went out and came back silent, while the event path — handed the same words — produced "с
+   * камерой норм задумка, живее будет". The instruction asked for a thought about what is
+   * happening; what is happening was not in the request.
+   */
+  recentSpeech?: Array<{ timestamp: number; text: string }>;
+  recentEvents?: Array<Pick<StreamEvent, 'timestamp' | 'type' | 'summary'>>;
   /**
    * How long ago perception last reported anything at all. A spontaneous message written while
    * this is minutes old is being written against a scene that has since moved on, so the decision

@@ -307,6 +307,52 @@ describe('PersonaDriveService', () => {
       service.stop();
     });
 
+    it('shows the Brain what the session just heard and saw, not only how long ago', async () => {
+      // Six drive calls produced nothing on a live run, and this is why: the payload carried the
+      // chat (nearly empty on an IRL stream), each account's own last messages, memories from other
+      // evenings, and the age of the newest observation — never its content. The instruction asks
+      // for a thought about what is happening; what was happening was not in the request. Twelve
+      // seconds after the stream explained a webcam plan a drive call came back silent while the
+      // event path, handed the same words, wrote "с камерой норм задумка, живее будет".
+      vi.useFakeTimers();
+      const now = Date.now();
+      const { service, contextStore, evaluateOpportunity } = await harness();
+      contextStore.addSpeech('S: вебку вот так делать, чтобы IRL был', now - 12_000);
+      contextStore.addSpeech('O: наверно Сларк умер', now - 6_000);
+      contextStore.addEvent({
+        id: 'event-1', timestamp: now - 6_000, type: 'conversation',
+        summary: 'S: вебку вот так делать, чтобы IRL был',
+        importance: 0.5, confidence: 0.9, source: 'transcription', directMentions: [],
+      });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      const input = evaluateOpportunity.mock.calls[0]?.[0];
+      expect(input?.recentSpeech?.map((line) => line.text)).toEqual([
+        'S: вебку вот так делать, чтобы IRL был',
+        'O: наверно Сларк умер',
+      ]);
+      expect(input?.recentEvents?.map((item) => item.summary)).toEqual([
+        'S: вебку вот так делать, чтобы IRL был',
+      ]);
+      // Still told the age, so a stale subject is still droppable. Six seconds old when seeded, plus
+      // the one second the scheduler waits before the tick.
+      expect(input?.secondsSinceLastObservation).toBe(7);
+      service.stop();
+    });
+
+    it('omits the hooks entirely when the session has observed nothing yet', async () => {
+      // Absent rather than empty: a drive opportunity with nothing behind it should look like one.
+      vi.useFakeTimers();
+      const { service, evaluateOpportunity } = await harness();
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      const input = evaluateOpportunity.mock.calls[0]?.[0];
+      expect(input).not.toHaveProperty('recentSpeech');
+      expect(input).not.toHaveProperty('recentEvents');
+      service.stop();
+    });
+
     it('two consecutive trailing AI messages block a drive attempt (A → B → C is blocked)', async () => {
       vi.useFakeTimers();
       const now = Date.now();
