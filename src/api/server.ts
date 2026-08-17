@@ -21,6 +21,7 @@ import { BotPersona, PersonaAuditReport, PersonaMemoryItem, PersonaSummary } fro
 import { BotAccountRecord } from '../persistence/repository';
 import { ReactionDecisionRecord, ReactionTraceRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
+import { MessageVerdictRecord } from '../personas/types';
 import { DeliveryRecordSnapshot } from '../twitch/delivery-record';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
@@ -65,6 +66,8 @@ export interface ApiServerDependencies {
   chat: () => ChatMessage[];
   usage: () => UsageSnapshot;
   deliveryRecord?: () => DeliveryRecordSnapshot;
+  rateMessage?: (verdict: Omit<MessageVerdictRecord, 'id' | 'createdAt'>) => Promise<void>;
+  listMessageVerdicts?: () => Promise<MessageVerdictRecord[]>;
   decisions?: () => ReactionDecisionRecord[];
   reactionTraces?: () => ReactionTraceRecord[];
   settings: () => Promise<Record<string, unknown>>;
@@ -298,6 +301,28 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
   app.get('/api/diagnostics/delivery', (_request, response) => {
     if (!dependencies.deliveryRecord) return response.status(503).json({ error: 'Учёт доставки недоступен' });
     return response.json(dependencies.deliveryRecord());
+  });
+  // The operator's judgement on a message, which becomes an example the decision layer reads.
+  // Rules carry taste badly; an em dash survived three separate attempts to forbid it by rule.
+  app.post('/api/message-verdicts', async (request, response, next) => {
+    if (!dependencies.rateMessage) return response.status(503).json({ error: 'Оценка сообщений недоступна' });
+    try {
+      const body = z.object({
+        username: z.string().trim().min(1).max(60),
+        message: z.string().trim().min(1).max(500),
+        verdict: z.enum(['good', 'bad']),
+        note: z.string().trim().max(400).optional(),
+        eventSummary: z.string().trim().max(600).optional(),
+      }).strict().parse(request.body);
+      await dependencies.rateMessage(body);
+      return response.status(204).end();
+    } catch (error) { return next(error); }
+  });
+  app.get('/api/message-verdicts', async (_request, response, next) => {
+    if (!dependencies.listMessageVerdicts) return response.status(503).json({ error: 'Оценка сообщений недоступна' });
+    try {
+      return response.json(await dependencies.listMessageVerdicts());
+    } catch (error) { return next(error); }
   });
   app.get('/api/overview', (_request, response) => response.json(dependencies.overview()));
   app.get('/api/bots', (_request, response) => response.json(dependencies.bots()));

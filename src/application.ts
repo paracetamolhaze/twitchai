@@ -3,7 +3,7 @@ import { ApiServer, createApiServer } from './api/server';
 import { GeminiBrainService } from './brain/gemini-brain.service';
 import { GoogleInteractionsClient } from './brain/google-interactions.client';
 import { OpenRouterBrainClient } from './brain/openrouter-brain.client';
-import { BrainBootstrap, BrainDecision, BrainDynamicDelta, GeminiBrainStatus } from './brain/types';
+import { BrainBootstrap, BrainDecision, BrainDynamicDelta, BrainEventInput, GeminiBrainStatus } from './brain/types';
 import { accumulatesMemory, AppConfig, normalizeChannel } from './config';
 import { GlobalStreamerMemory } from './global-memory/global-streamer-memory';
 import { StreamerMemory } from './global-memory/types';
@@ -89,6 +89,7 @@ export class Application {
   private transcriber?: SpeechTranscriber;
   private speechEvents?: SpeechEventSynthesizer;
   private sceneWatcher?: SceneWatcher;
+  private tasteCache?: { at: number; value: BrainEventInput['channelTaste'] };
   private twitchOAuth?: TwitchOAuthService;
   private categoryTimer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
@@ -181,6 +182,7 @@ export class Application {
     this.coordinator = new ReactionCoordinator({
       policy: this.policy,
       freshnessMs: this.config.reaction.freshnessMs,
+      taste: () => this.channelTaste(),
       onDelivery: ({ username, result, reason }) => {
         if (result === 'sent') this.deliveryRecord.recordSent(username);
         else if (result === 'shown') this.deliveryRecord.recordShown(username);
@@ -432,6 +434,15 @@ export class Application {
       chat: () => this.contextStore.snapshot().recentChat,
       usage: () => this.usage.snapshot(),
       deliveryRecord: () => this.deliveryRecord.snapshot(),
+      rateMessage: async (verdict) => {
+        await this.repository.saveMessageVerdict({
+          id: randomUUID(), createdAt: Date.now(), ...verdict,
+        });
+        // Dropped so the next decision reads the new verdict instead of the cached set.
+        this.tasteCache = undefined;
+        this.logger.info('Message rated by operator', { username: verdict.username, verdict: verdict.verdict });
+      },
+      listMessageVerdicts: () => this.repository.listMessageVerdicts(100),
       decisions: () => [...this.decisions].reverse(),
       reactionTraces: () => [...this.reactionTraces].reverse(),
       settings: () => this.getSettings(),
@@ -1029,6 +1040,29 @@ export class Application {
     };
     void refresh();
     this.categoryTimer = setInterval(() => { void refresh(); }, this.config.twitch.categoryRefreshMs);
+  }
+
+  /**
+   * Read once and kept for a while: a verdict changes when the operator marks a message, not per
+   * decision, and every event would otherwise pay for the same query.
+   */
+  private async channelTaste(): Promise<BrainEventInput['channelTaste']> {
+    const now = Date.now();
+    if (this.tasteCache && now - this.tasteCache.at < 60_000) return this.tasteCache.value;
+    try {
+      const verdicts = await this.repository.listMessageVerdicts(40);
+      const value = {
+        wanted: verdicts.filter((item) => item.verdict === 'good').slice(0, 8).map((item) => item.message),
+        unwanted: verdicts.filter((item) => item.verdict === 'bad').slice(0, 8)
+          .map((item) => ({ message: item.message, ...(item.note ? { why: item.note } : {}) })),
+      };
+      const taste = value.wanted.length > 0 || value.unwanted.length > 0 ? value : undefined;
+      this.tasteCache = { at: now, value: taste };
+      return taste;
+    } catch (cause) {
+      this.logger.warn('Could not read message verdicts', { cause });
+      return undefined;
+    }
   }
 
   private transcriptionModel(): string {

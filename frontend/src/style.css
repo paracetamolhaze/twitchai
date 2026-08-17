@@ -202,6 +202,8 @@ meter { width: 100%; height: 4px; accent-color: var(--green); }
 .streamer-memory-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 13px; }
 .streamer-memory-actions .danger-button { margin-left: auto; }
 .text-button.warning { color: var(--amber); }
+.verdict-actions { display: inline-flex; gap: .6rem; margin-left: auto; }
+.verdict-actions .text-button.chosen { color: var(--green); font-weight: 600; }
 .silence-warning { color: var(--amber); }
 .silence-critical { color: var(--red); }
 .streamer-memory-edit { display: grid; gap: 13px; }

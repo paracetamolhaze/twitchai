@@ -2,6 +2,7 @@ import { ReactionExample } from '../learning/types';
 import { StreamerMemory, StreamSession } from '../global-memory/types';
 import {
   BotMessageRecord,
+  MessageVerdictRecord,
   BotPersona,
   PersonaConversationMessage,
   PersonaMemoryItem,
@@ -31,6 +32,7 @@ export class MemoryRepository implements AppRepository {
   private twitchOAuthNonces = new Map<string, TwitchOAuthNonceRecord>();
   private messages: BotMessageRecord[] = [];
   private examples: ReactionExample[] = [];
+  private readonly verdicts: MessageVerdictRecord[] = [];
   private events: StreamEvent[] = [];
   private settings: Record<string, unknown> = {};
   private usage?: UsageSnapshot;
@@ -186,6 +188,10 @@ export class MemoryRepository implements AppRepository {
   }
   async saveReactionExample(example: ReactionExample): Promise<void> { this.examples.push(clone(example)); }
   async listReactionExamples(limit: number): Promise<ReactionExample[]> { return this.examples.slice(-limit).reverse().map(clone); }
+  async saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void> { this.verdicts.push(clone(verdict)); }
+  async listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
+    return this.verdicts.slice(-limit).reverse().map(clone);
+  }
   async saveStreamEvent(event: StreamEvent): Promise<void> {
     const index = this.events.findIndex((candidate) => candidate.id === event.id);
     if (index >= 0) this.events[index] = clone(event);

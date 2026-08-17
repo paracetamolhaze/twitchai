@@ -233,7 +233,6 @@ describe('Gemini 3.7 stateful Brain', () => {
         };
       },
     };
-    let secondBootstrap: BrainBootstrap | undefined;
     const service = brainService(client, {
       contextRolloverTokens: 750,
       bootstrap: async (reason) => {
@@ -253,8 +252,8 @@ describe('Gemini 3.7 stateful Brain', () => {
       ['bootstrap', undefined], ['decision', 'R4'],
     ]);
     expect(requests[2]?.input).toContain('session_handover');
-    secondBootstrap = JSON.parse(requests[3]!.input) as BrainBootstrap;
-    expect(secondBootstrap.previousSessionSummary).toContain('голубя');
+    const carried = JSON.parse(requests[3]!.input) as BrainBootstrap;
+    expect(carried.previousSessionSummary).toContain('голубя');
     expect(service.getStatus().rollovers).toBe(1);
   });
 

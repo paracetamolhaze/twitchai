@@ -636,6 +636,7 @@ async function loadDashboard(): Promise<void> {
     ])
     // Reading a record costs nothing, so it loads with everything else instead of behind a button.
     void loadDeliveryRecord()
+    void api<MessageVerdict[]>('/api/message-verdicts').then((items) => { messageVerdicts.value = items })
     Object.assign(overview, overviewData)
     Object.assign(usage, usageData)
     bots.value = botData
@@ -767,6 +768,46 @@ interface DeliveryRecordSnapshot {
   accounts: DeliveryAccountRecord[]
 }
 const deliveryRecord = ref<DeliveryRecordSnapshot | undefined>()
+
+interface MessageVerdict {
+  id: string; createdAt: number; username: string; message: string
+  verdict: 'good' | 'bad'; note?: string; eventSummary?: string
+}
+const messageVerdicts = ref<MessageVerdict[]>([])
+const verdictBusy = ref(false)
+
+function verdictFor(message: ChatMessage): 'good' | 'bad' | undefined {
+  return messageVerdicts.value.find((item) => item.message === message.message
+    && item.username.toLowerCase() === message.username.toLowerCase())?.verdict
+}
+
+/**
+ * A verdict is worth more than a rule here: it reaches the decision layer as an example of what
+ * this channel wanted, and the note explains a miss better than any instruction can.
+ */
+async function rateMessage(message: ChatMessage, verdict: 'good' | 'bad'): Promise<void> {
+  const note = verdict === 'bad'
+    ? (window.prompt('Что с ним не так? Можно оставить пустым.') ?? '').trim()
+    : ''
+  verdictBusy.value = true
+  errorMessage.value = ''
+  try {
+    await api('/api/message-verdicts', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: message.username,
+        message: message.message,
+        verdict,
+        ...(note ? { note } : {}),
+      }),
+    })
+    messageVerdicts.value = await api<MessageVerdict[]>('/api/message-verdicts')
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    verdictBusy.value = false
+  }
+}
 
 async function loadDeliveryRecord(): Promise<void> {
   errorMessage.value = ''
@@ -1789,7 +1830,8 @@ onBeforeUnmount(() => {
 
         <template v-else-if="activePage === 'chat'">
           <div class="page-heading"><div><p class="eyebrow">КОНТЕКСТ В РЕАЛЬНОМ ВРЕМЕНИ</p><h1>Чат Twitch</h1></div><p class="muted">Сообщения зрителей, ботов и системы отмечены отдельно.</p></div>
-          <section class="panel chat-feed"><article v-for="message in [...chat].reverse()" :key="message.id" :class="['chat-line', message.kind]"><time>{{ formatTime(message.timestamp) }}</time><span class="kind-chip">{{ kindLabel(message.kind) }}</span><strong>{{ message.displayName }}</strong><p>{{ message.message }}</p></article><div v-if="!chat.length" class="empty-state">Сообщения появятся, когда хотя бы один бот войдёт в канал.</div></section>
+          <p class="muted">Оценка сообщения бота попадает прямо в решения: удачные становятся примерами того, как здесь пишут, неудачные — списком того, чего делать не надо. Правилами вкус передаётся плохо, примерами хорошо.</p>
+          <section class="panel chat-feed"><article v-for="message in [...chat].reverse()" :key="message.id" :class="['chat-line', message.kind]"><time>{{ formatTime(message.timestamp) }}</time><span class="kind-chip">{{ kindLabel(message.kind) }}</span><strong>{{ message.displayName }}</strong><p>{{ message.message }}</p><span v-if="message.kind === 'bot'" class="verdict-actions"><button type="button" :class="['text-button', verdictFor(message) === 'good' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'good')">нравится</button><button type="button" :class="['text-button', verdictFor(message) === 'bad' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'bad')">не нравится</button></span></article><div v-if="!chat.length" class="empty-state">Сообщения появятся, когда хотя бы один бот войдёт в канал.</div></section>
         </template>
 
         <template v-else>

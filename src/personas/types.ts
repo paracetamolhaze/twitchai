@@ -319,6 +319,25 @@ export interface PersonaConversationMessage {
   expiresAt: number;
 }
 
+/**
+ * The operator's judgement on one message the accounts sent.
+ *
+ * Rules in the instruction carry taste badly — an em dash survived three separate attempts to
+ * forbid it — while examples carry it well. A verdict here becomes an example the decision layer
+ * reads: these are the messages this channel wanted, and these are the ones it did not.
+ */
+export interface MessageVerdictRecord {
+  id: string;
+  createdAt: number;
+  username: string;
+  message: string;
+  verdict: 'good' | 'bad';
+  /** Optional note in the operator's own words, which says more than the verdict alone. */
+  note?: string;
+  /** What the message was answering, when it is still known. */
+  eventSummary?: string;
+}
+
 export interface BotMessageRecord {
   id: string;
   username: string;

@@ -131,6 +131,16 @@ export interface BrainEventInput {
    * against the topic at hand.
    */
   streamerMemories?: Array<{ type: string; summary: string }>;
+  /**
+   * How this channel's operator judged earlier messages, with their own words where they gave them.
+   * Rules carry taste badly — an em dash survived three separate attempts to forbid it — and
+   * examples carry it well. wanted are messages to write more like; unwanted are the mistakes,
+   * which are worth more than any rule because they name what looked fine and was not.
+   */
+  channelTaste?: {
+    wanted: string[];
+    unwanted: Array<{ message: string; why?: string }>;
+  };
   targetedPersonaContext: BrainTargetedPersonaContext[];
   reactionExamples: ReactionExample[];
   deltas: BrainDynamicDelta[];

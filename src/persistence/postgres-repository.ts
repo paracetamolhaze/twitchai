@@ -3,6 +3,7 @@ import { StreamerMemory, StreamSession } from '../global-memory/types';
 import { ReactionExample } from '../learning/types';
 import {
   BotMessageRecord,
+  MessageVerdictRecord,
   BotPersona,
   PersonaConversationMessage,
   PersonaMemoryItem,
@@ -390,6 +391,35 @@ export class PostgresRepository implements AppRepository {
       id: row.id, timestamp: row.occurred_at.getTime(), game: row.game, streamContext: row.stream_context,
       eventType: row.event_type, event: row.event_summary, chatMessages: row.chat_messages,
       ...(row.transcript ? { transcript: row.transcript } : {}),
+    }));
+  }
+
+  async saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO message_verdicts (id, created_at, username, message, verdict, note, event_summary)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [verdict.id, new Date(verdict.createdAt), verdict.username, verdict.message, verdict.verdict,
+        verdict.note ?? null, verdict.eventSummary ?? null],
+    );
+  }
+
+  async listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
+    const result = await this.pool.query<{
+      id: string; created_at: Date; username: string; message: string;
+      verdict: string; note: string | null; event_summary: string | null;
+    }>(
+      `SELECT id, created_at, username, message, verdict, note, event_summary
+       FROM message_verdicts ORDER BY created_at DESC LIMIT $1`,
+      [limit],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      createdAt: row.created_at.getTime(),
+      username: row.username,
+      message: row.message,
+      verdict: row.verdict === 'good' ? 'good' as const : 'bad' as const,
+      ...(row.note ? { note: row.note } : {}),
+      ...(row.event_summary ? { eventSummary: row.event_summary } : {}),
     }));
   }
 

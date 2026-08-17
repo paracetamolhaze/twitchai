@@ -8,7 +8,7 @@ import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { MemoryRepository } from '../src/persistence/memory-repository';
-import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
+import { ReactionCoordinator, ReactionCoordinatorOptions } from '../src/reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
 import { ReactionBotCandidate, ReactionTraceRecord } from '../src/reaction/types';
 import { ContextStore } from '../src/stream-brain/context-store';
@@ -38,7 +38,14 @@ function bot(username: string, index: number): ReactionBotCandidate {
 
 type SenderResult = boolean | ((username: string, message: string) => boolean | Promise<boolean>);
 
-async function setup(senderResult: SenderResult = true, now: () => number = () => event.timestamp) {
+async function setup(
+  senderResult: SenderResult | { taste: ReactionCoordinatorOptions['taste'] } = true,
+  now: () => number = () => event.timestamp,
+) {
+  const overrides = typeof senderResult === 'object' && senderResult !== null && 'taste' in senderResult
+    ? senderResult
+    : undefined;
+  const sendResult: SenderResult = overrides ? true : senderResult as SenderResult;
   const repository = new MemoryRepository();
   await repository.initialize();
   const history = new BotHistory(repository);
@@ -71,7 +78,7 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
     sender: {
       send: async (username, message) => {
         sent.push({ username, message });
-        const accepted = await (typeof senderResult === 'function' ? senderResult(username, message) : senderResult);
+        const accepted = await (typeof sendResult === 'function' ? sendResult(username, message) : sendResult);
         return accepted
           ? { submitted: true, submittedAt: now() }
           : { submitted: false, reason: 'twitch_send_failed' };
@@ -92,6 +99,7 @@ async function setup(senderResult: SenderResult = true, now: () => number = () =
     observesChat: () => observesChat,
     deliveryEchoTimeoutMs: 10_000,
     now,
+    ...overrides,
   });
   return {
     coordinator, globalMemory, history, policy, sent, usage, personaMemory,
@@ -572,6 +580,23 @@ describe('single-session reaction protocol', () => {
       if (entry.username === 'bot-two') continue;
       expect(entry.memories).toEqual([]);
     }
+    await coordinator.stop();
+  });
+
+  it('carries the operator’s own verdicts into the decision as examples', async () => {
+    // Rules carry taste badly — an em dash survived three separate attempts to forbid it — while a
+    // message the operator marked, with their reason, says what no instruction managed to.
+    const { coordinator } = await setup({
+      taste: async () => ({
+        wanted: ['в тарелку камеру наведи, не видно же'],
+        unwanted: [{ message: 'Понял он всё, дал провод.', why: 'пересказ того, что видно' }],
+      }),
+    });
+    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'taste-event' }, 0);
+    expect(prepared.channelTaste?.wanted).toEqual(['в тарелку камеру наведи, не видно же']);
+    expect(prepared.channelTaste?.unwanted).toEqual([
+      { message: 'Понял он всё, дал провод.', why: 'пересказ того, что видно' },
+    ]);
     await coordinator.stop();
   });
 

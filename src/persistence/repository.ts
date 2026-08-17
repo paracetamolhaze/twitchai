@@ -3,6 +3,7 @@ import { StreamerMemory, StreamSession } from '../global-memory/types';
 import {
   BotMessageRecord,
   BotPersona,
+  MessageVerdictRecord,
   PersonaConversationMessage,
   PersonaMemoryItem,
   PersonaRelationship,
@@ -112,6 +113,8 @@ export interface AppRepository {
   listBotMessages(username: string, limit: number): Promise<BotMessageRecord[]>;
   saveReactionExample(example: ReactionExample): Promise<void>;
   listReactionExamples(limit: number): Promise<ReactionExample[]>;
+  saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void>;
+  listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]>;
   saveStreamEvent(event: StreamEvent): Promise<void>;
   listStreamEvents(limit: number): Promise<StreamEvent[]>;
   getSettings(): Promise<Record<string, unknown>>;
