@@ -195,7 +195,13 @@ const envSchema = z.object({
   GLOBAL_MEMORY_CHANNEL: z.string().default(''),
   TRANSCRIPTION_MODE: z.enum(['live', 'shadow', 'transcriber']).default('live'),
   TRANSCRIPTION_PROVIDER: z.enum(['openrouter', 'groq']).default('openrouter'),
-  TRANSCRIPTION_MODEL: z.string().default('google/gemini-3.5-flash-lite'),
+  // Chosen on a real minute of the stream rather than on a synthesised phrase, which is how the
+  // previous choice went wrong: clean studio speech says nothing about a far-field microphone with
+  // three people talking over café noise. On that minute 3.7-flash caught whole idioms
+  // ("инициатива, как говорится, наказуема") where 3.5-flash-lite produced "оличная два вообще базу
+  // выдаёт" for "уличные торговцы вообще базу выдают" — and cost less per window measured, not
+  // assumed. 3.5-flash, the full one, leaked its own deliberation into the transcript.
+  TRANSCRIPTION_MODEL: z.string().default('google/gemini-3.7-flash'),
   TRANSCRIPTION_GROQ_MODEL: z.string().default('whisper-large-v3-turbo'),
   // How much audio goes in one request. An hour of audio is about ninety thousand tokens, three
   // cents, so windows exist to shape latency and request count rather than to save money.
