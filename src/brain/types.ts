@@ -60,6 +60,15 @@ export interface BrainBootstrap {
     entities: string[];
   }>;
   recentMeaningfulEvents: Array<Pick<StreamEvent, 'id' | 'timestamp' | 'type' | 'summary' | 'importance'>>;
+  /**
+   * What the stream has been about so far, written by the session being replaced.
+   *
+   * A rollover exists to stop one conversation's per-call cost from growing without limit, and it
+   * used to do that by forgetting: everything said and decided since the stream began went away
+   * with the chain. This carries it across in a few hundred tokens instead, so a shorter rollover
+   * threshold costs recall of detail rather than recall of the stream.
+   */
+  previousSessionSummary?: string;
   recentChat: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
 }
 
@@ -104,6 +113,18 @@ export interface BrainEventInput {
    * them, which is most of why the messages read as commentary rather than as somebody talking.
    */
   recalledMemories?: Array<{ username: string; memories: Array<{ type: string; summary: string }> }>;
+  /**
+   * The same description of a candidate the spontaneous layer has always received: mood, how
+   * engaged they are, how much they have already said this session. That layer picks whoever has
+   * the most to work with and its messages read better for it; reactions were handed whoever
+   * happened to be off cooldown, with no way to tell one from another.
+   */
+  candidateStates?: Array<{
+    username: string;
+    mood: string;
+    engagement: number;
+    sessionMessageCount: number;
+  }>;
   /**
    * What is known about this streamer that bears on this particular moment, looked up by the words
    * that were just said. Session start loads a handful of memories and nothing re-reads them

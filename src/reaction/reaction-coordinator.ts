@@ -433,6 +433,15 @@ export class ReactionCoordinator extends EventEmitter {
       availableBots: candidates.map((candidate) => candidate.username),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
+      candidateStates: candidates.map((candidate) => {
+        const state = this.options.personaRuntime.get(candidate.persona.id);
+        return {
+          username: candidate.username,
+          mood: state.mood,
+          engagement: state.engagement,
+          sessionMessageCount: state.sessionMessageCount,
+        };
+      }),
       ...(streamerMemories.length > 0 ? { streamerMemories } : {}),
       // Only what was said around this moment: older lines belong to a part of the stream the
       // event is not about, and the chain already carries them from earlier turns.

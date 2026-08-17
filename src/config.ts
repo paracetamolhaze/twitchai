@@ -157,7 +157,11 @@ const envSchema = z.object({
   // old default) let a single session's per-call cost run into the hundreds of thousands of
   // tokens before ever resetting. Roll over much sooner instead; a fresh bootstrap is cheap
   // (~15K tokens) next to letting the chain run unchecked.
-  BRAIN_CONTEXT_ROLLOVER_TOKENS: z.coerce.number().int().min(100_000).max(1_048_576).default(150_000),
+  // Each chained call re-reads the whole conversation, so this bounds what one decision can cost.
+  // Lower than it looks safe because a rollover no longer forgets: the outgoing session writes a
+  // recap that travels into the next one, so the shorter chain costs recall of detail, not of the
+  // stream. Measured at 150k the chain grew about 1.4k tokens a minute and reached 53k in 38.
+  BRAIN_CONTEXT_ROLLOVER_TOKENS: z.coerce.number().int().min(20_000).max(1_048_576).default(60_000),
   // Must stay below the 45s reaction context TTL: a decision arriving after its context expired is
   // discarded anyway, so waiting longer only holds up every event queued behind it.
   BRAIN_INTERACTION_TIMEOUT_SECONDS: z.coerce.number().int().min(5).max(40).default(35),

@@ -575,6 +575,19 @@ describe('single-session reaction protocol', () => {
     await coordinator.stop();
   });
 
+  it('describes every candidate so the choice is made on material, not availability', async () => {
+    // The spontaneous layer always received this and picks whoever has the most to work with; its
+    // messages read better for it. Reactions were handed whoever happened to be off cooldown.
+    const { coordinator } = await setup();
+    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'described-event' }, 0);
+    expect(prepared.candidateStates).toEqual([
+      expect.objectContaining({ username: 'bot-one', mood: expect.any(String), engagement: expect.any(Number) }),
+      expect.objectContaining({ username: 'bot-two' }),
+      expect.objectContaining({ username: 'bot-three' }),
+    ]);
+    await coordinator.stop();
+  });
+
   it('scales how many accounts answer one moment with how many are available', async () => {
     // A fixed three was written for a full chat and reads as a pile-up on a small one: with four
     // accounts connected, two answered the same event a second apart with two wordings of one

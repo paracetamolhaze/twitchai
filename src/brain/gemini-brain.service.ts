@@ -95,6 +95,12 @@ const decisionSchema = z.object({
 }).strict();
 
 const readySchema = z.object({ ready: z.literal(true) }).strict();
+const summarySchema = z.object({ summary: z.string().max(2_000) }).strict();
+
+const SESSION_SUMMARY_RESPONSE_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['summary'],
+  properties: { summary: { type: 'string' } },
+} as const;
 
 export const BRAIN_DECISION_RESPONSE_SCHEMA = {
   type: 'object',
@@ -151,6 +157,8 @@ const READY_RESPONSE_SCHEMA = {
  * triggerKind instead, so the model never has to infer which class of input it received.
  */
 export const BRAIN_SYSTEM_INSTRUCTION = `You are the stateful decision and writing brain for a group of distinct persistent Twitch chat characters.
+A request may also carry triggerKind session_handover: the conversation so far is being replaced to keep its per-call cost bounded, and this is the one chance to write down what the stream has been about. Answer with the summary and nothing else. previousSessionSummary at the start of a session is that text from the session before it — treat it as this stream's own history, already lived rather than read about.
+
 Every request carries a triggerKind of either external_stream_event or persona_drive. Use it to tell the two apart; never guess from shape alone.
 
 triggerKind external_stream_event: decide whether any reaction is natural to the supplied StreamEvent, select zero to N currently available usernames, and write the final short Twitch-native messages. Natural silence is correct. Never force every account to write. Avoid duplicate thoughts and keep each selected voice distinct. Direct spoken mentions have high social relevance when the exact username is available, but never create an unconditional reply rule.
@@ -162,6 +170,8 @@ recentSpeech is what was actually said, transcribed. The event summary is a seco
 When mergedObservations is present, several separate things were noticed close together and the event's own summary is their texts joined into one string. Treat mergedObservations as the truth and that joined summary as a convenience: they did not happen as one moment, so never write a reply that describes them as a single connected scene, and never invent a link between them. Reacting to one of them, or to none, is usually right. An observation carries confidence — a low one is something perception was unsure it saw, so never restate it as established fact.
 
 triggerKind persona_drive: an internal spontaneous-expression opportunity supplied by the backend, not an external event. Nothing necessarily happened on stream — never pretend it did, and never describe an event that was not supplied. The backend has already judged the timing and the candidates, so this is a turn to speak, not a question of whether to. Pick the candidate with the most to work with and write their message. A chat this quiet is the failure, not a risk worth avoiding: an ordinary aside about what is on screen, a reaction to something said a moment ago, an unfinished thought from earlier, or a plain remark in that character's voice is enough — it does not need to be clever or important. Return reactions: [] only when the supplied candidates genuinely have nothing, which is rare, and never as the safe default. secondsSinceLastObservation says how long ago the stream was last observed at all. Once it is past roughly two minutes, whatever was last seen is no longer what is happening: do not continue that topic, do not describe it as current, and do not answer another account still discussing it. Write something that stands on its own in that character's voice, or return reactions: [] — a stale scene is one of the rare cases where silence is genuinely the better answer. At most one persona may speak. A message may naturally arise only from that candidate's supplied memory, stable interests, mood, engagement, relationship context, an unresolved prior topic, or something that persona previously said — never invent a memory, never expose another candidate's memory, and never manufacture generic filler such as "как дела?", "что нового?", or "чат вы где?" without a persona-specific reason. The message should sound like the persona naturally decided to say it, not like an AI announcing that it remembered something.
+
+candidateStates describes each available account: mood, engagement, how much they have already said this session. Choose who speaks the way the spontaneous layer does — whoever has the most to work with for this particular moment, judged by their memory, their mood and how much of the stream they have been quiet for. Availability is not a reason to select someone, and an account that has already said a lot is the weaker choice against one who has been listening.
 
 recalledMemories is what each available account personally remembers, two things each, and it is where that character's opinions live. Use the selected account's own entries and nothing from another's. A memory is a reason to have a view, not a thing to announce: it shapes what they say about the moment, and saying "я помню, как..." out loud is almost always wrong. streamerMemories are facts about this streamer that match what was just said, and they may be referred to as things everyone watching knows.
 
@@ -343,8 +353,13 @@ export class GeminiBrainService extends EventEmitter {
     return queued.then(() => result);
   }
 
-  private async bootstrap(reason: 'stream_start' | 'recovery' | 'rollover', generation: number): Promise<void> {
-    const snapshot = await this.options.bootstrap(reason);
+  private async bootstrap(
+    reason: 'stream_start' | 'recovery' | 'rollover',
+    generation: number,
+    previousSessionSummary?: string,
+  ): Promise<void> {
+    const built = await this.options.bootstrap(reason);
+    const snapshot = previousSessionSummary ? { ...built, previousSessionSummary } : built;
     if (generation !== this.sessionGeneration) return;
     const input = JSON.stringify(snapshot);
     const startedAt = this.now();
@@ -568,12 +583,48 @@ export class GeminiBrainService extends EventEmitter {
   private async rollover(): Promise<void> {
     const generation = this.sessionGeneration;
     this.rolloverRequired = false;
+    // Asked before the chain is dropped, on the chain itself: nobody else can say what this stream
+    // has been about. Cheap next to what it saves — the whole conversation is already cached, and
+    // the answer is a few hundred tokens that travel into the next session.
+    const summary = await this.summariseSessionSoFar();
     this.previousInteractionId = undefined;
     this.patchStatus({
       state: 'STARTING', previousInteractionId: undefined,
       rollovers: this.status.rollovers + 1,
     });
-    await this.bootstrap('rollover', generation);
+    await this.bootstrap('rollover', generation, summary);
+  }
+
+  private async summariseSessionSoFar(): Promise<string | undefined> {
+    const previousInteractionId = this.previousInteractionId;
+    if (!previousInteractionId) return undefined;
+    try {
+      const response = await this.withDeadline(this.options.client.create({
+        kind: 'decision',
+        model: this.options.model,
+        input: JSON.stringify({
+          triggerKind: 'session_handover',
+          instruction: 'Соберись: что происходило на стриме с начала сессии. Где стример был и что '
+            + 'делал, о чём говорил, что уже обсудили в чате, какие темы закрыты, что осталось '
+            + 'незаконченным. Только факты этой сессии, без вымысла. Не больше 120 слов.',
+        }),
+        previousInteractionId,
+        systemInstruction: BRAIN_SYSTEM_INSTRUCTION,
+        responseSchema: SESSION_SUMMARY_RESPONSE_SCHEMA,
+        thinkingLevel: 'low',
+        maxOutputTokens: 400,
+        store: true,
+      }));
+      const summary = summarySchema.parse(JSON.parse(response.outputText ?? '')).summary.trim();
+      this.recordInteraction(response.usage, false, 0);
+      this.logger.info('Session summarised before rollover', { characters: summary.length });
+      return summary || undefined;
+    } catch (cause) {
+      // A rollover that cannot summarise still has to happen: growing context is the problem it
+      // exists to solve, and losing the recap is far better than losing the session.
+      this.logger.warn('Could not summarise the session before rollover; continuing without it', { cause });
+      return undefined;
+    }
   }
 
   private async createDecisionInteraction(input: string, previousInteractionId: string): Promise<BrainInteractionResponse> {

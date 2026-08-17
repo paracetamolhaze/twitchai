@@ -221,7 +221,11 @@ describe('Gemini 3.7 stateful Brain', () => {
         requests.push(structuredClone(request));
         return {
           id: `R${requests.length}`, status: 'completed',
-          outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+          outputText: request.kind === 'bootstrap'
+            ? '{"ready":true}'
+            : request.input.includes('session_handover')
+              ? '{"summary":"Стример весь вечер ест в китайском ресторане и спорит про голубя."}'
+              : '{"reactions":[],"memoryUpdates":[]}',
           usage: {
             inputTokens: request.kind === 'decision' ? 800 : 100,
             cachedInputTokens: 50, outputTokens: 5, thoughtTokens: 5, totalTokens: 810,
@@ -229,18 +233,28 @@ describe('Gemini 3.7 stateful Brain', () => {
         };
       },
     };
+    let secondBootstrap: BrainBootstrap | undefined;
     const service = brainService(client, {
       contextRolloverTokens: 750,
-      bootstrap: async (reason) => { reasons.push(reason); return bootstrap(); },
+      bootstrap: async (reason) => {
+        reasons.push(reason);
+        return bootstrap();
+      },
     });
     await service.startStream();
     await service.enqueueEvent(firstEvent);
     await service.enqueueEvent({ ...firstEvent, id: 'after-rollover' });
 
     expect(reasons).toEqual(['stream_start', 'rollover']);
+    // A handover turn on the outgoing chain, then the fresh bootstrap carrying its recap: the
+    // rollover exists to bound per-call cost, and it used to pay for that by forgetting the stream.
     expect(requests.map(({ kind, previousInteractionId }) => [kind, previousInteractionId])).toEqual([
-      ['bootstrap', undefined], ['decision', 'R1'], ['bootstrap', undefined], ['decision', 'R3'],
+      ['bootstrap', undefined], ['decision', 'R1'], ['decision', 'R2'],
+      ['bootstrap', undefined], ['decision', 'R4'],
     ]);
+    expect(requests[2]?.input).toContain('session_handover');
+    secondBootstrap = JSON.parse(requests[3]!.input) as BrainBootstrap;
+    expect(secondBootstrap.previousSessionSummary).toContain('голубя');
     expect(service.getStatus().rollovers).toBe(1);
   });
 
