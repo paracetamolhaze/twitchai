@@ -310,6 +310,7 @@ export class Application {
           return [snapshot.channel, ...snapshot.botUsernames];
         },
         onUsage: (usage) => this.usage.recordHearingUsage(usage),
+        windowMs: this.config.transcription.windowMs,
         onTranscript: (text, meta) => {
           // In shadow mode this is a measurement, not a source: both layers hear the same stream
           // and both write down what they heard, so they can be compared on one real run before

@@ -18,22 +18,20 @@ export interface SpeechTranscriberOptions {
   onTranscript: (text: string, meta: { audioMs: number; latencyMs: number }) => void | Promise<void>;
   /** Every attempt, transcript or not, so the bill is counted where it is actually incurred. */
   onUsage?: (usage: { costUsd?: number; audioSeconds: number; failed: boolean }) => void;
-  /** Loudness a frame must clear to count as speech, relative to the measured noise floor. */
-  speechFloorRatio?: number;
-  /** How far back the quietest moment is looked for when estimating the room. */
-  noiseWindowMs?: number;
-  /** Audio spent measuring the room before anything is treated as speech. */
-  warmupMs?: number;
-  /** Absolute floor, so a silent stream never counts as speech no matter how quiet the room. */
-  minimumSpeechRms?: number;
-  /** Silence that ends a segment. Long enough to keep a thinking-out-loud speaker in one piece. */
+  /**
+   * Audible level. Deliberately near digital silence: this exists only to skip a dead stream, not
+   * to decide what counts as speech. The adaptive floor it replaces measured the room and then
+   * measured the speech too — in a restaurant with constant background the quietest moment of any
+   * six-second window was itself talking, so the threshold climbed to speech level and the layer
+   * went nearly deaf: 24 seconds of audio heard out of 38 minutes.
+   */
+  audibleRms?: number;
+  /** Silence that closes a window early, so a sentence is not cut mid-word when a pause offers. */
   hangoverMs?: number;
-  /** Audio kept from before speech was detected, so the first word is not clipped. */
-  preRollMs?: number;
-  /** Segments shorter than this are noise, not speech, and are never sent. */
+  /** Audio that must be audible before a window is worth sending at all. */
   minSegmentMs?: number;
-  /** A speaker who never pauses still gets cut here, so a transcript always arrives. */
-  maxSegmentMs?: number;
+  /** How much audio goes in one request. Longer is cheaper per second and slower to arrive. */
+  windowMs?: number;
 }
 
 export interface SpeechTranscriberStats {
@@ -49,33 +47,29 @@ export interface SpeechTranscriberStats {
 /**
  * Hearing as a sensor rather than a conversation.
  *
- * A speech segment is cut locally and transcribed on its own: nothing is retained between
- * segments, so a second of audio is paid for exactly once. The layer this replaces was a
- * stateful session that re-read its whole retained window on every turn, which billed roughly
- * eight times for each second of speech and could go deaf while still reporting itself connected.
+ * Audio is cut into windows and each is transcribed on its own: nothing is retained between them,
+ * so a second of audio is paid for exactly once. The layer this replaces was a stateful session
+ * that re-read its whole retained window on every turn, billing roughly eight times per second
+ * heard, and it could go deaf while still reporting itself connected.
  *
- * Silence is dropped before it ever leaves the machine. That is most of an IRL stream, and it
- * also removes the failure Whisper is known for: given silence, it invents plausible sentences.
+ * It listens to everything audible rather than trying to find the speech first. Deciding that
+ * locally was a mistake worth naming: a floor measured from the room rises to meet continuous
+ * conversation, and a restaurant left 24 seconds heard out of 38 minutes. An hour of audio is
+ * about ninety thousand tokens — three cents — so there is nothing to save by guessing, and
+ * everything to lose. Only a genuinely dead stream is skipped.
  */
 export class SpeechTranscriber {
   private readonly logger: Logger;
-  private readonly speechFloorRatio: number;
-  private readonly minimumSpeechRms: number;
+  private readonly audibleRms: number;
   private readonly hangoverMs: number;
-  private readonly preRollMs: number;
   private readonly minSegmentMs: number;
-  private readonly maxSegmentMs: number;
+  private readonly windowMs: number;
 
-  /** Frames held while idle so a segment can start slightly before speech was recognised. */
-  private preRoll: Buffer[] = [];
-  private segment: Buffer[] = [];
-  private segmentMs = 0;
-  private voicedMs = 0;
-  private trailingSilenceMs = 0;
+  private window: Buffer[] = [];
+  private windowMsFilled = 0;
+  private audibleMs = 0;
+  private trailingQuietMs = 0;
   private carry = Buffer.alloc(0);
-  private readonly recentLoudness: number[] = [];
-  private noiseWindowFrames: number;
-  private warmupFramesRemaining: number;
   private inFlight = 0;
   private readonly stats: SpeechTranscriberStats = {
     segmentsSent: 0,
@@ -87,14 +81,10 @@ export class SpeechTranscriber {
 
   constructor(private readonly options: SpeechTranscriberOptions) {
     this.logger = options.logger.child('TRANSCRIPTION');
-    this.speechFloorRatio = options.speechFloorRatio ?? 2.5;
-    this.minimumSpeechRms = options.minimumSpeechRms ?? 0.012;
+    this.audibleRms = options.audibleRms ?? 0.004;
     this.hangoverMs = options.hangoverMs ?? 900;
-    this.preRollMs = options.preRollMs ?? 300;
-    this.minSegmentMs = options.minSegmentMs ?? 700;
-    this.maxSegmentMs = options.maxSegmentMs ?? 15_000;
-    this.noiseWindowFrames = Math.max(1, Math.round((options.noiseWindowMs ?? 6_000) / FRAME_MS));
-    this.warmupFramesRemaining = Math.max(0, Math.round((options.warmupMs ?? 500) / FRAME_MS));
+    this.minSegmentMs = options.minSegmentMs ?? 600;
+    this.windowMs = options.windowMs ?? 12_000;
   }
 
   getStats(): SpeechTranscriberStats { return { ...this.stats }; }
@@ -109,65 +99,59 @@ export class SpeechTranscriber {
     this.carry = offset < buffer.length ? Buffer.from(buffer.subarray(offset)) : Buffer.alloc(0);
   }
 
-  /** Ends the current segment early — used when the stream stops rather than on a pause. */
+  /** Sends whatever is buffered — used when the stream stops rather than on a pause. */
   flush(): void {
-    if (this.segment.length > 0) this.closeSegment();
+    if (this.window.length > 0) this.closeWindow();
   }
 
   reset(): void {
-    this.preRoll = [];
-    this.segment = [];
-    this.segmentMs = 0;
-    this.voicedMs = 0;
-    this.trailingSilenceMs = 0;
+    this.window = [];
+    this.windowMsFilled = 0;
+    this.audibleMs = 0;
+    this.trailingQuietMs = 0;
     this.carry = Buffer.alloc(0);
   }
 
   private acceptFrame(frame: Buffer): void {
-    const loudness = rms(frame);
-    // The floor is the quietest moment in the last few seconds, not a fixed number: a market
-    // street and a quiet kitchen sit several times apart in background level, and one fixed
-    // threshold either misses the speech in the first or hears the traffic in the second. Speech
-    // has gaps between syllables, so even an unbroken talker leaves the floor where it belongs.
-    this.recentLoudness.push(loudness);
-    if (this.recentLoudness.length > this.noiseWindowFrames) this.recentLoudness.shift();
-    const threshold = Math.max(this.minimumSpeechRms, Math.min(...this.recentLoudness) * this.speechFloorRatio);
-    // The first moment of a stream is spent measuring the room. Without it, a loud street is
-    // simply "speech" from the first frame and every second of it gets uploaded.
-    if (this.warmupFramesRemaining > 0) {
-      this.warmupFramesRemaining -= 1;
-      this.rememberPreRoll(frame);
-      this.stats.silenceSecondsSkipped += FRAME_MS / 1000;
-      return;
-    }
-    const speech = loudness >= threshold;
-
-    if (this.segment.length === 0) {
-      if (!speech) {
-        this.rememberPreRoll(frame);
-        this.stats.silenceSecondsSkipped += FRAME_MS / 1000;
-        return;
-      }
-      this.segment = [...this.preRoll, Buffer.from(frame)];
-      this.segmentMs = (this.preRoll.length + 1) * FRAME_MS;
-      this.voicedMs = FRAME_MS;
-      this.trailingSilenceMs = 0;
-      this.preRoll = [];
-      return;
-    }
-
-    this.segment.push(Buffer.from(frame));
-    this.segmentMs += FRAME_MS;
-    if (speech) {
-      this.voicedMs += FRAME_MS;
-      this.trailingSilenceMs = 0;
+    const audible = rms(frame) >= this.audibleRms;
+    this.window.push(Buffer.from(frame));
+    this.windowMsFilled += FRAME_MS;
+    if (audible) {
+      this.audibleMs += FRAME_MS;
+      this.trailingQuietMs = 0;
     } else {
-      this.trailingSilenceMs += FRAME_MS;
+      this.trailingQuietMs += FRAME_MS;
     }
 
-    if (this.trailingSilenceMs >= this.hangoverMs || this.segmentMs >= this.maxSegmentMs) {
-      this.closeSegment();
+    // A pause is a good place to cut, so a sentence arrives whole; the window length is the
+    // backstop for someone who never pauses.
+    const pausedAfterSpeech = this.trailingQuietMs >= this.hangoverMs && this.audibleMs >= this.minSegmentMs;
+    if (pausedAfterSpeech || this.windowMsFilled >= this.windowMs) this.closeWindow();
+  }
+
+  private closeWindow(): void {
+    const pcm = Buffer.concat(this.window);
+    const { audibleMs, windowMsFilled } = this;
+    this.window = [];
+    this.windowMsFilled = 0;
+    this.audibleMs = 0;
+    this.trailingQuietMs = 0;
+    // Nothing but a dead stream in it. Uploading that costs money for no transcript and invites an
+    // invented sentence in return.
+    if (audibleMs < this.minSegmentMs) {
+      this.stats.silenceSecondsSkipped += windowMsFilled / 1000;
+      return;
     }
+    // Two at a time absorbs a slow answer without letting a backlog build: the model runs far
+    // faster than real time, and a third window means the stream is outrunning transcription.
+    if (this.inFlight >= 2) {
+      this.logger.warn('Dropped an audio window because transcription was still busy', {
+        windowMs: windowMsFilled, inFlight: this.inFlight,
+      });
+      this.stats.silenceSecondsSkipped += windowMsFilled / 1000;
+      return;
+    }
+    void this.transcribe(pcm, windowMsFilled);
   }
 
   private buildHint(): string {
@@ -177,34 +161,6 @@ export class SpeechTranscriber {
       names.length > 0 ? `Names: ${names.join(', ')}` : '',
       previous ? `Previous line: ${previous}` : '',
     ].filter(Boolean).join('. ');
-  }
-
-  private rememberPreRoll(frame: Buffer): void {
-    this.preRoll.push(Buffer.from(frame));
-    const maxFrames = Math.max(1, Math.round(this.preRollMs / FRAME_MS));
-    if (this.preRoll.length > maxFrames) this.preRoll.shift();
-  }
-
-  private closeSegment(): void {
-    const pcm = Buffer.concat(this.segment);
-    const { voicedMs, segmentMs } = this;
-    this.segment = [];
-    this.segmentMs = 0;
-    this.voicedMs = 0;
-    this.trailingSilenceMs = 0;
-    if (voicedMs < this.minSegmentMs) {
-      this.stats.silenceSecondsSkipped += segmentMs / 1000;
-      return;
-    }
-    // Two at a time is enough to absorb a slow response without letting a backlog build up: the
-    // segments are short and the model runs far faster than real time.
-    if (this.inFlight >= 2) {
-      this.logger.warn('Dropped a speech segment because transcription was still busy', {
-        segmentMs, inFlight: this.inFlight,
-      });
-      return;
-    }
-    void this.transcribe(pcm, segmentMs);
   }
 
   private async transcribe(pcm: Buffer, audioMs: number): Promise<void> {

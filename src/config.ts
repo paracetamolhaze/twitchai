@@ -106,6 +106,7 @@ export interface AppConfig {
     groqApiKey?: string;
     model: string;
     groqModel: string;
+    windowMs: number;
     language: string;
   };
   database: {
@@ -192,6 +193,9 @@ const envSchema = z.object({
   TRANSCRIPTION_PROVIDER: z.enum(['openrouter', 'groq']).default('openrouter'),
   TRANSCRIPTION_MODEL: z.string().default('google/gemini-3.5-flash-lite'),
   TRANSCRIPTION_GROQ_MODEL: z.string().default('whisper-large-v3-turbo'),
+  // How much audio goes in one request. An hour of audio is about ninety thousand tokens, three
+  // cents, so windows exist to shape latency and request count rather than to save money.
+  TRANSCRIPTION_WINDOW_SECONDS: z.coerce.number().int().min(4).max(30).default(12),
   GROQ_API_KEY: z.string().trim().optional(),
   ORIGINAL_STREAM_LANGUAGE: z.string().trim().default('ru'),
   DATABASE_URL: z.string().trim().optional(),
@@ -350,6 +354,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       provider: parsed.TRANSCRIPTION_PROVIDER,
       model: parsed.TRANSCRIPTION_MODEL,
       groqModel: parsed.TRANSCRIPTION_GROQ_MODEL,
+      windowMs: parsed.TRANSCRIPTION_WINDOW_SECONDS * 1000,
       groqApiKey: parsed.GROQ_API_KEY,
       language: parsed.ORIGINAL_STREAM_LANGUAGE,
     },
