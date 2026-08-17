@@ -37,7 +37,7 @@ import {
   TranscriptionBackend,
 } from './transcription/transcription-backend';
 import { TwitchBotManager } from './twitch/bot-manager';
-import { DeliveryProbe } from './twitch/delivery-probe';
+import { DeliveryRecord } from './twitch/delivery-record';
 import { TwitchHelixClient } from './twitch/helix-client';
 import { OfficialTwitchOAuthGateway } from './twitch/oauth-client';
 import { AuthorizedTwitchAccount, TwitchOAuthService } from './twitch/oauth-service';
@@ -83,7 +83,9 @@ export class Application {
   private gemini?: GeminiLiveClient;
   private geminiBrain?: GeminiBrainService;
   private personaDrive?: PersonaDriveService;
-  private deliveryProbe!: DeliveryProbe;
+  private readonly deliveryRecord = new DeliveryRecord({
+    observesChat: () => this.botManager?.hasChatReader() ?? false,
+  });
   private transcriber?: SpeechTranscriber;
   private speechEvents?: SpeechEventSynthesizer;
   private sceneWatcher?: SceneWatcher;
@@ -176,15 +178,14 @@ export class Application {
       credentialProvider: this.twitchOAuth,
     });
     await this.botManager.initialize();
-    this.deliveryProbe = new DeliveryProbe({
-      sender: this.botManager,
-      logger: this.logger,
-      channel: () => this.contextStore.snapshot().channel,
-    });
-
     this.coordinator = new ReactionCoordinator({
       policy: this.policy,
       freshnessMs: this.config.reaction.freshnessMs,
+      onDelivery: ({ username, result, reason }) => {
+        if (result === 'sent') this.deliveryRecord.recordSent(username);
+        else if (result === 'shown') this.deliveryRecord.recordShown(username);
+        else this.deliveryRecord.recordHidden(username, reason);
+      },
       sender: this.botManager,
       history: this.history,
       memory: this.memory,
@@ -429,7 +430,7 @@ export class Application {
       events: (limit) => this.repository.listStreamEvents(limit),
       chat: () => this.contextStore.snapshot().recentChat,
       usage: () => this.usage.snapshot(),
-      runDeliveryCheck: () => this.deliveryProbe.run(),
+      deliveryRecord: () => this.deliveryRecord.snapshot(),
       decisions: () => [...this.decisions].reverse(),
       reactionTraces: () => [...this.reactionTraces].reverse(),
       settings: () => this.getSettings(),

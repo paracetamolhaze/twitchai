@@ -634,6 +634,8 @@ async function loadDashboard(): Promise<void> {
       api<ReactionDecision[]>('/api/decisions'), api<ReactionTrace[]>('/api/reaction-traces'), api<TwitchOAuthStatus>('/api/twitch/oauth/status'),
       api<StreamerMemory[]>('/api/streamer-memories?limit=100'), api<StreamerMemoryStats>('/api/streamer-memories/stats'),
     ])
+    // Reading a record costs nothing, so it loads with everything else instead of behind a button.
+    void loadDeliveryRecord()
     Object.assign(overview, overviewData)
     Object.assign(usage, usageData)
     bots.value = botData
@@ -755,41 +757,32 @@ async function connectTwitchAccount(): Promise<void> {
   }
 }
 
-interface DeliveryCheckAccount {
-  username: string; index: number; message: string
-  skipped?: 'not_enabled' | 'not_connected'
-  submitted: boolean; submitFailureReason?: string
-  delivered: boolean; rejectionReason?: string; selfEchoUnreliable?: boolean
+interface DeliveryAccountRecord {
+  username: string
+  sent: number; shown: number; hidden: number; refused: number
+  lastReason?: string; lastShownAt?: number; lastHiddenAt?: number
 }
-interface DeliveryCheckReport {
-  channel: string; reader?: string
-  totalAccounts: number; delivered: number; notDelivered: number
-  observedChatMessages: number; detectionVerified: boolean; detectionWarning?: string
-  accounts: DeliveryCheckAccount[]
+interface DeliveryRecordSnapshot {
+  observing: boolean
+  accounts: DeliveryAccountRecord[]
 }
-const deliveryCheck = ref<DeliveryCheckReport | undefined>()
-const deliveryCheckRunning = ref(false)
+const deliveryRecord = ref<DeliveryRecordSnapshot | undefined>()
 
-async function runDeliveryCheck(): Promise<void> {
-  deliveryCheckRunning.value = true
+async function loadDeliveryRecord(): Promise<void> {
   errorMessage.value = ''
   try {
-    // Runs for a while by design: one account every couple of seconds, then a window for echoes.
-    deliveryCheck.value = await api<DeliveryCheckReport>('/api/diagnostics/delivery-check', { method: 'POST' })
+    deliveryRecord.value = await api<DeliveryRecordSnapshot>('/api/diagnostics/delivery')
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
-  } finally {
-    deliveryCheckRunning.value = false
   }
 }
 
-function deliveryCheckStatus(account: DeliveryCheckAccount): string {
-  if (account.skipped === 'not_enabled') return 'выключен'
-  if (account.skipped === 'not_connected') return 'нет в чате'
-  if (account.rejectionReason) return reactionTraceReasonLabel(account.rejectionReason)
-  if (!account.submitted) return account.submitFailureReason ?? 'не отправлено'
-  if (account.delivered) return account.selfEchoUnreliable ? 'дошло (не показатель — это ридер)' : 'дошло'
-  return 'Twitch не показал'
+function deliveryVerdict(account: DeliveryAccountRecord): string {
+  if (account.refused > 0) return reactionTraceReasonLabel(account.lastReason ?? 'не принято')
+  if (account.shown === 0 && account.hidden === 0) return 'пока не писал'
+  if (account.hidden === 0) return 'чат показывает'
+  if (account.shown === 0) return 'Twitch не показывает'
+  return 'показывает через раз'
 }
 
 async function saveSettings(): Promise<void> {
@@ -1556,26 +1549,23 @@ onBeforeUnmount(() => {
           <div class="page-heading"><div><p class="eyebrow">ОФИЦИАЛЬНЫЙ ЧАТ TWITCH</p><h1>Аккаунты ботов</h1></div><p class="muted">Сбой одного аккаунта не останавливает остальные. Накрутка просмотров не используется.</p></div>
           <section class="panel">
             <div class="panel-heading">
-              <div><p class="eyebrow">ДИАГНОСТИКА</p><h3>Проверка доставки</h3></div>
-            <button class="text-button" type="button" :disabled="deliveryCheckRunning" @click="runDeliveryCheck()">
-                {{ deliveryCheckRunning ? 'Идёт проверка…' : 'Проверить все аккаунты' }}
-              </button>
+              <div><p class="eyebrow">ДИАГНОСТИКА</p><h3>Доставка по аккаунтам</h3></div>
+              <button class="text-button" type="button" @click="loadDeliveryRecord()">Обновить</button>
             </div>
-            <p class="muted">Каждый аккаунт пишет в чат свой номер с паузой в 2 секунды. Twitch не подтверждает отправку, поэтому доставка определяется по тому, вернулось ли сообщение обратно через читающий аккаунт. Проверка идёт примерно по 2 секунды на аккаунт плюс окно ожидания.</p>
-            <template v-if="deliveryCheck">
-              <p v-if="!deliveryCheck.detectionVerified" class="notice error">{{ deliveryCheck.detectionWarning }}</p>
+            <p class="muted">Считается по живым сообщениям: Twitch не подтверждает отправку, поэтому доставка определяется по тому, вернулась ли реплика обратно через читающий аккаунт. Отдельные проверочные сообщения больше не отправляются — тридцать аккаунтов, пишущих подряд по цифре, Twitch воспринимает как спам-рейд и закрывает их примерно на сутки.</p>
+            <template v-if="deliveryRecord">
+              <p v-if="!deliveryRecord.observing" class="notice error">Ни один аккаунт не читает чат, поэтому доставку сейчас определить нельзя.</p>
               <div class="metric-strip">
-                <div><span>Канал</span><strong>{{ deliveryCheck.channel || '—' }}</strong></div>
-                <div><span>Дошло</span><strong>{{ deliveryCheck.delivered }} / {{ deliveryCheck.totalAccounts }}</strong></div>
-                <div><span>Twitch не показал</span><strong>{{ deliveryCheck.notDelivered }}</strong></div>
-                <div><span>Читающий аккаунт</span><strong>{{ deliveryCheck.reader || '—' }}</strong></div>
-                <div><span>Видел сообщений в чате</span><strong>{{ deliveryCheck.observedChatMessages }}</strong></div>
+                <div><span>Чат показывает</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown > 0 && item.hidden === 0).length }}</strong></div>
+                <div><span>Не показывает</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown === 0 && item.hidden > 0).length }}</strong></div>
+                <div><span>Через раз</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown > 0 && item.hidden > 0).length }}</strong></div>
+                <div><span>Ещё не писали</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown === 0 && item.hidden === 0).length }}</strong></div>
               </div>
               <div class="bulk-preview-list">
-                <article v-for="item in deliveryCheck.accounts" :key="item.username">
-                  <strong>{{ item.index }}. {{ item.username }}</strong>
-                  <span>{{ deliveryCheckStatus(item) }}</span>
-                  <small>отправлено в чат: «{{ item.message }}»</small>
+                <article v-for="item in deliveryRecord.accounts" :key="item.username">
+                  <strong>{{ item.username }}</strong>
+                  <span>{{ deliveryVerdict(item) }}</span>
+                  <small>показано {{ item.shown }} из {{ item.sent }}<template v-if="item.refused"> · отказов {{ item.refused }}</template></small>
                 </article>
               </div>
             </template>

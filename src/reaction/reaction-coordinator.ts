@@ -50,6 +50,8 @@ export interface ReactionCoordinatorOptions {
   contextTtlMs?: number;
   /** Past this age a moment is no longer what the stream is talking about, and a reply is dropped. */
   freshnessMs?: number;
+  /** Per-account record of what the channel actually shows, kept from real traffic. */
+  onDelivery?: (outcome: { username: string; result: 'sent' | 'shown' | 'hidden'; reason?: string }) => void;
   /** How long to wait for a sent message to echo back from Twitch before calling it undelivered. */
   deliveryEchoTimeoutMs?: number;
   /**
@@ -604,12 +606,14 @@ export class ReactionCoordinator extends EventEmitter {
     const timer = setTimeout(() => {
       this.pendingDeliveries.delete(key);
       this.options.usage.recordUndeliveredMessage();
+      this.options.onDelivery?.({ username, result: 'hidden' });
       this.markReactionUndelivered(eventId, username);
       this.logger.warn('Reaction never appeared in Twitch chat', {
         bot: username, eventId, text: message, waitedMs: this.deliveryEchoTimeoutMs,
       });
     }, this.deliveryEchoTimeoutMs);
     timer.unref?.();
+    this.options.onDelivery?.({ username, result: 'sent' });
     this.pendingDeliveries.set(key, { eventId, username, timer, sentAt });
   }
 
@@ -624,6 +628,7 @@ export class ReactionCoordinator extends EventEmitter {
     clearTimeout(pending.timer);
     this.pendingDeliveries.delete(key);
     this.options.usage.recordConfirmedDelivery();
+    this.options.onDelivery?.({ username, result: 'shown' });
     this.logger.info('Reaction confirmed visible in Twitch chat', {
       bot: username, eventId: pending.eventId, roundTripMs: this.now() - pending.sentAt,
     });
@@ -643,6 +648,7 @@ export class ReactionCoordinator extends EventEmitter {
     clearTimeout(pending.timer);
     this.pendingDeliveries.delete(key);
     this.options.usage.recordUndeliveredMessage();
+    this.options.onDelivery?.({ username: pending.username, result: 'hidden', reason });
     this.markReactionUndelivered(pending.eventId, pending.username, reason);
     this.logger.warn('Twitch refused a reaction', { bot: pending.username, eventId: pending.eventId, reason });
   }
