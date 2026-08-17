@@ -32,6 +32,38 @@ function transcriber(overrides: Partial<ConstructorParameters<typeof SpeechTrans
   return { instance, heard, created, hints };
 }
 
+describe('OpenRouter transcription request', () => {
+  it('asks who is speaking, by role rather than by index', async () => {
+    // An IRL stream is several people across each other, and one undivided blob left the decision
+    // layer unable to tell the streamer from the friend beside him. Each window is transcribed on
+    // its own, so "speaker 1" would mean someone different in the next one; S is always the camera.
+    const { OpenRouterTranscriptionBackend } = await import('../src/transcription/transcription-backend');
+    let sent = '';
+    const backend = new OpenRouterTranscriptionBackend({
+      apiKey: 'test-key',
+      model: 'google/gemini-3.7-flash',
+      language: 'ru',
+      fetchImpl: (async (_url: string, init: { body: string }) => {
+        sent = init.body;
+        return {
+          ok: true, status: 200, statusText: 'OK',
+          json: async () => ({ choices: [{ message: { content: 'S: слышно' } }], usage: { cost: 0.0006 } }),
+        } as unknown as Response;
+      }) as unknown as typeof fetch,
+    });
+
+    const result = await backend.transcribe(Buffer.from('RIFF'), 'Names: Лёша');
+    expect(result.text).toBe('S: слышно');
+    expect(result.costUsd).toBe(0.0006);
+    const body = JSON.parse(sent) as { messages: Array<{ content: Array<{ text?: string }> }> };
+    const instruction = body.messages[0]!.content[0]!.text ?? '';
+    expect(instruction).toContain('"S: " for the person holding the camera');
+    expect(instruction).toContain('Лёша');
+    // The old instruction forbade speaker labels outright; that is what has changed.
+    expect(instruction).not.toContain('no speaker labels');
+  });
+});
+
 describe('withoutRepeatedTail', () => {
   it('drops the words the audio overlap made the model say twice', () => {
     // The overlap is deliberate so a word cut by the clock survives; its echo in the text is not.
