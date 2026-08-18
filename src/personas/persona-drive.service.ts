@@ -2,6 +2,7 @@ import { Logger } from '../logger';
 import { BrainDecision, BrainDriveCandidate, BrainDriveOpportunityInput, FIRST_MESSAGE_GATE } from '../brain/types';
 import { ReactionBatchResult, ReactionBotCandidate } from '../reaction/types';
 import { ContextStore } from '../stream-brain/context-store';
+import { ColdStartStatus } from '../stream-brain/stream-session';
 import { UsageTracker } from '../usage/usage-tracker';
 import { BotHistory } from './bot-history';
 import { PersonaMemory } from './persona-memory';
@@ -29,18 +30,20 @@ export interface PersonaDriveServiceOptions {
   history: BotHistory;
   evaluateOpportunity: (input: BrainDriveOpportunityInput) => Promise<BrainDecision | undefined>;
   /**
-   * Whether the session has yet to put a message in chat. A spontaneous aside is a worse first
-   * impression than a reaction to something visible, so the drive is held to the same condition
-   * rather than being allowed to slip under it.
+   * The strict first-message quality bar's current state. A spontaneous aside is a worse first
+   * impression than a reaction to something visible, so the drive is held to the same time-bounded
+   * condition as an ordinary stream-event reaction rather than being allowed to slip under it.
    */
-  isColdStart?: () => boolean;
+  coldStart?: () => ColdStartStatus;
   /**
    * ReactionCoordinator.prepareAutonomousCandidates. The newest observed moment travels with it so
-   * the naturalness guard has something to judge a spontaneous message against.
+   * the naturalness guard has something to judge a spontaneous message against, and whether the
+   * strict bar was in force travels with it too, so the coordinator's own record of the decision
+   * matches what was actually put in front of the model.
    */
   prepareCandidates: (usernames: string[], observed?: {
     type: string; summary: string; speech?: string;
-  }) => string;
+  }, coldStartActive?: boolean) => string;
   /** ReactionCoordinator.submitBatch, wrapped as (requestId, reactions) => ... */
   submitReaction: (requestId: string, reactions: Array<{ username: string; message: string }>) => Promise<ReactionBatchResult>;
   /**
@@ -235,6 +238,7 @@ export class PersonaDriveService {
       .map(({ timestamp, text }) => ({ timestamp, text }));
     const recentEvents = snapshot.recentEvents.slice(-MAX_RECENT_EVENTS_FOR_DRIVE)
       .map(({ timestamp, type, summary }) => ({ timestamp, type, summary }));
+    const coldStartActive = o.coldStart?.()?.active ?? false;
     const input: BrainDriveOpportunityInput = {
       triggerKind: 'persona_drive',
       channel: snapshot.channel,
@@ -248,7 +252,7 @@ export class PersonaDriveService {
       ...(lastObservationAt !== undefined
         ? { secondsSinceLastObservation: Math.round((now - lastObservationAt) / 1000) }
         : {}),
-      ...(o.isColdStart?.() ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
+      ...(coldStartActive ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
       deltas: [],
     };
 
@@ -259,6 +263,7 @@ export class PersonaDriveService {
     const requestId = o.prepareCandidates(
       candidateUsernames,
       newest ? { type: newest.type, summary: newest.summary, ...(newest.speech ? { speech: newest.speech } : {}) } : undefined,
+      coldStartActive,
     );
     this.logger.info('PERSONA_DRIVE_BRAIN_CALL', { requestId, candidates: candidateUsernames });
     const decision = await o.evaluateOpportunity(input);

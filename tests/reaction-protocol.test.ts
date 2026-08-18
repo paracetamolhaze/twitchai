@@ -13,6 +13,7 @@ import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
 import { ReactionBotCandidate, ReactionTraceRecord } from '../src/reaction/types';
 import { ContextStore } from '../src/stream-brain/context-store';
+import { ColdStartStatus, StreamSession } from '../src/stream-brain/stream-session';
 import { StreamEvent } from '../src/stream-brain/types';
 import { UsageTracker } from '../src/usage/usage-tracker';
 
@@ -71,8 +72,13 @@ async function setup(
   // here have no reader, so arming the watchdog would report every message as undelivered.
   let observesChat = false;
   // The logical-session state the coordinator consults, faked here so the payload and the send path
-  // can be tested without standing up an Application.
-  let coldStart = false;
+  // can be tested without standing up an Application. A plain boolean toggle rather than a real
+  // StreamSession: these cases are about what the coordinator does with the status, not about the
+  // window/continuity arithmetic itself, which stream-session.test.ts already covers directly.
+  let coldStartActive = false;
+  const coldStart = (): ColdStartStatus => ({
+    active: coldStartActive, ageMs: 0, windowMs: 60_000, hasSentAiMessage: false, expired: false,
+  });
   let messageSentCalls = 0;
   const sent: Array<{ username: string; message: string }> = [];
   const usage = new UsageTracker();
@@ -89,7 +95,7 @@ async function setup(
   const coordinator = new ReactionCoordinator({
     policy,
     naturalness: new NaturalnessGuard(),
-    isColdStart: () => coldStart,
+    coldStart,
     onMessageSent: () => { messageSentCalls += 1; },
     sender: {
       send: async (username, message) => {
@@ -119,7 +125,7 @@ async function setup(
   return {
     coordinator, globalMemory, history, policy, sent, usage, personaMemory,
     logged: () => written,
-    setColdStart: (value: boolean) => { coldStart = value; },
+    setColdStart: (value: boolean) => { coldStartActive = value; },
     messageSentCalls: () => messageSentCalls,
     candidatesFor: (username: string) => candidates.find((candidate) => candidate.username === username)!,
     setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; },
@@ -731,7 +737,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent({ ...event, id: 'cold-decision' }, 0);
     await coordinator.submitBatch({ eventId: 'cold-decision', reactions: [] });
     const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated');
-    expect(decision).toMatchObject({ coldStartGateActive: true, selected: [] });
+    expect(decision).toMatchObject({ coldStartQualityModeActive: true, selected: [] });
     await coordinator.stop();
     vi.restoreAllMocks();
   });
@@ -1096,5 +1102,112 @@ describe('single-session reaction protocol', () => {
     await vi.runAllTimersAsync();
     expect(sent).toEqual([]);
     await coordinator.stop();
+  });
+});
+
+/**
+ * The same wiring `setup()` above uses, but driven by a real StreamSession rather than a boolean
+ * fake — this is what actually proves the coordinator's cold-start bookkeeping (the age recorded
+ * for the first send, and the per-mechanism decision counts) matches what a real session clock
+ * produces, rather than just matching whatever the fake was told to say.
+ */
+async function liveSessionSetup(now: () => number) {
+  const streamSession = new StreamSession({ now, coldStartWindowMs: 60_000, newId: () => 'session-1' });
+  streamSession.begin();
+  const repository = new MemoryRepository();
+  await repository.initialize();
+  const history = new BotHistory(repository);
+  const personaMemory = new PersonaMemory(repository, { now });
+  const personaRuntime = new PersonaRuntimeStore(now);
+  const contextStore = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 100, maxEvents: 100, now });
+  contextStore.configure({ channel: 'streamer', category: 'Dota 2', streamContext: 'рейтинг с друзьями' });
+  let candidates = [bot('bot-one', 0), bot('bot-two', 1), bot('bot-three', 2)];
+  const sent: Array<{ username: string; message: string }> = [];
+  const usage = new UsageTracker();
+  const globalMemory = new GlobalStreamerMemory({ repository, usage, now });
+  await globalMemory.startOrResumeSession({ channel: 'streamer', initialCategory: 'Dota 2' });
+  const policy = new ReactionPolicyGuard({
+    globalMessagesPer30Seconds: 20, maxReactionsPerEvent: 3, reactionShareOfCandidates: 1, now,
+  });
+  const written: Array<Record<string, unknown>> = [];
+  vi.spyOn(console, 'log').mockImplementation((line: unknown) => {
+    if (typeof line === 'string') {
+      try { written.push(JSON.parse(line) as Record<string, unknown>); } catch { /* not ours */ }
+    }
+  });
+  const coordinator = new ReactionCoordinator({
+    policy,
+    naturalness: new NaturalnessGuard(),
+    coldStart: () => streamSession.coldStartStatus(),
+    onMessageSent: () => streamSession.markMessageSent(),
+    sender: { send: async (username, message) => { sent.push({ username, message }); return { submitted: true, submittedAt: now() }; } },
+    history,
+    memory: new ReactionMemory({ enabled: true, reactionWindowMs: 1_000, repository }),
+    globalMemory,
+    personaContext: new PersonaContextBuilder(personaMemory, personaRuntime),
+    personaMemory,
+    personaRuntime,
+    contextStore,
+    usage,
+    logger: new Logger('TEST', 'info'),
+    retrievalLimit: 4,
+    candidates: () => candidates,
+    contextTtlMs: 60_000,
+    now,
+  });
+  return {
+    coordinator, streamSession, sent, logged: () => written,
+    setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; },
+  };
+}
+
+describe('cold-start bookkeeping against a real StreamSession clock', () => {
+  it('records how old the session was when the first message actually landed', async () => {
+    vi.useFakeTimers();
+    let clock = event.timestamp;
+    const now = () => clock;
+    const { coordinator, sent, logged } = await liveSessionSetup(now);
+
+    clock += 41_000; // 41 seconds into the strict window
+    await coordinator.prepareBrainEvent({ ...event, id: 'e1' }, 0);
+    await coordinator.submitBatch({ eventId: 'e1', reactions: [{ username: 'bot-one', message: 'ого' }] });
+    await vi.runAllTimersAsync();
+    expect(sent).toHaveLength(1);
+
+    coordinator.logSessionSummary('test');
+    const summary = logged().find((entry) => entry.message === 'Stream decision summary');
+    expect(summary).toMatchObject({ firstAiMessageAtMs: 41_000, coldStartWindowExpired: false });
+    await coordinator.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('counts stream-event decisions taken under the strict bar separately from ordinary ones', async () => {
+    vi.useFakeTimers();
+    let clock = event.timestamp;
+    const now = () => clock;
+    const { coordinator, logged } = await liveSessionSetup(now);
+
+    // Two silent decisions inside the 60-second window.
+    await coordinator.prepareBrainEvent({ ...event, id: 'cold-1' }, 0);
+    await coordinator.submitBatch({ eventId: 'cold-1', reactions: [] });
+    clock += 20_000;
+    await coordinator.prepareBrainEvent({ ...event, id: 'cold-2' }, 0);
+    await coordinator.submitBatch({ eventId: 'cold-2', reactions: [] });
+
+    // Past the window: an ordinary decision, no longer under the bar.
+    clock += 45_000; // total age now 65s
+    await coordinator.prepareBrainEvent({ ...event, id: 'warm-1' }, 0);
+    await coordinator.submitBatch({ eventId: 'warm-1', reactions: [] });
+
+    coordinator.logSessionSummary('test');
+    const summary = logged().find((entry) => entry.message === 'Stream decision summary');
+    expect(summary).toMatchObject({
+      streamEventDecisions: 3,
+      streamDecisionsDuringColdStart: 2,
+      coldStartWindowExpired: true,
+    });
+    expect(summary?.firstAiMessageAtMs).toBeUndefined();
+    await coordinator.stop();
+    vi.restoreAllMocks();
   });
 });

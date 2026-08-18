@@ -11,6 +11,7 @@ import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { ReactionBatchResult, ReactionBotCandidate } from '../src/reaction/types';
 import { ChatMessage } from '../src/stream-brain/types';
+import { ColdStartStatus } from '../src/stream-brain/stream-session';
 import { ContextStore } from '../src/stream-brain/context-store';
 import { UsageTracker } from '../src/usage/usage-tracker';
 
@@ -87,6 +88,11 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
     submitReaction: options.submitReaction,
     applyMemoryUpdates: options.applyMemoryUpdates,
   };
+}
+
+/** A fixed cold-start reading — these cases are about whether `.active` reaches the payload, not about the window arithmetic, which stream-session.test.ts covers directly. */
+function coldStartStatus(active: boolean): ColdStartStatus {
+  return { active, ageMs: 0, windowMs: 60_000, hasSentAiMessage: !active, expired: false };
 }
 
 function sequence(values: number[]): () => number {
@@ -345,14 +351,14 @@ describe('PersonaDriveService', () => {
       // A spontaneous aside is a worse first impression than a reaction to something on screen, so
       // the drive is held to the same condition rather than slipping under it.
       vi.useFakeTimers();
-      const cold = await harness({ isColdStart: () => true });
+      const cold = await harness({ coldStart: () => coldStartStatus(true) });
       cold.service.start();
       await vi.advanceTimersByTimeAsync(1_000);
       expect(cold.evaluateOpportunity.mock.calls[0]?.[0]?.firstMessageGate)
         .toContain('Nothing has been sent this session yet');
       cold.service.stop();
 
-      const warm = await harness({ isColdStart: () => false });
+      const warm = await harness({ coldStart: () => coldStartStatus(false) });
       warm.service.start();
       await vi.advanceTimersByTimeAsync(1_000);
       expect(warm.evaluateOpportunity.mock.calls[0]?.[0]).not.toHaveProperty('firstMessageGate');

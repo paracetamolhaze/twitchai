@@ -10,6 +10,7 @@ import { PersonaMemory, relevanceScore, semanticTokens } from '../personas/perso
 import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
 import { ContextStore } from '../stream-brain/context-store';
 import { StreamEvent } from '../stream-brain/types';
+import { ColdStartStatus } from '../stream-brain/stream-session';
 import { BrainEventInput, FIRST_MESSAGE_GATE } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
 import { NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
@@ -59,11 +60,13 @@ export interface ReactionCoordinatorOptions {
   /** Per-account record of what the channel actually shows, kept from real traffic. */
   onDelivery?: (outcome: { username: string; result: 'sent' | 'shown' | 'hidden'; reason?: string }) => void;
   /**
-   * Whether this logical stream session has yet to put a message in chat. While true the decision
+   * The strict first-message quality bar's current state. While `active` is true the decision
    * payload carries an extra condition, because the first thing these accounts say is the one line
-   * with no established voice behind it and the one most likely to come out as a default.
+   * with no established voice behind it and the one most likely to come out as a default. It is a
+   * clock, not a permanent hold — see StreamSession.isStrictColdStart for why a live run needed
+   * that distinction.
    */
-  isColdStart?: () => boolean;
+  coldStart?: () => ColdStartStatus;
   /** Called once a message has actually reached Twitch, which is what retires the gate. */
   onMessageSent?: () => void;
   /** How long to wait for a sent message to echo back from Twitch before calling it undelivered. */
@@ -97,6 +100,12 @@ interface PendingContext {
    * session heard — otherwise a spontaneous message would be the one path with no check on it.
    */
   naturalnessEvent?: NaturalnessInput['event'];
+  /**
+   * Whether the strict quality bar was in force when this opportunity was offered to the Brain —
+   * frozen at that moment rather than re-read at decision time, because a Brain round trip can take
+   * seconds and what matters here is what was actually in the prompt, not what is true right now.
+   */
+  coldStartActive: boolean;
   permittedUsernames: Set<string>;
   candidateCount: number;
   viewerByUsername: Map<string, string>;
@@ -131,6 +140,18 @@ interface SessionDecisionStats {
   naturalnessChecked: number;
   naturalnessRejected: Record<'semantic_echo' | 'borrowed_opinion' | 'generic_evaluator', number>;
   naturalnessGuardMs: number;
+  /**
+   * How much of the strict quality window's cost fell on each mechanism. A live run spent this on
+   * eighteen stream-event decisions and three Persona Drive calls, every one of them silent, before
+   * the window had a bound at all — the number that answers "was cold start actually the bottleneck,
+   * or was something else keeping the chat quiet" without re-deriving it from raw log lines.
+   */
+  coldStart: {
+    streamEventDecisions: number;
+    driveDecisions: number;
+    /** Session-clock age, in ms, of the first message that ever reached Twitch. Set once. */
+    firstAiMessageAgeMs?: number;
+  };
 }
 
 function emptySessionStats(): SessionDecisionStats {
@@ -145,6 +166,7 @@ function emptySessionStats(): SessionDecisionStats {
     naturalnessChecked: 0,
     naturalnessRejected: { semantic_echo: 0, borrowed_opinion: 0, generic_evaluator: 0 },
     naturalnessGuardMs: 0,
+    coldStart: { streamEventDecisions: 0, driveDecisions: 0 },
   };
 }
 
@@ -327,13 +349,17 @@ export class ReactionCoordinator extends EventEmitter {
     tally.selected += decision.selected.length;
     if (decision.selected.length === 0) tally.silent += 1;
     this.session.rejectedReactions += decision.rejected.length;
+    if (pending.coldStartActive) {
+      if (trigger.kind === 'stream_event') this.session.coldStart.streamEventDecisions += 1;
+      else this.session.coldStart.driveDecisions += 1;
+    }
     this.logger.info('Gemini reaction batch validated', {
       eventId: decision.eventId,
       triggerKind: trigger.kind,
-      // Whether this decision was made before this session had said anything. A silent decision
-      // taken under it is not proof the gate caused the silence, but without the flag a quiet cold
-      // start and a quiet stream read identically afterwards.
-      coldStartGateActive: this.options.isColdStart?.() ?? false,
+      // Whether this decision was offered under the strict quality bar. A silent decision taken
+      // under it is not proof the bar caused the silence, but without the flag a quiet cold start
+      // and an ordinarily quiet stream read identically afterwards.
+      coldStartQualityModeActive: pending.coldStartActive,
       candidates: pending.candidateCount,
       selected: decision.selected.map((item) => item.username),
       silent: decision.silentCandidateCount,
@@ -374,6 +400,10 @@ export class ReactionCoordinator extends EventEmitter {
     const drive = this.options.usage.snapshot().currentStream.drive;
     const events = stats.byTrigger.stream_event;
     const driven = stats.byTrigger.persona_drive;
+    // Read now, before the stats reset below: this is a fact about the session as it stands at the
+    // moment of the summary, not something accumulated over the reporting period like the counters
+    // above it, so it must come from the session tracker directly rather than from `stats`.
+    const coldStartNow = this.options.coldStart?.();
     this.session = emptySessionStats();
     if (stats.events === 0 && events.decisions + driven.decisions === 0) return;
     const average = (total: number, count: number): number =>
@@ -400,6 +430,16 @@ export class ReactionCoordinator extends EventEmitter {
       naturalnessBorrowedOpinion: stats.naturalnessRejected.borrowed_opinion,
       naturalnessGenericEvaluator: stats.naturalnessRejected.generic_evaluator,
       naturalnessGuardMs: Number(stats.naturalnessGuardMs.toFixed(1)),
+      // How much of the above happened under the strict first-message bar, and whether it is still
+      // up. A live run put all eighteen of its stream-event decisions and all three of its Persona
+      // Drive calls here before the bar had a bound — the number that would have made the seven
+      // minutes of silence legible from this one line instead of five hundred.
+      streamDecisionsDuringColdStart: stats.coldStart.streamEventDecisions,
+      driveCallsDuringColdStart: stats.coldStart.driveDecisions,
+      ...(stats.coldStart.firstAiMessageAgeMs !== undefined
+        ? { firstAiMessageAtMs: stats.coldStart.firstAiMessageAgeMs }
+        : {}),
+      coldStartWindowExpired: coldStartNow?.expired ?? false,
       attentionNotices: stats.attention.notices,
       attentionPassesOver: stats.attention['passes over'],
       attentionNoPattern: stats.attention['no strong pattern'],
@@ -572,11 +612,13 @@ export class ReactionCoordinator extends EventEmitter {
     }));
     const contextReadyAt = this.now();
     const expiresAt = contextReadyAt + this.contextTtlMs;
+    const coldStartActive = this.options.coldStart?.()?.active ?? false;
     this.removePending(event.id);
     const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
     this.pendingContexts.set(event.id, {
       trigger: { kind: 'stream_event', event },
       naturalnessEvent: event,
+      coldStartActive,
       expiresAt,
       timer,
       permittedUsernames: new Set(candidates.map((candidate) => candidate.username.toLowerCase())),
@@ -649,7 +691,7 @@ export class ReactionCoordinator extends EventEmitter {
         .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
       targetedPersonaContext,
       reactionExamples: reactionExamples.slice(0, 3),
-      ...(this.options.isColdStart?.() ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
+      ...(coldStartActive ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
       deltas: [],
       constraints: {
         // The ceiling follows the moment, not just the crowd: an ordinary remark is one voice at
@@ -670,13 +712,18 @@ export class ReactionCoordinator extends EventEmitter {
    * external path gets. No trace record is created — the reaction-trace dashboard panel stays
    * exclusively about real observed events; `updateTrace` already no-ops safely without one.
    */
-  prepareAutonomousCandidates(usernames: string[], observed?: NaturalnessInput['event']): string {
+  prepareAutonomousCandidates(
+    usernames: string[],
+    observed?: NaturalnessInput['event'],
+    coldStartActive = false,
+  ): string {
     const id = `persona-drive:${randomUUID()}`;
     const expiresAt = this.now() + this.contextTtlMs;
     const timer = setTimeout(() => this.expirePending(id), this.contextTtlMs);
     this.pendingContexts.set(id, {
       trigger: { kind: 'persona_drive', id },
       ...(observed ? { naturalnessEvent: observed } : {}),
+      coldStartActive,
       expiresAt,
       timer,
       permittedUsernames: new Set(usernames.map((username) => username.toLowerCase())),
@@ -753,11 +800,19 @@ export class ReactionCoordinator extends EventEmitter {
         return;
       }
       const sentAt = sendResult.submittedAt;
+      // Read just before flipping hasSentAiMessage, so a message that turns out to be the first one
+      // this session ever lands still gets its age recorded — after onMessageSent() runs, this would
+      // already read hasSentAiMessage: true and the moment would be gone.
+      const coldStartBeforeSend = this.options.coldStart?.();
       // Submitted, not confirmed-visible. Confirmation is a separate signal that can legitimately
       // never arrive — one account went 0 for 4 on echoes across a whole run while two others went
       // 7 for 7 — and hanging the gate on it would leave a suppressed account holding the whole
       // session in cold start forever.
       this.options.onMessageSent?.();
+      if (coldStartBeforeSend && !coldStartBeforeSend.hasSentAiMessage
+        && this.session.coldStart.firstAiMessageAgeMs === undefined) {
+        this.session.coldStart.firstAiMessageAgeMs = coldStartBeforeSend.ageMs;
+      }
       this.recordSendSuccess(eventId, current.username, sentAt);
       this.awaitDeliveryEcho(eventId, current.username, plan.message, sentAt);
       this.logger.info('Bot reaction submitted to Twitch', { bot: current.username, eventId, text: plan.message });

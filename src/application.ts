@@ -120,6 +120,7 @@ export class Application {
    */
   private readonly streamSession = new StreamSession();
   private lastBroadcastId?: string;
+  private coldStartExpiryTimer?: NodeJS.Timeout;
   private greetedStreamGeneration = 0;
   private lastBotAvailability = new Map<string, string>();
   private readonly availableBotUsernames = new Set<string>();
@@ -189,7 +190,7 @@ export class Application {
     await this.botManager.initialize();
     this.coordinator = new ReactionCoordinator({
       naturalness: new NaturalnessGuard(),
-      isColdStart: () => this.streamSession.isColdStart(),
+      coldStart: () => this.streamSession.coldStartStatus(),
       onMessageSent: () => this.streamSession.markMessageSent(),
       policy: this.policy,
 
@@ -285,7 +286,7 @@ export class Application {
 
     if (this.geminiBrain) {
       this.personaDrive = new PersonaDriveService({
-        isColdStart: () => this.streamSession.isColdStart(),
+        coldStart: () => this.streamSession.coldStartStatus(),
         enabled: this.config.personaDrive.enabled,
         minIntervalMs: this.config.personaDrive.minIntervalMs,
         maxIntervalMs: this.config.personaDrive.maxIntervalMs,
@@ -627,13 +628,39 @@ export class Application {
           // it the gap since the last activity does, and an operator pause is seconds. Getting this
           // wrong is what made a fifteen-second pause look like a fresh evening to the Brain.
           const { session, continuity } = this.streamSession.begin(this.lastBroadcastId);
+          const coldStart = this.streamSession.coldStartStatus();
           this.logger.info('Logical stream session', {
             logicalStreamSessionId: session.id,
             sessionContinuity: continuity,
             broadcastId: session.broadcastId,
             hasSentAiMessage: session.hasSentAiMessage,
-            coldStartGateActive: !session.hasSentAiMessage,
+            coldStartQualityModeActive: coldStart.active,
+            coldStartWindowMs: coldStart.windowMs,
           });
+          if (continuity === 'new') {
+            // Scheduled only for a genuinely new evening, and left alone on resume. This is a
+            // one-shot wall-clock timer anchored to this session's own startedAt: a pause does not
+            // touch it, because the whole point is that the window keeps counting through a pause
+            // rather than restarting. Clearing any leftover timer here is only for the case where
+            // a previous session ended before its own timer fired; the id check inside makes that
+            // harmless even if this line were skipped.
+            if (this.coldStartExpiryTimer) clearTimeout(this.coldStartExpiryTimer);
+            const sessionId = session.id;
+            this.coldStartExpiryTimer = setTimeout(() => {
+              this.coldStartExpiryTimer = undefined;
+              if (this.streamSession.snapshot()?.id !== sessionId) return;
+              const status = this.streamSession.coldStartStatus();
+              if (!status.expired) return;
+              // One line, once, only if the window actually ran out with nothing sent — not a
+              // per-tick log, and not fired at all if a message landed first.
+              this.logger.info('Cold start quality window expired without a sent AI message', {
+                logicalStreamSessionId: sessionId,
+                coldStartWindowMs: status.windowMs,
+                coldStartAgeMs: status.ageMs,
+              });
+            }, this.streamSession.coldStartWindow + 1_000);
+            this.coldStartExpiryTimer.unref?.();
+          }
           const brainStart = this.geminiBrain?.startStream() ?? Promise.resolve();
           this.brainSessionReady = this.enqueueGlobalMemoryLifecycle(async () => {
             await this.startGlobalMemorySession();
@@ -776,6 +803,7 @@ export class Application {
         .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
     };
     const session = this.streamSession.snapshot();
+    const coldStart = this.streamSession.coldStartStatus();
     this.logger.info('Gemini Brain bootstrap prepared', {
       reason,
       personas: bootstrap.personas.length,
@@ -785,7 +813,12 @@ export class Application {
       earlierStreamEvents: bootstrap.earlierStreamEvents.length,
       logicalStreamSessionId: session?.id,
       hasSentAiMessage: session?.hasSentAiMessage ?? false,
-      coldStartGateActive: this.streamSession.isColdStart(),
+      // A rollover reaching this line with coldStartQualityModeActive: false and
+      // hasSentAiMessage: true is the case that matters most here — it says the technical reset did
+      // not resurrect the strict bar. That is exactly what the run motivating this showed: rollover
+      // at age 9m59s, well past both the 60s window and the first send at 7m12s.
+      coldStartQualityModeActive: coldStart.active,
+      coldStartAgeMs: coldStart.ageMs,
       characters: JSON.stringify(bootstrap).length,
     });
     return bootstrap;
