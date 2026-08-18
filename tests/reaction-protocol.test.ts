@@ -1210,4 +1210,31 @@ describe('cold-start bookkeeping against a real StreamSession clock', () => {
     await coordinator.stop();
     vi.restoreAllMocks();
   });
+
+  it('does not let a naturalness-rejected candidate count as the first message', async () => {
+    // A candidate that never reaches Twitch has not introduced these accounts to anybody, whether
+    // the reason is a failed send or the naturalness guard deciding it was commentary rather than a
+    // reaction. Both must leave the strict bar exactly where they found it.
+    vi.useFakeTimers();
+    let clock = event.timestamp;
+    const now = () => clock;
+    const { coordinator, streamSession, sent } = await liveSessionSetup(now);
+
+    clock += 10_000;
+    await coordinator.prepareBrainEvent({
+      ...event,
+      id: 'rejected-1',
+      speech: 'O: I support Yandex. S: Yandex so good.',
+      summary: 'O: I support Yandex. S: Yandex so good.',
+    }, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'rejected-1',
+      reactions: [{ username: 'bot-one', message: 'Яндекс это мощно конечно' }],
+    });
+    expect(result.rejected).toEqual([{ username: 'bot-one', reason: 'generic_evaluator' }]);
+    expect(sent).toEqual([]);
+    expect(streamSession.snapshot()?.hasSentAiMessage).toBe(false);
+    expect(streamSession.isStrictColdStart()).toBe(true);
+    await coordinator.stop();
+  });
 });
