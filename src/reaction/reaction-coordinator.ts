@@ -12,6 +12,7 @@ import { ContextStore } from '../stream-brain/context-store';
 import { StreamEvent } from '../stream-brain/types';
 import { BrainEventInput, FIRST_MESSAGE_GATE } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
+import { NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
 import { ReactionPolicyGuard } from './reaction-policy-guard';
 import {
   PlannedReaction,
@@ -35,6 +36,13 @@ export interface ReactionSender {
 
 export interface ReactionCoordinatorOptions {
   policy: ReactionPolicyGuard;
+  /**
+   * Runs before the policy guard on purpose. A message with no reaction in it should not consume a
+   * rate-limit reservation or an account's cooldown on its way to being dropped, and the policy
+   * guard's job — length, duplicates, dashes, who may speak — is a different question from whether
+   * this is a reaction at all. Optional so existing wiring keeps working without it.
+   */
+  naturalness?: NaturalnessGuard;
   sender: ReactionSender;
   history: BotHistory;
   memory: ReactionMemory;
@@ -83,6 +91,12 @@ function deliveryKey(username: string, message: string): string {
 
 interface PendingContext {
   trigger: ReactionTrigger;
+  /**
+   * What the naturalness guard compares a generated message against. For an observed moment that is
+   * the event; a drive opportunity has no event of its own, so it supplies the newest thing the
+   * session heard — otherwise a spontaneous message would be the one path with no check on it.
+   */
+  naturalnessEvent?: NaturalnessInput['event'];
   permittedUsernames: Set<string>;
   candidateCount: number;
   viewerByUsername: Map<string, string>;
@@ -109,6 +123,14 @@ interface SessionDecisionStats {
   byTrigger: Record<'stream_event' | 'persona_drive', { decisions: number; silent: number; selected: number }>;
   rejectedReactions: number;
   attention: Record<'notices' | 'passes over' | 'no strong pattern', number>;
+  /**
+   * How much the naturalness guard saw and how much it dropped, by class. The number that matters
+   * next run is the ratio: a guard rejecting a message here and there is doing its job, and one
+   * rejecting a third of everything generated has a class that is too wide.
+   */
+  naturalnessChecked: number;
+  naturalnessRejected: Record<'semantic_echo' | 'borrowed_opinion' | 'generic_evaluator', number>;
+  naturalnessGuardMs: number;
 }
 
 function emptySessionStats(): SessionDecisionStats {
@@ -120,6 +142,9 @@ function emptySessionStats(): SessionDecisionStats {
     },
     rejectedReactions: 0,
     attention: { notices: 0, 'passes over': 0, 'no strong pattern': 0 },
+    naturalnessChecked: 0,
+    naturalnessRejected: { semantic_echo: 0, borrowed_opinion: 0, generic_evaluator: 0 },
+    naturalnessGuardMs: 0,
   };
 }
 
@@ -211,14 +236,37 @@ export class ReactionCoordinator extends EventEmitter {
       return { eventId: parsed.eventId, accepted: [], rejected: itemRejections };
     }
 
+    // Naturalness first: what survives here is what the policy guard is then asked to schedule.
+    const naturalnessStartedAt = this.now();
+    const naturalnessRejections: ReactionRejection[] = [];
+    const natural = this.options.naturalness
+      ? parsed.reactions.filter((reaction) => {
+        const verdict = this.options.naturalness!.check({
+          message: reaction.message,
+          ...(pending.naturalnessEvent ? { event: pending.naturalnessEvent } : {}),
+        });
+        if (verdict.ok) return true;
+        const username = reaction.username.trim().toLowerCase();
+        naturalnessRejections.push({ username, reason: verdict.reason! });
+        this.session.naturalnessRejected[verdict.reason!] += 1;
+        this.logger.info('Reaction dropped as commentary rather than reaction', {
+          eventId: parsed.eventId, bot: username, reason: verdict.reason, text: reaction.message,
+        });
+        return false;
+      })
+      : parsed.reactions;
+    this.session.naturalnessChecked += parsed.reactions.length;
+    this.session.naturalnessGuardMs += this.now() - naturalnessStartedAt;
+    naturalnessRejections.forEach(() => this.options.usage.recordGuardRejection());
+
     const result = await this.options.policy.validateBatch({
       trigger: pending.trigger,
-      reactions: parsed.reactions,
+      reactions: natural,
       permittedUsernames: pending.permittedUsernames,
       currentCandidates: this.options.candidates(),
       isDuplicate: (username, message) => this.options.history.isDuplicate(username, message),
     });
-    const allRejections = [...itemRejections, ...result.rejected];
+    const allRejections = [...itemRejections, ...naturalnessRejections, ...result.rejected];
     for (const rejection of result.rejected) {
       this.options.usage.recordGuardRejection();
       this.logger.warn('Gemini reaction rejected by policy', { eventId: parsed.eventId, bot: rejection.username, reason: rejection.reason });
@@ -345,6 +393,13 @@ export class ReactionCoordinator extends EventEmitter {
       personaDriveSilent: driven.silent,
       personaDriveSelected: driven.selected,
       rejectedReactions: stats.rejectedReactions,
+      naturalnessChecked: stats.naturalnessChecked,
+      naturalnessRejected: stats.naturalnessRejected.semantic_echo
+        + stats.naturalnessRejected.borrowed_opinion + stats.naturalnessRejected.generic_evaluator,
+      naturalnessSemanticEcho: stats.naturalnessRejected.semantic_echo,
+      naturalnessBorrowedOpinion: stats.naturalnessRejected.borrowed_opinion,
+      naturalnessGenericEvaluator: stats.naturalnessRejected.generic_evaluator,
+      naturalnessGuardMs: Number(stats.naturalnessGuardMs.toFixed(1)),
       attentionNotices: stats.attention.notices,
       attentionPassesOver: stats.attention['passes over'],
       attentionNoPattern: stats.attention['no strong pattern'],
@@ -521,6 +576,7 @@ export class ReactionCoordinator extends EventEmitter {
     const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
     this.pendingContexts.set(event.id, {
       trigger: { kind: 'stream_event', event },
+      naturalnessEvent: event,
       expiresAt,
       timer,
       permittedUsernames: new Set(candidates.map((candidate) => candidate.username.toLowerCase())),
@@ -614,12 +670,13 @@ export class ReactionCoordinator extends EventEmitter {
    * external path gets. No trace record is created — the reaction-trace dashboard panel stays
    * exclusively about real observed events; `updateTrace` already no-ops safely without one.
    */
-  prepareAutonomousCandidates(usernames: string[]): string {
+  prepareAutonomousCandidates(usernames: string[], observed?: NaturalnessInput['event']): string {
     const id = `persona-drive:${randomUUID()}`;
     const expiresAt = this.now() + this.contextTtlMs;
     const timer = setTimeout(() => this.expirePending(id), this.contextTtlMs);
     this.pendingContexts.set(id, {
       trigger: { kind: 'persona_drive', id },
+      ...(observed ? { naturalnessEvent: observed } : {}),
       expiresAt,
       timer,
       permittedUsernames: new Set(usernames.map((username) => username.toLowerCase())),

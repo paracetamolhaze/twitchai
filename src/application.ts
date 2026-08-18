@@ -21,6 +21,7 @@ import { BotPersona } from './personas/types';
 import { AppRepository, BotAccountRecord } from './persistence/repository';
 import { MemoryRepository } from './persistence/memory-repository';
 import { PostgresRepository } from './persistence/postgres-repository';
+import { NaturalnessGuard } from './reaction/naturalness-guard';
 import { ReactionCoordinator } from './reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from './reaction/reaction-policy-guard';
 import { ReactionDecisionRecord, ReactionTraceRecord } from './reaction/types';
@@ -187,6 +188,7 @@ export class Application {
     });
     await this.botManager.initialize();
     this.coordinator = new ReactionCoordinator({
+      naturalness: new NaturalnessGuard(),
       isColdStart: () => this.streamSession.isColdStart(),
       onMessageSent: () => this.streamSession.markMessageSent(),
       policy: this.policy,

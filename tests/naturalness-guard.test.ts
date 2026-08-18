@@ -1,0 +1,163 @@
+import { describe, expect, it } from 'vitest';
+import { NaturalnessGuard } from '../src/reaction/naturalness-guard';
+import { StreamEvent } from '../src/stream-brain/types';
+
+const guard = new NaturalnessGuard();
+
+function moment(overrides: Partial<StreamEvent>): StreamEvent {
+  return {
+    id: 'event-1',
+    timestamp: 1_700_000_000_000,
+    type: 'speech',
+    summary: '',
+    importance: 0.6,
+    confidence: 0.9,
+    source: 'transcription',
+    directMentions: [],
+    ...overrides,
+  };
+}
+
+const speech = (text: string, overrides: Partial<StreamEvent> = {}): StreamEvent =>
+  moment({ summary: text, speech: text, ...overrides });
+
+/**
+ * Every rejecting case below is a message this system actually sent to a live Twitch chat, with the
+ * moment it answered taken verbatim from the same log. Every accepting case is a shape the guard
+ * must not touch — the failure mode of a check like this is not missing a bad message, it is
+ * swallowing a good one, and short good messages look superficially identical to short bad ones.
+ */
+describe('what the naturalness guard turns into silence', () => {
+  it('rejects a conclusion the stream had already drawn', () => {
+    // 15:24:25. Two people establish they are the same age three times over, and an account
+    // announces it in Russian. No word overlaps; the shape is a bare noun and a "therefore".
+    const verdict = guard.check({
+      message: 'ровесники получается',
+      event: speech('S: How old are you? O: Me? 27. S: 27 too. O: 27. Same? S: Yeah, yeah, same. Same.',
+        { type: 'question' }),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'semantic_echo' });
+  });
+
+  it('rejects somebody else\'s opinion handed back with a stamp on it', () => {
+    // 15:25:10, after "He's a legend" and "Legend. Yeah, No[o]ne".
+    const verdict = guard.check({
+      message: 'нунун легенда без вопросов',
+      event: speech('O: Legend. Yeah, No[o]ne S: You have good English. O: Yeah, O: recently.'),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'borrowed_opinion' });
+  });
+
+  it('rejects a subject from the stream with a grade attached and nothing else', () => {
+    // 15:26:16, after "I support Yandex" / "Yandex so good" — including the alphabet change.
+    const verdict = guard.check({
+      message: 'Яндекс это мощно конечно',
+      event: speech('O: Maybe... I support Yandex. S: Yandex? Yandex? Oh. Yandex so good.',
+        { type: 'question' }),
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toBe('generic_evaluator');
+  });
+
+  it('does not pretend to catch a scene label, which is not separable locally', () => {
+    // "Планёрка на улице пошла" is a novel noun over scene words — the same shape as "у него рюкзак
+    // больше него", which is a good joke. Telling them apart needs to know what планёрка means, so
+    // this class stays with the instruction rather than getting a rule that only fires on fixtures
+    // written to make it fire.
+    const label = guard.check({
+      message: 'планёрка на улице пошла',
+      event: moment({
+        type: 'visual',
+        summary: 'Молодой человек стоит на улице и разговаривает с двумя парнями.',
+        visualContext: 'Молодой человек стоит на улице и разговаривает с двумя парнями.',
+      }),
+    });
+    expect(label.ok).toBe(true);
+  });
+});
+
+describe('what the naturalness guard must never touch', () => {
+  it('lets a one-word correction through even though it repeats the subject', () => {
+    const verdict = guard.check({
+      message: 'баранина',
+      event: speech('S: это свинина? O: не знаю, похоже на свинину', { type: 'question' }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets pure feeling through, which carries no information by definition', () => {
+    for (const message of ['ахахах', 'бляя', '??????', 'KEKW', 'ооо']) {
+      expect(guard.check({
+        message,
+        event: speech('S: Yandex so good. O: Yandex is the best'),
+      }).ok).toBe(true);
+    }
+  });
+
+  it('lets an answer through when the chat was the one being addressed', () => {
+    // 15:22:56, and the message the guard must not have blocked: "Garena, you know what is this?"
+    // answered with "олды на месте".
+    const verdict = guard.check({
+      message: 'олды на месте',
+      event: speech('S: I ICCup, Garena. You know what is this, man?',
+        { type: 'question', audience: 'twitch_chat', audienceConfidence: 0.9 }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets a disagreement through, which reuses the subject by nature', () => {
+    const verdict = guard.check({
+      message: 'не лучший он, сильно упал',
+      event: speech('O: этот герой лучший сейчас, база'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets a question through', () => {
+    const verdict = guard.check({
+      message: 'а он вообще на инт едет?',
+      event: speech('O: He is a legend. S: Yeah, No[o]ne'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets a joke through when it targets a detail of its own', () => {
+    const verdict = guard.check({
+      message: 'у него рюкзак больше него',
+      event: moment({
+        type: 'visual',
+        summary: 'Молодой человек идет по набережной ночного города.',
+        visualContext: 'Молодой человек идет по набережной ночного города.',
+      }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets an account be named without judging the message at all', () => {
+    const verdict = guard.check({
+      message: 'легенда конечно',
+      event: speech('S: gigantiuz что думаешь', { directMentions: ['gigantiuz'] }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets a longer message through, where the extra words are carrying something', () => {
+    const verdict = guard.check({
+      message: 'яндекс мощно конечно, но у них состав второй год не меняется совсем',
+      event: speech('O: I support Yandex. S: Yandex so good.'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('does not judge a message with no moment behind it', () => {
+    expect(guard.check({ message: 'мощно конечно' }).ok).toBe(true);
+  });
+
+  it('leaves an inference marker alone when the message carries a real thought', () => {
+    const verdict = guard.check({
+      message: 'значит патч сломал ему керри полностью',
+      event: speech('O: он вообще не фармит в этой игре'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+});

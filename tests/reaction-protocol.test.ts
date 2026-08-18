@@ -8,6 +8,7 @@ import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { MemoryRepository } from '../src/persistence/memory-repository';
+import { NaturalnessGuard } from '../src/reaction/naturalness-guard';
 import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
 import { ReactionBotCandidate, ReactionTraceRecord } from '../src/reaction/types';
@@ -87,6 +88,7 @@ async function setup(
   });
   const coordinator = new ReactionCoordinator({
     policy,
+    naturalness: new NaturalnessGuard(),
     isColdStart: () => coldStart,
     onMessageSent: () => { messageSentCalls += 1; },
     sender: {
@@ -621,6 +623,60 @@ describe('single-session reaction protocol', () => {
     // No number beside it. A raw eventSelectivity here was a second cooldown applied to candidates
     // the backend had already cleared, and it never once told two of them apart.
     expect(JSON.stringify(states)).not.toContain('selectivity');
+    await coordinator.stop();
+  });
+
+  it('turns a message that only grades the moment into silence, before anything is reserved', async () => {
+    // The whole point of sitting ahead of the policy guard: a message with no reaction in it should
+    // not spend a rate-limit slot or an account's cooldown on the way to being dropped.
+    vi.useFakeTimers();
+    const { coordinator, sent, policy, logged } = await setup(true, () => event.timestamp, true);
+    const yandex: StreamEvent = {
+      ...event,
+      id: 'yandex-event',
+      type: 'question',
+      summary: 'O: Maybe... I support Yandex. S: Yandex? Yandex? Oh. Yandex so good.',
+      speech: 'O: Maybe... I support Yandex. S: Yandex? Yandex? Oh. Yandex so good.',
+    };
+    await coordinator.prepareBrainEvent(yandex, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'yandex-event',
+      reactions: [{ username: 'bot-one', message: 'Яндекс это мощно конечно' }],
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(sent).toHaveLength(0);
+    expect(result.accepted).toEqual([]);
+    expect(result.rejected).toEqual([{ username: 'bot-one', reason: 'generic_evaluator' }]);
+    // Nothing was reserved on its behalf, so the next real message still has its slot.
+    expect(policy.globalSlotsAvailable()).toBe(2);
+    // And it is distinguishable afterwards from the Brain having chosen silence.
+    expect(logged().some((entry) => entry.message === 'Reaction dropped as commentary rather than reaction'
+      && entry.reason === 'generic_evaluator')).toBe(true);
+    await coordinator.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('still sends a real answer to the same kind of moment', async () => {
+    // The guard must not be a general filter on short messages about a subject the stream raised.
+    vi.useFakeTimers();
+    const { coordinator, sent } = await setup();
+    const asked: StreamEvent = {
+      ...event,
+      id: 'garena-event',
+      type: 'question',
+      summary: 'S: I ICCup, Garena. You know what is this, man?',
+      speech: 'S: I ICCup, Garena. You know what is this, man?',
+      audience: 'twitch_chat',
+      audienceConfidence: 0.9,
+    };
+    await coordinator.prepareBrainEvent(asked, 0);
+    await coordinator.submitBatch({
+      eventId: 'garena-event',
+      reactions: [{ username: 'bot-one', message: 'олды на месте' }],
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sent).toEqual([{ username: 'bot-one', message: 'олды на месте' }]);
     await coordinator.stop();
   });
 

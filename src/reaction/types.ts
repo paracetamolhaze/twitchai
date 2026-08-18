@@ -67,6 +67,12 @@ export type ReactionRejectionReason =
   | 'account_busy'
   | 'global_rate_limit'
   | 'recent_duplicate'
+  // NaturalnessGuard. Not a policy or safety refusal: the message was well-formed and allowed, and
+  // simply was not a reaction to anything. Kept as three codes rather than one so a live run shows
+  // which shape is actually leaking, and so an over-eager class can be found and narrowed.
+  | 'semantic_echo'
+  | 'borrowed_opinion'
+  | 'generic_evaluator'
   | 'invalid_item';
 
 export interface ReactionRejection {

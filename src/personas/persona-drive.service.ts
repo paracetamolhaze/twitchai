@@ -34,8 +34,13 @@ export interface PersonaDriveServiceOptions {
    * rather than being allowed to slip under it.
    */
   isColdStart?: () => boolean;
-  /** ReactionCoordinator.prepareAutonomousCandidates */
-  prepareCandidates: (usernames: string[]) => string;
+  /**
+   * ReactionCoordinator.prepareAutonomousCandidates. The newest observed moment travels with it so
+   * the naturalness guard has something to judge a spontaneous message against.
+   */
+  prepareCandidates: (usernames: string[], observed?: {
+    type: string; summary: string; speech?: string;
+  }) => string;
   /** ReactionCoordinator.submitBatch, wrapped as (requestId, reactions) => ... */
   submitReaction: (requestId: string, reactions: Array<{ username: string; message: string }>) => Promise<ReactionBatchResult>;
   /**
@@ -250,7 +255,11 @@ export class PersonaDriveService {
     const driveStartedAt = this.now();
     this.brainCallTimestamps.push(driveStartedAt);
     o.usage.recordDriveBrainCall();
-    const requestId = o.prepareCandidates(candidateUsernames);
+    const newest = snapshot.recentEvents.at(-1);
+    const requestId = o.prepareCandidates(
+      candidateUsernames,
+      newest ? { type: newest.type, summary: newest.summary, ...(newest.speech ? { speech: newest.speech } : {}) } : undefined,
+    );
     this.logger.info('PERSONA_DRIVE_BRAIN_CALL', { requestId, candidates: candidateUsernames });
     const decision = await o.evaluateOpportunity(input);
 
