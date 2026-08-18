@@ -69,6 +69,10 @@ async function setup(
   // Off by default: delivery can only be judged while an account is reading chat, and most tests
   // here have no reader, so arming the watchdog would report every message as undelivered.
   let observesChat = false;
+  // The logical-session state the coordinator consults, faked here so the payload and the send path
+  // can be tested without standing up an Application.
+  let coldStart = false;
+  let messageSentCalls = 0;
   const sent: Array<{ username: string; message: string }> = [];
   const usage = new UsageTracker();
   const globalMemory = new GlobalStreamerMemory({ repository, usage, now });
@@ -83,6 +87,8 @@ async function setup(
   });
   const coordinator = new ReactionCoordinator({
     policy,
+    isColdStart: () => coldStart,
+    onMessageSent: () => { messageSentCalls += 1; },
     sender: {
       send: async (username, message) => {
         sent.push({ username, message });
@@ -111,6 +117,8 @@ async function setup(
   return {
     coordinator, globalMemory, history, policy, sent, usage, personaMemory,
     logged: () => written,
+    setColdStart: (value: boolean) => { coldStart = value; },
+    messageSentCalls: () => messageSentCalls,
     candidatesFor: (username: string) => candidates.find((candidate) => candidate.username === username)!,
     setCandidates: (value: ReactionBotCandidate[]) => { candidates = value; },
     setObservesChat: (value: boolean) => { observesChat = value; },
@@ -614,6 +622,62 @@ describe('single-session reaction protocol', () => {
     // the backend had already cleared, and it never once told two of them apart.
     expect(JSON.stringify(states)).not.toContain('selectivity');
     await coordinator.stop();
+  });
+
+  it('adds the first-message condition only while the session has said nothing', async () => {
+    // Cases A and B: the first line of an evening is the one with no established voice behind it,
+    // and it is where the safe default appears. The condition rides in the payload rather than the
+    // system instruction, so it is gone the moment it stops being true instead of being read by
+    // every later decision.
+    const { coordinator, setColdStart } = await setup();
+    setColdStart(true);
+    const cold = await coordinator.prepareBrainEvent({ ...event, id: 'cold-event' }, 0);
+    expect(cold.firstMessageGate).toContain('Nothing has been sent this session yet');
+    expect(cold.firstMessageGate).toContain('It may be one word');
+
+    setColdStart(false);
+    const warm = await coordinator.prepareBrainEvent({ ...event, id: 'warm-event' }, 0);
+    expect(warm).not.toHaveProperty('firstMessageGate');
+    await coordinator.stop();
+  });
+
+  it('retires the gate on a message that reached Twitch, not on one that was merely accepted', async () => {
+    // Case I against Case J. A reaction the guard accepted and the sender then failed to deliver has
+    // introduced these accounts to nobody, so the session is still cold.
+    vi.useFakeTimers();
+    const failing = await setup(false);
+    failing.setColdStart(true);
+    await failing.coordinator.prepareBrainEvent({ ...event, id: 'failed-send' }, 0);
+    await failing.coordinator.submitBatch({
+      eventId: 'failed-send',
+      reactions: [{ username: 'bot-one', message: 'ахах' }],
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(failing.sent).toHaveLength(1);
+    expect(failing.messageSentCalls()).toBe(0);
+    await failing.coordinator.stop();
+
+    const landing = await setup(true);
+    landing.setColdStart(true);
+    await landing.coordinator.prepareBrainEvent({ ...event, id: 'good-send' }, 0);
+    await landing.coordinator.submitBatch({
+      eventId: 'good-send',
+      reactions: [{ username: 'bot-one', message: 'ахах' }],
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(landing.messageSentCalls()).toBe(1);
+    await landing.coordinator.stop();
+  });
+
+  it('records whether a decision was taken before the session had said anything', async () => {
+    const { coordinator, setColdStart, logged } = await setup(true, () => event.timestamp, true);
+    setColdStart(true);
+    await coordinator.prepareBrainEvent({ ...event, id: 'cold-decision' }, 0);
+    await coordinator.submitBatch({ eventId: 'cold-decision', reactions: [] });
+    const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated');
+    expect(decision).toMatchObject({ coldStartGateActive: true, selected: [] });
+    await coordinator.stop();
+    vi.restoreAllMocks();
   });
 
   it('carries the addressee and what was observable into the decision it logs', async () => {

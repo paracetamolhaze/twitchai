@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { ApiServer, createApiServer } from './api/server';
 import { partitionBootstrapEvents } from './brain/bootstrap-events';
+import { StreamSession } from './stream-brain/stream-session';
 import { GeminiBrainService } from './brain/gemini-brain.service';
 import { GoogleInteractionsClient } from './brain/google-interactions.client';
 import { OpenRouterBrainClient } from './brain/openrouter-brain.client';
@@ -112,6 +113,12 @@ export class Application {
   private mediaOfflineGraceTimer?: NodeJS.Timeout;
   private mediaOfflineGraceState?: string;
   private streamGeneration = 0;
+  /**
+   * Which evening this is. Deliberately not the usage tracker's stream clock, which restarts on
+   * every media transition and so treated an operator pause as the start of a new night.
+   */
+  private readonly streamSession = new StreamSession();
+  private lastBroadcastId?: string;
   private greetedStreamGeneration = 0;
   private lastBotAvailability = new Map<string, string>();
   private readonly availableBotUsernames = new Set<string>();
@@ -180,6 +187,8 @@ export class Application {
     });
     await this.botManager.initialize();
     this.coordinator = new ReactionCoordinator({
+      isColdStart: () => this.streamSession.isColdStart(),
+      onMessageSent: () => this.streamSession.markMessageSent(),
       policy: this.policy,
 
       onDelivery: ({ username, result, reason }) => {
@@ -274,6 +283,7 @@ export class Application {
 
     if (this.geminiBrain) {
       this.personaDrive = new PersonaDriveService({
+        isColdStart: () => this.streamSession.isColdStart(),
         enabled: this.config.personaDrive.enabled,
         minIntervalMs: this.config.personaDrive.minIntervalMs,
         maxIntervalMs: this.config.personaDrive.maxIntervalMs,
@@ -571,6 +581,9 @@ export class Application {
   private wireEvents(): void {
     this.perception.on('event', (event: StreamEvent) => {
       this.personaDrive?.notifyExternalEvent();
+      // Keeps the continuity window measured from the last thing actually observed, so a long
+      // uneventful stretch mid-broadcast is not mistaken for the gap between two evenings.
+      this.streamSession.touch();
       const emittedAt = Date.now();
       this.api.emitEvent(event);
       this.api.emitOverview();
@@ -608,6 +621,17 @@ export class Application {
         if (!this.mediaStreaming) {
           this.mediaStreaming = true;
           this.streamGeneration += 1;
+          // Same broadcast or a new one? Twitch's own id decides when Helix has answered; without
+          // it the gap since the last activity does, and an operator pause is seconds. Getting this
+          // wrong is what made a fifteen-second pause look like a fresh evening to the Brain.
+          const { session, continuity } = this.streamSession.begin(this.lastBroadcastId);
+          this.logger.info('Logical stream session', {
+            logicalStreamSessionId: session.id,
+            sessionContinuity: continuity,
+            broadcastId: session.broadcastId,
+            hasSentAiMessage: session.hasSentAiMessage,
+            coldStartGateActive: !session.hasSentAiMessage,
+          });
           const brainStart = this.geminiBrain?.startStream() ?? Promise.resolve();
           this.brainSessionReady = this.enqueueGlobalMemoryLifecycle(async () => {
             await this.startGlobalMemorySession();
@@ -639,8 +663,14 @@ export class Application {
           this.personaDrive?.stop();
           this.sceneWatcher?.stop();
           void this.geminiBrain?.stopStream();
-          if (finalState === 'OFFLINE') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
-          else if (finalState === 'ERROR') void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
+          // OFFLINE past the grace window is the broadcast being over; ERROR is this process
+          // failing to watch one that may well still be running, so only the first ends the evening.
+          if (finalState === 'OFFLINE') {
+            this.streamSession.end();
+            void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('ended'));
+          } else if (finalState === 'ERROR') {
+            void this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
+          }
         }, MEDIA_OFFLINE_GRACE_MS);
       }
     });
@@ -712,7 +742,13 @@ export class Application {
       this.globalMemory.startupSnapshot(snapshot.channel, this.config.globalMemory.snapshotLimit),
       this.repository.listStreamEvents(80),
     ]);
-    const startedAt = this.usage.snapshot().currentStream.startedAt ?? Date.now();
+    // The logical session's clock, not the usage tracker's. The usage tracker restarts whenever
+    // media transitions — including an operator pause — so reading it here meant a fifteen-second
+    // pause mid-broadcast produced currentSessionEvents: 0 and a Brain that had seen nothing all
+    // evening. A rollover kept its 25 events only because nothing had touched that clock.
+    const startedAt = this.streamSession.snapshot()?.startedAt
+      ?? this.usage.snapshot().currentStream.startedAt
+      ?? Date.now();
     // Two lists, not one, split on the session boundary. See partitionBootstrapEvents for why.
     //
     // The channel is not filterable here: a stored event carries a category but not the channel it
@@ -737,6 +773,7 @@ export class Application {
       recentChat: snapshot.recentChat.slice(-40)
         .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
     };
+    const session = this.streamSession.snapshot();
     this.logger.info('Gemini Brain bootstrap prepared', {
       reason,
       personas: bootstrap.personas.length,
@@ -744,6 +781,9 @@ export class Application {
       globalMemories: bootstrap.globalMemories.length,
       currentSessionEvents: bootstrap.currentSessionEvents.length,
       earlierStreamEvents: bootstrap.earlierStreamEvents.length,
+      logicalStreamSessionId: session?.id,
+      hasSentAiMessage: session?.hasSentAiMessage ?? false,
+      coldStartGateActive: this.streamSession.isColdStart(),
       characters: JSON.stringify(bootstrap).length,
     });
     return bootstrap;
@@ -1031,6 +1071,10 @@ export class Application {
         // Helix enriches category metadata only. MediaPipeline STREAMING/OFFLINE is the
         // sole lifecycle authority for isLive and the Gemini Live session.
         this.contextStore.configure({ category: info.category });
+        // The same request already ran for the category; the id costs nothing extra and is the only
+        // unambiguous evidence of which broadcast this is.
+        this.lastBroadcastId = info.broadcastId;
+        this.streamSession.observeBroadcast(info.broadcastId);
         if (previous.category !== info.category) {
           this.logger.info('Twitch category updated', { category: info.category || 'offline' });
           this.queueBrainDelta({

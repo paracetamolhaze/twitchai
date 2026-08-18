@@ -10,7 +10,7 @@ import { PersonaMemory, relevanceScore, semanticTokens } from '../personas/perso
 import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
 import { ContextStore } from '../stream-brain/context-store';
 import { StreamEvent } from '../stream-brain/types';
-import { BrainEventInput } from '../brain/types';
+import { BrainEventInput, FIRST_MESSAGE_GATE } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
 import { ReactionPolicyGuard } from './reaction-policy-guard';
 import {
@@ -50,6 +50,14 @@ export interface ReactionCoordinatorOptions {
   contextTtlMs?: number;
   /** Per-account record of what the channel actually shows, kept from real traffic. */
   onDelivery?: (outcome: { username: string; result: 'sent' | 'shown' | 'hidden'; reason?: string }) => void;
+  /**
+   * Whether this logical stream session has yet to put a message in chat. While true the decision
+   * payload carries an extra condition, because the first thing these accounts say is the one line
+   * with no established voice behind it and the one most likely to come out as a default.
+   */
+  isColdStart?: () => boolean;
+  /** Called once a message has actually reached Twitch, which is what retires the gate. */
+  onMessageSent?: () => void;
   /** How long to wait for a sent message to echo back from Twitch before calling it undelivered. */
   deliveryEchoTimeoutMs?: number;
   /**
@@ -274,6 +282,10 @@ export class ReactionCoordinator extends EventEmitter {
     this.logger.info('Gemini reaction batch validated', {
       eventId: decision.eventId,
       triggerKind: trigger.kind,
+      // Whether this decision was made before this session had said anything. A silent decision
+      // taken under it is not proof the gate caused the silence, but without the flag a quiet cold
+      // start and a quiet stream read identically afterwards.
+      coldStartGateActive: this.options.isColdStart?.() ?? false,
       candidates: pending.candidateCount,
       selected: decision.selected.map((item) => item.username),
       silent: decision.silentCandidateCount,
@@ -581,6 +593,7 @@ export class ReactionCoordinator extends EventEmitter {
         .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
       targetedPersonaContext,
       reactionExamples: reactionExamples.slice(0, 3),
+      ...(this.options.isColdStart?.() ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
       deltas: [],
       constraints: {
         // The ceiling follows the moment, not just the crowd: an ordinary remark is one voice at
@@ -683,6 +696,11 @@ export class ReactionCoordinator extends EventEmitter {
         return;
       }
       const sentAt = sendResult.submittedAt;
+      // Submitted, not confirmed-visible. Confirmation is a separate signal that can legitimately
+      // never arrive — one account went 0 for 4 on echoes across a whole run while two others went
+      // 7 for 7 — and hanging the gate on it would leave a suppressed account holding the whole
+      // session in cold start forever.
+      this.options.onMessageSent?.();
       this.recordSendSuccess(eventId, current.username, sentAt);
       this.awaitDeliveryEcho(eventId, current.username, plan.message, sentAt);
       this.logger.info('Bot reaction submitted to Twitch', { bot: current.username, eventId, text: plan.message });

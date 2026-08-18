@@ -1,5 +1,5 @@
 import { Logger } from '../logger';
-import { BrainDecision, BrainDriveCandidate, BrainDriveOpportunityInput } from '../brain/types';
+import { BrainDecision, BrainDriveCandidate, BrainDriveOpportunityInput, FIRST_MESSAGE_GATE } from '../brain/types';
 import { ReactionBatchResult, ReactionBotCandidate } from '../reaction/types';
 import { ContextStore } from '../stream-brain/context-store';
 import { UsageTracker } from '../usage/usage-tracker';
@@ -28,6 +28,12 @@ export interface PersonaDriveServiceOptions {
   personaRuntime: PersonaRuntimeStore;
   history: BotHistory;
   evaluateOpportunity: (input: BrainDriveOpportunityInput) => Promise<BrainDecision | undefined>;
+  /**
+   * Whether the session has yet to put a message in chat. A spontaneous aside is a worse first
+   * impression than a reaction to something visible, so the drive is held to the same condition
+   * rather than being allowed to slip under it.
+   */
+  isColdStart?: () => boolean;
   /** ReactionCoordinator.prepareAutonomousCandidates */
   prepareCandidates: (usernames: string[]) => string;
   /** ReactionCoordinator.submitBatch, wrapped as (requestId, reactions) => ... */
@@ -237,6 +243,7 @@ export class PersonaDriveService {
       ...(lastObservationAt !== undefined
         ? { secondsSinceLastObservation: Math.round((now - lastObservationAt) / 1000) }
         : {}),
+      ...(o.isColdStart?.() ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
       deltas: [],
     };
 

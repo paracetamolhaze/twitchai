@@ -341,6 +341,24 @@ describe('PersonaDriveService', () => {
       service.stop();
     });
 
+    it('carries the first-message condition when nothing has been said this session', async () => {
+      // A spontaneous aside is a worse first impression than a reaction to something on screen, so
+      // the drive is held to the same condition rather than slipping under it.
+      vi.useFakeTimers();
+      const cold = await harness({ isColdStart: () => true });
+      cold.service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(cold.evaluateOpportunity.mock.calls[0]?.[0]?.firstMessageGate)
+        .toContain('Nothing has been sent this session yet');
+      cold.service.stop();
+
+      const warm = await harness({ isColdStart: () => false });
+      warm.service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(warm.evaluateOpportunity.mock.calls[0]?.[0]).not.toHaveProperty('firstMessageGate');
+      warm.service.stop();
+    });
+
     it('omits the hooks entirely when the session has observed nothing yet', async () => {
       // Absent rather than empty: a drive opportunity with nothing behind it should look like one.
       vi.useFakeTimers();

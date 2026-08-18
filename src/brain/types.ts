@@ -166,6 +166,8 @@ export interface BrainEventInput {
   streamerMemories?: Array<{ type: string; summary: string }>;
   targetedPersonaContext: BrainTargetedPersonaContext[];
   reactionExamples: ReactionExample[];
+  /** FIRST_MESSAGE_GATE, present only until this session's first message actually reaches Twitch. */
+  firstMessageGate?: string;
   deltas: BrainDynamicDelta[];
   constraints: {
     maxReactions: number;
@@ -242,8 +244,29 @@ export interface BrainDriveOpportunityInput {
    * layer is told the age rather than being handed a stale observation as if it were current.
    */
   secondsSinceLastObservation?: number;
+  /** FIRST_MESSAGE_GATE, present only until this session's first message actually reaches Twitch. */
+  firstMessageGate?: string;
   deltas: BrainDynamicDelta[];
 }
+
+/**
+ * Sent only while no account has managed to say anything this session, and removed for good once
+ * one has.
+ *
+ * It lives here rather than in the system instruction on purpose. The instruction is the cached
+ * prefix and is a set of standing principles; this is a condition that is true for the first few
+ * minutes of an evening and false for the rest of it, and putting a paragraph about cold starts in
+ * the permanent text would have every later decision reading a rule that no longer applies. It is
+ * also cheap: a few hundred characters on the handful of turns before the first message lands.
+ */
+export const FIRST_MESSAGE_GATE = 'Nothing has been sent this session yet. A first message that '
+  + 'could have preceded any stream — a safe preference, an agreement with whatever was just said, '
+  + 'a name for the scene, a general opinion — is worse than none, because it is what these '
+  + 'accounts will sound like before they have sounded like anything. Send now only if this moment '
+  + 'plainly asks for it: the chat was addressed, an account was named, or something just happened '
+  + 'that a person would answer without having to think of a reason. It may be one word, a laugh, '
+  + 'or a correction. It must not be built out of an earlier evening. Otherwise stay silent; there '
+  + 'will be a better one.';
 
 export interface BrainReaction {
   username: string;

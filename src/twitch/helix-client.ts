@@ -1,6 +1,16 @@
 import { Logger } from '../logger';
 
-export interface TwitchStreamInfo { isLive: boolean; category: string; title: string; }
+export interface TwitchStreamInfo {
+  isLive: boolean;
+  category: string;
+  title: string;
+  /**
+   * Twitch's own id for this broadcast, stable for its whole run and different for the next one.
+   * The only unambiguous answer to "is this still the same evening", which matters because an
+   * operator pause and a new stream look identical from the media pipeline.
+   */
+  broadcastId?: string;
+}
 
 export class TwitchHelixClient {
   private appToken?: { value: string; expiresAt: number };
@@ -21,13 +31,18 @@ export class TwitchHelixClient {
     );
     const userId = users.data[0]?.id;
     if (!userId) return { isLive: false, category: '', title: '' };
-    const streams = await this.request<{ data: Array<{ game_name: string; title: string }> }>(
+    const streams = await this.request<{ data: Array<{ id: string; game_name: string; title: string }> }>(
       `https://api.twitch.tv/helix/streams?user_id=${encodeURIComponent(userId)}`,
       headers,
     );
     const stream = streams.data[0];
     return stream
-      ? { isLive: true, category: stream.game_name, title: stream.title }
+      ? {
+        isLive: true,
+        category: stream.game_name,
+        title: stream.title,
+        ...(stream.id ? { broadcastId: stream.id } : {}),
+      }
       : { isLive: false, category: '', title: '' };
   }
 
