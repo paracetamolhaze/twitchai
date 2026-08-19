@@ -8,6 +8,7 @@ import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { MemoryRepository } from '../src/persistence/memory-repository';
+import { SHORTLIST_TARGET_SIZE } from '../src/reaction/candidate-shortlist';
 import { NaturalnessGuard } from '../src/reaction/naturalness-guard';
 import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
@@ -834,6 +835,65 @@ describe('single-session reaction protocol', () => {
     expect(policy.maxReactionsFor(30)).toBe(5);
     // Never above the configured ceiling, whatever the crowd.
     expect(policy.maxReactionsFor(200)).toBe(5);
+  });
+
+  describe('candidate shortlisting for a roster past the target size', () => {
+    // Twenty-nine equally-shaped candidate entries is what a live run actually looked like: a
+    // measured session put attention at 'notices' for 63 of 449 checks and 'no strong pattern' for
+    // the rest, and every one of those twenty-nine went into the same payload regardless. These build
+    // a crowd well past SHORTLIST_TARGET_SIZE and check what actually reaches the Brain.
+    function crowd(size: number): ReactionBotCandidate[] {
+      return Array.from({ length: size }, (_, index) => {
+        const base = CANDIDATE_PERSONAS[index % CANDIDATE_PERSONAS.length]!;
+        return {
+          username: `crowd-${index}`,
+          persona: { ...base, behavior: { ...base.behavior, minimumIntervalMs: 30_000 } },
+          enabled: true, connectionState: 'CONNECTED' as const, chatConnected: true,
+        };
+      });
+    }
+
+    it('shows the Brain a shortlist rather than the full roster, once the pool passes the target size', async () => {
+      const { coordinator, setCandidates, policy } = await setup();
+      setCandidates(crowd(12));
+      const prepared = await coordinator.prepareBrainEvent(
+        { ...event, id: 'crowded-event', summary: 'секунда тишины в чате' }, 0,
+      );
+      expect(prepared.candidateStates?.length).toBeLessThan(12);
+      expect(prepared.candidateStates?.length).toBeLessThanOrEqual(SHORTLIST_TARGET_SIZE);
+      expect(prepared.availableBots).toHaveLength(prepared.candidateStates!.length);
+      // The ceiling still follows the full room, not the smaller set the Brain was actually shown —
+      // an ordinary remark stays one voice at most however many of the twelve made the shortlist.
+      expect(prepared.constraints.maxReactions).toBe(policy.maxReactionsFor(12, event.importance));
+      await coordinator.stop();
+    });
+
+    it('keeps a topically-relevant account in the shortlist out of a crowd past the target size', async () => {
+      const { coordinator, candidatesFor, setCandidates } = await setup();
+      const archivist = candidatesFor('bot-three');
+      expect(archivist.persona.interests.other).toContain('плёночная фотография');
+      setCandidates([{ ...archivist, username: 'the-archivist' }, ...crowd(11)]);
+      const prepared = await coordinator.prepareBrainEvent({
+        ...event, id: 'topical-crowded-event', type: 'speech',
+        summary: 'S: смотри, тут плёночная фотография на стене висит',
+      }, 0);
+      expect(prepared.candidateStates?.length).toBeLessThan(12);
+      expect(prepared.candidateStates?.find((state) => state.username === 'the-archivist')?.attention)
+        .toBe('notices');
+      await coordinator.stop();
+    });
+
+    it('never trims a directly-mentioned account, even when more accounts are mentioned than the shortlist target', async () => {
+      const { coordinator, setCandidates } = await setup();
+      const pool = crowd(12);
+      setCandidates(pool);
+      const mentioned = pool.slice(0, 9).map((candidate) => candidate.username);
+      const prepared = await coordinator.prepareBrainEvent(
+        { ...event, id: 'many-mentions-event', directMentions: mentioned }, 0,
+      );
+      expect(prepared.candidateStates?.map((state) => state.username).sort()).toEqual([...mentioned].sort());
+      await coordinator.stop();
+    });
   });
 
   it('keeps an account that cannot send out of the decision entirely', async () => {

@@ -109,7 +109,23 @@ export interface DriveUsageCounters {
   silentDecisions: number;
   messages: number;
   messagesBlockedByHourlyLimit: number;
+  /**
+   * Sum of the three fields below — kept for dashboards built against it before arbitration could
+   * tell a discard's reason apart. New code should read the specific field instead.
+   */
   cancelledForExternalEvent: number;
+  /** Discarded: the moment this reaction answered was already too old by the time it was ready. */
+  droppedExpired: number;
+  /** Discarded: a viewer or another bot already said essentially this while the reaction was generating. */
+  droppedDuplicate: number;
+  /** Discarded: an unrelated, high-importance event landed elsewhere while this was generating. */
+  droppedSuperseded: number;
+  /**
+   * A newer external event arrived while this reaction was generating — which used to mean an
+   * automatic discard — but arbitration read what actually happened and sent it anyway. The number
+   * that shows how much the unconditional rule used to throw away for no real reason.
+   */
+  survivedNewerEvent: number;
   cancelledForCooldown: number;
   cancelledForNoCandidates: number;
 }
@@ -376,6 +392,10 @@ export class UsageTracker {
   recordDriveMessage(): void { this.incrementDrive('messages'); }
   recordDriveMessagesBlockedByHourlyLimit(): void { this.incrementDrive('messagesBlockedByHourlyLimit'); }
   recordDriveCancelledForExternalEvent(): void { this.incrementDrive('cancelledForExternalEvent'); }
+  recordDriveDroppedExpired(): void { this.incrementDrive('droppedExpired'); }
+  recordDriveDroppedDuplicate(): void { this.incrementDrive('droppedDuplicate'); }
+  recordDriveDroppedSuperseded(): void { this.incrementDrive('droppedSuperseded'); }
+  recordDriveSurvivedNewerEvent(): void { this.incrementDrive('survivedNewerEvent'); }
   recordDriveCancelledForCooldown(): void { this.incrementDrive('cancelledForCooldown'); }
   recordDriveCancelledForNoCandidates(): void { this.incrementDrive('cancelledForNoCandidates'); }
 
@@ -514,7 +534,8 @@ function emptyDriveCounters(): DriveUsageCounters {
   return {
     ticks: 0, eligibleTicks: 0, localSkips: 0, brainCalls: 0, brainCallsBlockedByHourlyLimit: 0,
     silentDecisions: 0, messages: 0, messagesBlockedByHourlyLimit: 0,
-    cancelledForExternalEvent: 0, cancelledForCooldown: 0, cancelledForNoCandidates: 0,
+    cancelledForExternalEvent: 0, droppedExpired: 0, droppedDuplicate: 0, droppedSuperseded: 0,
+    survivedNewerEvent: 0, cancelledForCooldown: 0, cancelledForNoCandidates: 0,
   };
 }
 

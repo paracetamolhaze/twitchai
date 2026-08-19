@@ -5,9 +5,10 @@ import { ContextStore } from '../stream-brain/context-store';
 import { ColdStartStatus } from '../stream-brain/stream-session';
 import { UsageTracker } from '../usage/usage-tracker';
 import { BotHistory } from './bot-history';
+import { CHAT_FREQUENCY_WEIGHT } from './chat-frequency-weight';
+import { arbitrateDriveReaction } from './persona-drive-arbitration';
 import { PersonaMemory } from './persona-memory';
 import { PersonaRuntimeStore } from './persona-runtime-store';
-import { PersonaActivityPattern } from './types';
 
 export interface PersonaDriveServiceOptions {
   enabled: boolean;
@@ -75,13 +76,6 @@ const MAX_RECENT_SPEECH_FOR_DRIVE = 8;
 const MAX_RECENT_EVENTS_FOR_DRIVE = 4;
 /** How long without any own message before "hasn't spoken in a while" stops adding extra weight. */
 const IDLE_REFERENCE_WINDOW_MS = 30 * 60_000;
-
-const CHAT_FREQUENCY_WEIGHT: Record<PersonaActivityPattern['chatFrequency'], number> = {
-  'very-low': 0.15,
-  low: 0.4,
-  medium: 1,
-  high: 2,
-};
 
 /**
  * Single global scheduler for autonomous, spontaneous persona-initiated messages — the internal
@@ -238,6 +232,7 @@ export class PersonaDriveService {
       .map(({ timestamp, text }) => ({ timestamp, text }));
     const recentEvents = snapshot.recentEvents.slice(-MAX_RECENT_EVENTS_FOR_DRIVE)
       .map(({ timestamp, type, summary }) => ({ timestamp, type, summary }));
+    const recentChatForDrive = snapshot.recentChat.slice(-MAX_RECENT_CHAT_FOR_DRIVE);
     const coldStartActive = o.coldStart?.()?.active ?? false;
     const input: BrainDriveOpportunityInput = {
       triggerKind: 'persona_drive',
@@ -245,8 +240,7 @@ export class PersonaDriveService {
       category: snapshot.category,
       streamContext: snapshot.streamContext,
       candidates: driveCandidates,
-      recentChat: snapshot.recentChat.slice(-MAX_RECENT_CHAT_FOR_DRIVE)
-        .map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
+      recentChat: recentChatForDrive.map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
       ...(recentSpeech.length > 0 ? { recentSpeech } : {}),
       ...(recentEvents.length > 0 ? { recentEvents } : {}),
       ...(lastObservationAt !== undefined
@@ -277,16 +271,6 @@ export class PersonaDriveService {
     // Before the branches below, all of which can end the tick: whether this persona ends up
     // speaking has nothing to do with whether what the Brain noticed is worth keeping.
     await o.applyMemoryUpdates(decision, requestId);
-    if (this.lastExternalEventAt > driveStartedAt) {
-      // A real observation arrived while Gemini was still thinking about the drive opportunity.
-      // The tokens are already spent; sending a now-stale autonomous reply on top of something
-      // that actually just happened would be worse, so the result is discarded before it ever
-      // reaches the scheduler.
-      await o.submitReaction(requestId, []);
-      o.usage.recordDriveCancelledForExternalEvent();
-      this.logger.info('PERSONA_DRIVE_CANCELLED_EXTERNAL_EVENT', { requestId });
-      return;
-    }
     if (decision.reactions.length === 0) {
       await o.submitReaction(requestId, []);
       o.usage.recordDriveSilentDecision();
@@ -297,6 +281,44 @@ export class PersonaDriveService {
     }
 
     const reaction = decision.reactions[0]!;
+    // A real observation may have arrived while Gemini was still thinking. That used to mean an
+    // unconditional discard — but a live run showed both of its actual triggers were unrelated,
+    // low-importance filler ('speech' events at importance 0.4 and 0.5) that had nothing to do with
+    // what the drive had just written, and the tokens it discarded were never even logged. Content
+    // arbitration reads what was actually recorded during generation instead of only noticing the
+    // clock moved: too old, already said by someone else, or genuinely beaten by something more
+    // important. Anchored to driveStartedAt, not to how old the subject already was when the tick
+    // fired — the drive is meant to fire after minutes of quiet, and that quiet is not staleness.
+    const newerEventArrived = this.lastExternalEventAt > driveStartedAt;
+    const postCallSnapshot = o.contextStore.snapshot();
+    const arbitration = arbitrateDriveReaction({
+      reaction,
+      generationStartedAt: driveStartedAt,
+      hookSubjectText: [
+        ...recentSpeech.map((line) => line.text),
+        ...recentEvents.map((item) => item.summary),
+        ...recentChatForDrive.map((message) => message.message),
+      ].join(' '),
+      now: this.now(),
+      recentChat: postCallSnapshot.recentChat,
+      recentEvents: postCallSnapshot.recentEvents,
+    });
+    if (arbitration.outcome !== 'valid') {
+      await o.submitReaction(requestId, []);
+      o.usage.recordDriveCancelledForExternalEvent();
+      if (arbitration.outcome === 'expired') o.usage.recordDriveDroppedExpired();
+      else if (arbitration.outcome === 'duplicate') o.usage.recordDriveDroppedDuplicate();
+      else o.usage.recordDriveDroppedSuperseded();
+      this.logger.info('PERSONA_DRIVE_CANCELLED_EXTERNAL_EVENT', {
+        requestId, outcome: arbitration.outcome, ...(arbitration.reason ? { reason: arbitration.reason } : {}),
+      });
+      return;
+    }
+    // The old unconditional rule would have discarded this on the newer-event fact alone. Content
+    // arbitration looked at what actually arrived since and found nothing that makes the reaction
+    // stale, a repeat, or beaten by something more important — so, unlike before, it survives.
+    if (newerEventArrived) o.usage.recordDriveSurvivedNewerEvent();
+
     const result = await o.submitReaction(requestId, [{ username: reaction.username, message: reaction.message }]);
     if (result.accepted.length > 0) {
       const sentAt = this.now();

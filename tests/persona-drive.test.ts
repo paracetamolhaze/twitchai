@@ -104,8 +104,8 @@ function sequence(values: number[]): () => number {
   };
 }
 
-function chat(kind: ChatMessage['kind'], username: string, timestamp: number): ChatMessage {
-  return { id: `${username}-${timestamp}`, timestamp, username, displayName: username, message: 'привет', kind };
+function chat(kind: ChatMessage['kind'], username: string, timestamp: number, message = 'привет'): ChatMessage {
+  return { id: `${username}-${timestamp}`, timestamp, username, displayName: username, message, kind };
 }
 
 describe('PersonaDriveService', () => {
@@ -224,29 +224,100 @@ describe('PersonaDriveService', () => {
     service.stop();
   });
 
-  it('discards a decision that resolves after a real external event arrived while Gemini was thinking', async () => {
-    vi.useFakeTimers();
-    // A strictly-increasing counter, not the frozen fake Date: notifyExternalEvent() is called
-    // from inside evaluateOpportunity(), i.e. at the same virtual instant driveStartedAt was
-    // captured at — under a frozen clock both reads would tie, and a real Date.now() in
-    // production always ticks forward between them, so the discard check must see "later", not "equal".
-    let counter = 1_000_000;
-    const now = () => counter++;
-    const ref: { service?: PersonaDriveService } = {};
-    const { service, usage, submitReaction } = await harness({
-      now,
-      evaluateOpportunity: vi.fn(async () => {
-        ref.service!.notifyExternalEvent();
-        return { reactions: [{ username: 'karlbekner', message: 'привет' }], memoryUpdates: [] };
-      }),
+  describe('content arbitration for a reaction that finished after a real external event was noted', () => {
+    // The old rule was unconditional: any external event noted while Gemini was still generating
+    // discarded the result, content unread. A live run showed what that cost — two spontaneous
+    // replies thrown away for unrelated 'speech' filler at importance 0.4 and 0.5. Arbitration now
+    // reads what was actually recorded since the hook; these pin the service wiring end to end.
+    // arbitrateDriveReaction's own outcomes are covered exhaustively in
+    // persona-drive-arbitration.test.ts — these three only prove this service calls it and routes
+    // each outcome to the right usage counter and submitReaction call.
+
+    it('sends the reaction anyway when a newer event was merely noted but nothing actually conflicts with it', async () => {
+      vi.useFakeTimers();
+      // A strictly-increasing counter, not the frozen fake Date: notifyExternalEvent() is called
+      // from inside evaluateOpportunity(), i.e. at the same virtual instant driveStartedAt was
+      // captured at — under a frozen clock both reads would tie, and a real Date.now() in
+      // production always ticks forward between them, so this must see "later", not "equal".
+      let counter = 1_000_000;
+      const now = () => counter++;
+      const ref: { service?: PersonaDriveService } = {};
+      const { service, usage, submitReaction } = await harness({
+        now,
+        evaluateOpportunity: vi.fn(async () => {
+          ref.service!.notifyExternalEvent();
+          return { reactions: [{ username: 'karlbekner', message: 'привет' }], memoryUpdates: [] };
+        }),
+      });
+      ref.service = service;
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(submitReaction).toHaveBeenCalledWith(expect.any(String), [{ username: 'karlbekner', message: 'привет' }]);
+      expect(usage.snapshot().drive.survivedNewerEvent).toBe(1);
+      expect(usage.snapshot().drive.cancelledForExternalEvent).toBe(0);
+      service.stop();
     });
-    ref.service = service;
-    service.start();
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(submitReaction).toHaveBeenCalledWith(expect.any(String), []);
-    expect(usage.snapshot().drive.cancelledForExternalEvent).toBe(1);
-    expect(usage.snapshot().drive.messages).toBe(0);
-    service.stop();
+
+    it('sends a reaction built from a five-minute-old observation without expiring it — quiet is not staleness', async () => {
+      // The drive is gated on being quiet for at least minQuietMs, not on being fresh, so the subject
+      // it fires on is routinely minutes old already by the time generation even starts. Arbitration
+      // must measure its TTL from when generation began, never from the subject's own age, or every
+      // ordinary drive opportunity on a quiet stream would expire before it was ever sent.
+      vi.useFakeTimers();
+      const now = Date.now();
+      const { service, usage, submitReaction, contextStore } = await harness({
+        evaluateOpportunity: vi.fn(async () => ({ reactions: [{ username: 'karlbekner', message: 'привет' }], memoryUpdates: [] })),
+      });
+      contextStore.addEvent({
+        id: 'stale-observation', timestamp: now - 5 * 60_000, type: 'other', summary: 'стример говорит про VPN',
+        importance: 0.6, confidence: 0.9, source: 'gemini-live', directMentions: [],
+      });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(submitReaction).toHaveBeenCalledWith(expect.any(String), [{ username: 'karlbekner', message: 'привет' }]);
+      expect(usage.snapshot().drive.droppedExpired).toBe(0);
+      expect(usage.snapshot().drive.cancelledForExternalEvent).toBe(0);
+      service.stop();
+    });
+
+    it('discards the reaction when a viewer already said essentially the same thing while Gemini was thinking', async () => {
+      vi.useFakeTimers();
+      const { service, usage, submitReaction, contextStore } = await harness({
+        evaluateOpportunity: vi.fn(async () => {
+          // A real tick between the hook and this chat message, so it reads as "after" — under a
+          // frozen fake clock a same-instant write would tie the hook and never count as newer.
+          vi.setSystemTime(Date.now() + 1);
+          contextStore.addChat(chat('viewer', 'realviewer', Date.now(), 'го дальше по классике'));
+          return { reactions: [{ username: 'karlbekner', message: 'го дальше по классике' }], memoryUpdates: [] };
+        }),
+      });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(submitReaction).toHaveBeenCalledWith(expect.any(String), []);
+      expect(usage.snapshot().drive.droppedDuplicate).toBe(1);
+      expect(usage.snapshot().drive.cancelledForExternalEvent).toBe(1);
+      service.stop();
+    });
+
+    it('discards the reaction when an unrelated, high-importance event lands elsewhere while Gemini was thinking', async () => {
+      vi.useFakeTimers();
+      const { service, usage, submitReaction, contextStore } = await harness({
+        evaluateOpportunity: vi.fn(async () => {
+          vi.setSystemTime(Date.now() + 1);
+          contextStore.addEvent({
+            id: 'superseding', timestamp: Date.now(), type: 'mishap',
+            summary: 'стример роняет кружку с чаем на клавиатуру и вскакивает',
+            importance: 0.9, confidence: 0.9, source: 'gemini-live', directMentions: [],
+          });
+          return { reactions: [{ username: 'karlbekner', message: 'го дальше по классике' }], memoryUpdates: [] };
+        }),
+      });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(submitReaction).toHaveBeenCalledWith(expect.any(String), []);
+      expect(usage.snapshot().drive.droppedSuperseded).toBe(1);
+      service.stop();
+    });
   });
 
   it('keeps durable memory from a tick that ends in silence, since remembering is not speaking', async () => {

@@ -6,13 +6,14 @@ import { ReactionMemory } from '../learning/reaction-memory';
 import { GlobalStreamerMemory } from '../global-memory/global-streamer-memory';
 import { BotHistory } from '../personas/bot-history';
 import { PersonaContextBuilder } from '../personas/persona-context-builder';
-import { PersonaMemory, relevanceScore, semanticTokens } from '../personas/persona-memory';
+import { PersonaMemory } from '../personas/persona-memory';
 import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
 import { ContextStore } from '../stream-brain/context-store';
 import { StreamEvent } from '../stream-brain/types';
 import { ColdStartStatus } from '../stream-brain/stream-session';
 import { BrainEventInput, FIRST_MESSAGE_GATE } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
+import { shortlistCandidates } from './candidate-shortlist';
 import { NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
 import { ReactionPolicyGuard } from './reaction-policy-guard';
 import {
@@ -152,6 +153,19 @@ interface SessionDecisionStats {
     /** Session-clock age, in ms, of the first message that ever reached Twitch. Set once. */
     firstAiMessageAgeMs?: number;
   };
+  /**
+   * What shortlisting actually did to the pool before it reached the Brain. `candidateSum` above is
+   * the pool size before shortlisting; `shortlistedSum` is what the Brain was actually shown — the
+   * two averages read side by side are the before/after a run either did or didn't need trimming.
+   * `noticesShown`/`paddingShown` split the kept seats by why they were kept, so a shortlist that
+   * turned out to be all padding and no topical fit is visible without re-deriving it from raw events.
+   */
+  shortlist: {
+    shortlistedSum: number;
+    reducedEvents: number;
+    noticesShown: number;
+    paddingShown: number;
+  };
 }
 
 function emptySessionStats(): SessionDecisionStats {
@@ -167,6 +181,7 @@ function emptySessionStats(): SessionDecisionStats {
     naturalnessRejected: { semantic_echo: 0, borrowed_opinion: 0, generic_evaluator: 0 },
     naturalnessGuardMs: 0,
     coldStart: { streamEventDecisions: 0, driveDecisions: 0 },
+    shortlist: { shortlistedSum: 0, reducedEvents: 0, noticesShown: 0, paddingShown: 0 },
   };
 }
 
@@ -361,6 +376,9 @@ export class ReactionCoordinator extends EventEmitter {
       // and an ordinarily quiet stream read identically afterwards.
       coldStartQualityModeActive: pending.coldStartActive,
       candidates: pending.candidateCount,
+      // How many of `candidates` above were actually shown to the Brain — equal to it whenever the
+      // pool was already small enough that shortlisting had nothing to trim.
+      offered: pending.permittedUsernames.size,
       selected: decision.selected.map((item) => item.username),
       silent: decision.silentCandidateCount,
       rejected: decision.rejected.length,
@@ -414,6 +432,10 @@ export class ReactionCoordinator extends EventEmitter {
       eventsWithoutCandidate: stats.eventsWithoutCandidate,
       averageEligible: average(stats.eligibleSum, stats.events),
       averageCandidates: average(stats.candidateSum, stats.events),
+      // The pool the Brain was actually shown, next to the pool it was drawn from above: on a small
+      // stream the two match, and on a large one the gap is the shortlist working as intended.
+      averageShortlisted: average(stats.shortlist.shortlistedSum, stats.events),
+      shortlistReducedEvents: stats.shortlist.reducedEvents,
       excludedByCooldown: stats.excludedByCooldown,
       // Each mechanism on its own line, so how often either one speaks is read rather than derived.
       streamEventDecisions: events.decisions,
@@ -443,6 +465,10 @@ export class ReactionCoordinator extends EventEmitter {
       attentionNotices: stats.attention.notices,
       attentionPassesOver: stats.attention['passes over'],
       attentionNoPattern: stats.attention['no strong pattern'],
+      // Of the seats the Brain actually saw (averageShortlisted above), how many were there on a
+      // topical match versus filled in as plausible general audience.
+      shortlistNoticesShown: stats.shortlist.noticesShown,
+      shortlistPaddingShown: stats.shortlist.paddingShown,
       // The gates in front of the drive, which is a different question from what it then decided.
       // driveBrainCalls minus driveSilentDecisions minus driveCancelledForExternalEvent is what
       // actually reached a persona; the last of those was invisible here and made three cancelled
@@ -453,6 +479,14 @@ export class ReactionCoordinator extends EventEmitter {
       driveBrainCalls: drive.brainCalls,
       driveSilentDecisions: drive.silentDecisions,
       driveCancelledForExternalEvent: drive.cancelledForExternalEvent,
+      // The arbitrated breakdown of the line above, plus the one number that did not exist before
+      // arbitration could tell a real discard apart from a reaction that only looked stale: how many
+      // times a newer event arrived and the reaction was sent anyway because nothing about it
+      // actually conflicted.
+      driveDroppedExpired: drive.droppedExpired,
+      driveDroppedDuplicate: drive.droppedDuplicate,
+      driveDroppedSuperseded: drive.droppedSuperseded,
+      driveSurvivedNewerEvent: drive.survivedNewerEvent,
       driveMessages: drive.messages,
     });
   }
@@ -582,7 +616,24 @@ export class ReactionCoordinator extends EventEmitter {
       };
     }
 
-    const targetedCandidates = directTargets.size > 0 ? candidates : [];
+    // Twenty-nine people is not twenty-nine equally plausible respondents to one remark. Narrow to
+    // who this moment actually reads as being for, plus a capped, deterministic general-audience
+    // fill, before building the payload below — a direct mention passes its own size as the target,
+    // which makes the size guard inside shortlistCandidates a structural no-op for it rather than a
+    // rule to remember here.
+    const shortlist = shortlistCandidates(candidates, event, directTargets.size > 0 ? candidates.length : undefined);
+    const offered = shortlist.shortlisted;
+    this.session.shortlist.shortlistedSum += offered.length;
+    if (shortlist.reduced) this.session.shortlist.reducedEvents += 1;
+    for (const candidate of candidates) {
+      this.session.attention[shortlist.attentionByUsername.get(candidate.username) ?? 'no strong pattern'] += 1;
+    }
+    for (const candidate of offered) {
+      if (shortlist.attentionByUsername.get(candidate.username) === 'notices') this.session.shortlist.noticesShown += 1;
+      else this.session.shortlist.paddingShown += 1;
+    }
+
+    const targetedCandidates = directTargets.size > 0 ? offered : [];
     const [histories, reactionExamples] = await Promise.all([
       Promise.all(targetedCandidates.map((candidate) => this.options.history.recent(candidate.username))),
       this.options.memory.retrieve(event, snapshot, Math.min(3, this.options.retrievalLimit)),
@@ -621,7 +672,9 @@ export class ReactionCoordinator extends EventEmitter {
       coldStartActive,
       expiresAt,
       timer,
-      permittedUsernames: new Set(candidates.map((candidate) => candidate.username.toLowerCase())),
+      permittedUsernames: new Set(offered.map((candidate) => candidate.username.toLowerCase())),
+      // Unchanged by shortlisting on purpose: how many voices a moment this size deserves is a fact
+      // about the whole room, not about the smaller set the Brain happened to be shown this time.
       candidateCount: candidates.length,
       viewerByUsername,
     });
@@ -635,7 +688,7 @@ export class ReactionCoordinator extends EventEmitter {
     // messages — but those only ever arrived inside targetedPersonaContext, which is built for
     // direct mentions alone. On an ordinary event the model had nothing to compare against, so one
     // account opened three messages in a row with the same word. A few lines each is enough.
-    const recentAccountMessages = await Promise.all(candidates.map(async (candidate) => ({
+    const recentAccountMessages = await Promise.all(offered.map(async (candidate) => ({
       username: candidate.username,
       messages: (await this.options.history.recent(candidate.username)).slice(-3).map((record) => record.message),
     })));
@@ -645,7 +698,7 @@ export class ReactionCoordinator extends EventEmitter {
     // cheap half of it, and it is the half that carries opinions. Without it every ordinary moment
     // was answered by accounts with no history of their own in front of them.
     const [recalledMemories, streamerMemories] = await Promise.all([
-      Promise.all(candidates.map(async (candidate) => ({
+      Promise.all(offered.map(async (candidate) => ({
         username: candidate.username,
         memories: (await this.options.personaMemory.recall(candidate.persona.id, {
           limit: 2, excludeViewerTagged: true,
@@ -662,13 +715,11 @@ export class ReactionCoordinator extends EventEmitter {
     return {
       event,
       triggerKind: 'external_stream_event',
-      availableBots: candidates.map((candidate) => candidate.username),
+      availableBots: offered.map((candidate) => candidate.username),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
-      candidateStates: candidates.map((candidate) => {
+      candidateStates: offered.map((candidate) => {
         const state = this.options.personaRuntime.get(candidate.persona.id);
-        const attention = attentionFor(candidate.persona, event);
-        this.session.attention[attention] += 1;
         return {
           username: candidate.username,
           mood: state.mood,
@@ -678,7 +729,7 @@ export class ReactionCoordinator extends EventEmitter {
           // an account which had been quiet was the stronger choice, which is a rotation wearing
           // the clothes of a judgement: a moment nobody cares about does not become interesting
           // because it is somebody's turn.
-          attention,
+          attention: shortlist.attentionByUsername.get(candidate.username) ?? 'no strong pattern',
         };
       }),
       ...(streamerMemories.length > 0 ? { streamerMemories } : {}),
@@ -1026,37 +1077,6 @@ function groundingOf(event: StreamEvent): 'speech' | 'scene' | 'speech+scene' | 
   if (spoken && seen) return 'speech+scene';
   if (spoken) return 'speech';
   return seen ? 'scene' : 'none';
-}
-
-/**
- * Whether this moment is one this character would look at.
- *
- * Matching `event.type` against the profile's own event labels sounded right and did nothing. The
- * two vocabularies barely meet: the catalogue calls things 'football', 'dota-analysis', 'gossip',
- * 'music', 'routine', while the perception layer emits 'speech', 'question', 'conversation',
- * 'visual'. Across a measured stream that left `attention` at 'no strong pattern' for 28 of 31
- * moments and identical for all four accounts on the other three — a fit signal that never once
- * told two candidates apart, while the numeric selectivity beside it suppressed all of them.
- *
- * What the profiles do carry in the same language as the stream is what the person is into, so a
- * topical hit on interests or expertise is the signal that actually fires. The event-type lists are
- * still honoured where they happen to line up.
- */
-function attentionFor(persona: ReactionBotCandidate['persona'], event: StreamEvent): 'notices' | 'passes over' | 'no strong pattern' {
-  const activity = persona.behavior.activity;
-  if (activity.ignoredEventTypes.includes(event.type)) return 'passes over';
-  if (activity.preferredEventTypes.includes(event.type)) return 'notices';
-  const moment = semanticTokens([event.summary, event.speech, event.visualContext, event.gameContext]
-    .filter(Boolean).join(' '));
-  if (moment.size === 0) return 'no strong pattern';
-  const subjects = [
-    ...persona.interests.games, ...persona.interests.music,
-    ...persona.interests.food, ...persona.interests.other,
-    ...persona.knowledge.expertise, ...persona.knowledge.familiarTopics,
-  ];
-  return subjects.some((subject) => relevanceScore(moment, subject) > 0)
-    ? 'notices'
-    : 'no strong pattern';
 }
 
 function rawUsername(value: unknown, index: number): string {

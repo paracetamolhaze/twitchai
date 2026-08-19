@@ -25,7 +25,9 @@ describe('what the brain is told about writing like a viewer', () => {
   it('puts the moment before the person, and never the person before the line', () => {
     // The failure this prevents: reaching for a personality and producing a line that displays it.
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Decide in this order');
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('whether anyone watching would have a reaction to it');
+    // "anyone watching" read as one averaged viewer; the payload is a specific, shortlisted roster,
+    // and the instruction now says so.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('whether one of these particular people would react to it');
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Never work the other way round');
   });
 
