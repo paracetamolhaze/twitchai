@@ -110,6 +110,7 @@ export class OpenRouterBrainClient implements BrainInteractionClient {
       // The service treats anything other than 'completed' as unusable, and a truncated answer is
       // exactly that: valid JSON is impossible once the model was cut off mid-object.
       status: choice?.finish_reason === 'length' ? 'incomplete' : 'completed',
+      ...(choice?.finish_reason ? { finishReason: choice.finish_reason } : {}),
       ...(outputText !== undefined ? { outputText } : {}),
       usage: {
         inputTokens: usage?.prompt_tokens ?? 0,

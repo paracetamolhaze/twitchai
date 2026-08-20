@@ -152,7 +152,7 @@ interface SessionDecisionStats {
    * rejecting a third of everything generated has a class that is too wide.
    */
   naturalnessChecked: number;
-  naturalnessRejected: Record<'semantic_echo' | 'borrowed_opinion' | 'generic_evaluator' | 'majority_echo', number>;
+  naturalnessRejected: Record<'semantic_echo' | 'borrowed_opinion' | 'generic_evaluator' | 'majority_echo' | 'transcript_echo', number>;
   naturalnessGuardMs: number;
   /**
    * How much of the strict quality window's cost fell on each mechanism. A live run spent this on
@@ -199,7 +199,9 @@ function emptySessionStats(): SessionDecisionStats {
     rejectedReactions: 0,
     attention: { notices: 0, 'passes over': 0, 'no strong pattern': 0 },
     naturalnessChecked: 0,
-    naturalnessRejected: { semantic_echo: 0, borrowed_opinion: 0, generic_evaluator: 0, majority_echo: 0 },
+    naturalnessRejected: {
+      semantic_echo: 0, borrowed_opinion: 0, generic_evaluator: 0, majority_echo: 0, transcript_echo: 0,
+    },
     naturalnessGuardMs: 0,
     coldStart: { streamEventDecisions: 0, driveDecisions: 0 },
     shortlist: { shortlistedSum: 0, reducedEvents: 0, noticesShown: 0, paddingShown: 0 },
@@ -489,11 +491,13 @@ export class ReactionCoordinator extends EventEmitter {
       rejectedReactions: stats.rejectedReactions,
       naturalnessChecked: stats.naturalnessChecked,
       naturalnessRejected: stats.naturalnessRejected.semantic_echo + stats.naturalnessRejected.borrowed_opinion
-        + stats.naturalnessRejected.generic_evaluator + stats.naturalnessRejected.majority_echo,
+        + stats.naturalnessRejected.generic_evaluator + stats.naturalnessRejected.majority_echo
+        + stats.naturalnessRejected.transcript_echo,
       naturalnessSemanticEcho: stats.naturalnessRejected.semantic_echo,
       naturalnessBorrowedOpinion: stats.naturalnessRejected.borrowed_opinion,
       naturalnessGenericEvaluator: stats.naturalnessRejected.generic_evaluator,
       naturalnessMajorityEcho: stats.naturalnessRejected.majority_echo,
+      naturalnessTranscriptEcho: stats.naturalnessRejected.transcript_echo,
       naturalnessGuardMs: Number(stats.naturalnessGuardMs.toFixed(1)),
       // How much of the above happened under the strict first-message bar, and whether it is still
       // up. A live run put all eighteen of its stream-event decisions and all three of its Persona

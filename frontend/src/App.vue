@@ -816,9 +816,41 @@ interface LearnedRule {
   updatedAt: number
   version: number
 }
+interface TeacherStatus {
+  running: boolean
+  pendingFeedback: number
+  model: string
+  lastRun?: { at: number; result: 'success' | 'failed'; category?: string; casesConsidered: number }
+}
 const learnedRules = ref<LearnedRule[]>([])
+const teacherStatus = ref<TeacherStatus | undefined>()
 const rulesBusy = ref(false)
 const trainingResult = ref('')
+
+const FAILURE_LABELS: Record<string, string> = {
+  transport_error: 'модель не ответила',
+  incomplete_response: 'ответ модели не поместился в лимит',
+  empty_response: 'модель вернула пустой ответ',
+  invalid_json: 'модель вернула повреждённый ответ',
+  schema_mismatch: 'ответ модели не совпал с форматом',
+  unexpected_error: 'внутренняя ошибка',
+}
+
+/**
+ * The operator has to be able to tell "nothing new to learn" from "training tried and did not
+ * finish" — three production runs failed in a row while the dashboard said nothing at all.
+ */
+const teacherStatusLine = computed(() => {
+  const status = teacherStatus.value
+  if (!status) return ''
+  if (status.running) return 'Обучение выполняется…'
+  const last = status.lastRun
+  if (!last) return 'Обучение ещё ни разу не запускалось.'
+  const when = formatTime(last.at)
+  return last.result === 'success'
+    ? `Последнее обучение в ${when}: разобрано оценок ${last.casesConsidered}.`
+    : `Обучение не завершено в ${when}: ${FAILURE_LABELS[last.category ?? ''] ?? 'причина неизвестна'}. Оценки не потеряны — можно повторить.`
+})
 
 const pendingVerdictCount = computed(() => messageVerdicts.value.filter((item) => !item.processedAt).length)
 
@@ -834,7 +866,12 @@ function ruleStatusLabel(rule: LearnedRule): string {
 
 async function loadLearnedRules(): Promise<void> {
   try {
-    learnedRules.value = await api<LearnedRule[]>('/api/learned-rules')
+    const [rules, status] = await Promise.all([
+      api<LearnedRule[]>('/api/learned-rules'),
+      api<TeacherStatus>('/api/learned-rules/status').catch(() => undefined),
+    ])
+    learnedRules.value = rules
+    teacherStatus.value = status
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   }
@@ -872,11 +909,19 @@ async function trainNow(): Promise<void> {
   try {
     const result = await api<
       { ran: true; outcome: { created: number; updated: number; disabled: number; unchanged: number; rejected: number; casesConsidered: number } }
-      | { ran: false; reason: string }
+      | { ran: false; reason: string; category?: string }
     >('/api/learned-rules/train', { method: 'POST' })
-    trainingResult.value = result.ran
-      ? `Разобрано оценок: ${result.outcome.casesConsidered}. Создано ${result.outcome.created}, обновлено ${result.outcome.updated}, отключено ${result.outcome.disabled}, без изменений ${result.outcome.unchanged}.`
-      : (result.reason === 'nothing_to_learn' ? 'Новых оценок пока нет.' : 'Обучение недоступно: не настроен OpenRouter.')
+    if (result.ran) {
+      trainingResult.value = `Разобрано оценок: ${result.outcome.casesConsidered}. Создано ${result.outcome.created}, обновлено ${result.outcome.updated}, отключено ${result.outcome.disabled}, без изменений ${result.outcome.unchanged}.`
+    } else if (result.reason === 'failed') {
+      trainingResult.value = `Обучение не завершено: ${FAILURE_LABELS[result.category ?? ''] ?? 'причина неизвестна'}. Оценки остались в очереди, можно повторить.`
+    } else if (result.reason === 'already_running') {
+      trainingResult.value = 'Обучение уже выполняется.'
+    } else if (result.reason === 'nothing_to_learn') {
+      trainingResult.value = 'Новых оценок пока нет.'
+    } else {
+      trainingResult.value = 'Обучение недоступно: не настроен OpenRouter.'
+    }
     await Promise.all([loadLearnedRules(), refreshVerdicts()])
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
@@ -1952,8 +1997,8 @@ onBeforeUnmount(() => {
           </div>
           <section class="panel rules-controls">
             <div>
-              <strong>{{ pendingVerdictCount }}</strong>
-              <span class="muted"> оценок ждут обучения. Обучение запускается само, когда их накопится достаточно.</span>
+              <div><strong>{{ teacherStatus?.pendingFeedback ?? pendingVerdictCount }}</strong><span class="muted"> оценок ждут обучения. Обучение запускается само, когда их накопится достаточно.</span></div>
+              <p v-if="teacherStatusLine" :class="['muted', teacherStatus?.lastRun?.result === 'failed' ? 'teacher-failed' : '']">{{ teacherStatusLine }}</p>
             </div>
             <button type="button" class="primary" :disabled="rulesBusy" @click="trainNow">Обновить обучение</button>
           </section>

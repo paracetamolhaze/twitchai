@@ -163,6 +163,107 @@ describe('majority echo — a length the first pass did not reach', () => {
   });
 });
 
+/**
+ * A third live run, on the deployment that first shipped learned policy. Two of the operator's three
+ * flagged messages are grounded here against the events they actually answered, pulled from the same
+ * production log.
+ */
+describe('transcript replay — the stream\'s own words in the stream\'s own order', () => {
+  it('F. rejects a message that stitches two consecutive speaker turns together and laughs', () => {
+    // 12:01:13. Two turns, verbatim, plus a laugh. It passed the old guard because it contains
+    // "нет" — the negation exemption read a copied line as this account's disagreement.
+    const verdict = guard.check({
+      message: 'я умер нет ты жив ахахах',
+      event: speech('O: Я умер. O: Нет, ты жив. O: Нету. O: А. O: Рошан у них, походу. ля, надо было оставить, я б добил.'),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'transcript_echo' });
+  });
+
+  it('G. lets a pure laugh through on the same event', () => {
+    const verdict = guard.check({
+      message: 'ахахах',
+      event: speech('O: Я умер. O: Нет, ты жив. O: Нету. O: А.'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('H. lets a disagreement through on the same event, even though it reuses the words', () => {
+    const verdict = guard.check({
+      message: 'да ты вообще не умер',
+      event: speech('O: Я умер. O: Нет, ты жив. O: Нету. O: А.'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets a short quoted fragment through — three words is a phrase, not a replay', () => {
+    const verdict = guard.check({
+      message: 'не успел уйти',
+      event: speech('O: не успел уйти, блядь, там стан был'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('rejects a replay that arrives without any laugh attached', () => {
+    const verdict = guard.check({
+      message: 'надо было оставить я б добил',
+      event: speech('O: Рошан у них, походу. ля, надо было оставить, я б добил.'),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'transcript_echo' });
+  });
+
+  it('does not treat a scene description as something anyone said', () => {
+    // visualContext is written by the perception layer, not spoken, so reproducing it is not a
+    // replay of anyone's line. Long enough to clear the short-message rules, so the only thing that
+    // could reject it here is transcript replay — and it must not, because nobody said this.
+    const verdict = guard.check({
+      message: 'мужчина в наушниках сидит за светящейся клавиатурой глядя на монитор',
+      event: moment({
+        type: 'visual',
+        summary: 'кто-то играет',
+        visualContext: 'Мужчина в наушниках сидит за светящейся клавиатурой, глядя на монитор.',
+      }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('still rejects a replay when the account was the one being addressed', () => {
+    // The direct-mention exemption exists because an answer reuses the question's words. Copying
+    // four consecutive words of the transcript is not answering, whoever was addressed.
+    const verdict = guard.check({
+      message: 'я умер нет ты жив',
+      event: speech('O: Я умер. O: Нет, ты жив.', { directMentions: ['aaaarrtyom'] }),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'transcript_echo' });
+  });
+
+  it('leaves a wry label for what just happened alone — the scene-label class, still not local', () => {
+    // 11:26:54, the operator's third flagged message. Its event was recoverable from the production
+    // log after all: the stream said "завтра уже типа торнамент? Ну тогда бухаем", and the account
+    // labelled that as tournament preparation. Nothing overlaps — "турнир" and "торнамент" are not
+    // even the same word to a transliteration key — so no surface rule sees it, and it is the same
+    // class as "планёрка на улице пошла": naming what a moment amounts to. Deliberately left to
+    // learned policy rather than given a rule that would only fire on this fixture.
+    const verdict = guard.check({
+      message: 'ахаха чисто настрой на турнир',
+      event: speech('S: Сегодня ещё... И за всё, и завтра уже типа торнамент? Ну тогда бухаем. Налейте мне кто-нибудь.',
+        { type: 'question' }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('leaves a paraphrased punchline alone — one shared word is not a replay', () => {
+    // 11:56:48, the other flagged message. The stream had already made the Rapier joke and the
+    // account made it again in its own words. Only "рапиру" overlaps, so no surface rule can see
+    // it; this is deliberately left to learned policy rather than guessed at here.
+    const verdict = guard.check({
+      message: 'рапиру сразу бери чего мелочиться ахах',
+      event: speech('O: Дальше чё хочешь: хоть Блинк, хоть Хекс, хоть там Рапиру ёбни вообще. O: А, давай. O: Всё, погнали.',
+        { type: 'reaction' }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+});
+
 describe('what the naturalness guard must never touch', () => {
   it('lets a one-word correction through even though it repeats the subject', () => {
     const verdict = guard.check({

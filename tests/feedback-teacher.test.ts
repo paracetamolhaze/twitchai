@@ -36,6 +36,8 @@ interface HarnessOptions {
   actions?: TeacherAction[];
   fail?: boolean;
   personas?: Record<string, { interests: string[]; expertise: string[]; weakTopics: string[] }>;
+  /** One entry per attempt, in order, so a retry can be given a different answer than the first try. */
+  responses?: Array<Partial<BrainInteractionResponse> & { throws?: boolean }>;
 }
 
 async function harness(verdicts: MessageVerdictRecord[], options: HarnessOptions = {}) {
@@ -43,21 +45,31 @@ async function harness(verdicts: MessageVerdictRecord[], options: HarnessOptions
   await repository.initialize();
   for (const item of verdicts) await repository.saveMessageVerdict(item);
 
+  const usage = { inputTokens: 4_000, cachedInputTokens: 0, outputTokens: 300, thoughtTokens: 500, totalTokens: 4_800 };
   const requests: BrainInteractionRequest[] = [];
   const client = {
     create: vi.fn(async (request: BrainInteractionRequest): Promise<BrainInteractionResponse> => {
       requests.push(structuredClone(request));
       if (options.fail) throw new Error('provider exploded');
+      const scripted = options.responses?.[requests.length - 1];
+      if (scripted?.throws) throw new Error('provider exploded');
+      if (scripted) {
+        return {
+          id: `teacher-${requests.length}`, status: 'completed', usage,
+          ...scripted,
+        } as BrainInteractionResponse;
+      }
       return {
         id: `teacher-${requests.length}`,
         status: 'completed',
         outputText: JSON.stringify({ actions: options.actions ?? [] }),
-        usage: { inputTokens: 4_000, cachedInputTokens: 0, outputTokens: 300, thoughtTokens: 500, totalTokens: 4_800 },
+        usage,
       };
     }),
   };
   const policyStore = new LearnedPolicyStore(repository, logger);
   await policyStore.load();
+  const usageTracker = new UsageTracker();
   const teacher = new FeedbackTeacher({
     client,
     model: 'test/teacher-model',
@@ -70,10 +82,10 @@ async function harness(verdicts: MessageVerdictRecord[], options: HarnessOptions
       ? options.personas[username]
       : { interests: [], expertise: [], weakTopics: [] }),
     recentChat: () => [],
-    usage: new UsageTracker(),
+    usage: usageTracker,
     logger,
   });
-  return { teacher, policyStore, repository, requests, client };
+  return { teacher, policyStore, repository, requests, client, usageTracker };
 }
 
 describe('FeedbackTeacher batch learning', () => {
@@ -323,6 +335,133 @@ describe('FeedbackTeacher batch learning', () => {
     expect(sent.event?.grounding).toBe('speech+scene');
     expect((sent.persona as { weakTopics: string[] }).weakTopics).toEqual(['экономика']);
     expect(sent.recentChat).toHaveLength(1);
+  });
+
+  it('A. a truncated response mutates nothing, leaves the batch pending, and names the reason', async () => {
+    // The exact production failure: finish_reason 'length', which the client reports as 'incomplete'.
+    // Both attempts truncated, so the run gives up rather than looping.
+    const { teacher, policyStore, repository, client } = await harness(
+      [verdict({ id: 'case-1' }), verdict({ id: 'case-2' })],
+      { responses: [{ status: 'incomplete', finishReason: 'length', outputText: '{"actions":[{"acti' },
+        { status: 'incomplete', finishReason: 'length', outputText: '{"actions":[{"acti' }] },
+    );
+    expect(await teacher.runManually()).toBeUndefined();
+    expect(policyStore.all()).toHaveLength(0);
+    expect(await repository.listUnprocessedMessageVerdicts(50)).toHaveLength(2);
+    expect(client.create).toHaveBeenCalledTimes(2);
+    const status = await teacher.status();
+    expect(status.lastRun).toMatchObject({ result: 'failed', category: 'incomplete_response' });
+    expect(status.pendingFeedback).toBe(2);
+  });
+
+  it('C. retries once when the first answer is unusable, and accepts the second', async () => {
+    const { teacher, policyStore, requests } = await harness([verdict({ id: 'case-1' })], {
+      responses: [
+        { status: 'incomplete', finishReason: 'length', outputText: '{"actions":[' },
+        {
+          status: 'completed',
+          outputText: JSON.stringify({
+            actions: [action({
+              action: 'CREATE_RULE', scopeType: 'global', rule: 'A rule the retry produced.',
+              rationale: 'x', confidence: 0.8, evidenceIds: ['case-1'],
+            })],
+          }),
+        },
+      ],
+    });
+    const outcome = await teacher.runManually();
+    expect(outcome?.created).toBe(1);
+    expect(requests).toHaveLength(2);
+    // The repair is principled, not a blind repeat: the second attempt asks the model to spend less
+    // of the same budget thinking, because spending it all thinking is what failed.
+    expect(requests[0]?.thinkingLevel).toBe('high');
+    expect(requests[1]?.thinkingLevel).toBe('low');
+    // Same batch, so a rule from the retry rests on exactly what the first attempt was shown.
+    expect(requests[0]?.input).toBe(requests[1]?.input);
+    expect(policyStore.active()).toHaveLength(1);
+  });
+
+  it('C. never retries more than once', async () => {
+    const { teacher, client } = await harness([verdict({ id: 'case-1' })], {
+      responses: Array.from({ length: 5 }, () => ({ status: 'incomplete' as const, finishReason: 'length' })),
+    });
+    await teacher.runManually();
+    expect(client.create).toHaveBeenCalledTimes(2);
+  });
+
+  it('D. a second failing run leaves the batch pending and keeps reporting failure', async () => {
+    const { teacher, repository } = await harness([verdict({ id: 'case-1' }), verdict({ id: 'case-2' })], {
+      responses: Array.from({ length: 8 }, () => ({ status: 'incomplete' as const, finishReason: 'length' })),
+    });
+    await teacher.runManually();
+    await teacher.runManually();
+    expect(await repository.listUnprocessedMessageVerdicts(50)).toHaveLength(2);
+    expect((await teacher.status()).lastRun).toMatchObject({ result: 'failed' });
+  });
+
+  it('K. a verdict that survives a failed run carries no processed stamp', async () => {
+    const { teacher, repository } = await harness([verdict({ id: 'case-1' })], {
+      responses: [{ status: 'incomplete' as const }, { status: 'incomplete' as const }],
+    });
+    await teacher.runManually();
+    const stored = await repository.listMessageVerdicts(10);
+    expect(stored[0]?.processedAt).toBeUndefined();
+  });
+
+  it('records what a failed attempt cost, because a truncated answer was still billed', async () => {
+    const { teacher, usageTracker } = await harness([verdict({ id: 'case-1' })], {
+      responses: [{ status: 'incomplete' as const }, { status: 'incomplete' as const }],
+    });
+    await teacher.runManually();
+    // Two attempts, both billed, neither previously counted anywhere.
+    expect(usageTracker.snapshot().teacherBrain.interactions).toBe(2);
+  });
+
+  it('reports invalid JSON as its own category, with bounded structural diagnostics only', async () => {
+    const { teacher } = await harness([verdict({ id: 'case-1' })], {
+      responses: [{ outputText: '{"actions": [ this is not json' }, { outputText: '{"actions": [ still not' }],
+    });
+    await teacher.runManually();
+    expect((await teacher.status()).lastRun).toMatchObject({ category: 'invalid_json' });
+  });
+
+  it('reports a schema mismatch separately from invalid JSON', async () => {
+    const { teacher } = await harness([verdict({ id: 'case-1' })], {
+      responses: [{ outputText: '{"rules": []}' }, { outputText: '{"rules": []}' }],
+    });
+    await teacher.runManually();
+    expect((await teacher.status()).lastRun).toMatchObject({ category: 'schema_mismatch' });
+  });
+
+  it('B/E. drains a real backlog across runs, committing each batch it completes', async () => {
+    // 25 pending, capped at 12 per run: the first run takes a batch, marks exactly that batch read,
+    // and the next run picks up what is left. Nothing is lost and nothing is counted twice.
+    const many = Array.from({ length: 25 }, (_, index) => verdict({
+      id: `case-${index}`,
+      verdict: index % 3 === 0 ? 'good' : 'bad',
+      message: `сообщение номер ${index}`,
+      ...(index % 3 === 0 ? {} : { note: 'повторяет уже сказанное' }),
+    }));
+    const { teacher, policyStore, repository } = await harness(many, {
+      actions: [action({
+        action: 'CREATE_RULE', scopeType: 'global',
+        rule: 'A reaction must contribute a stance, feeling, correction or question of its own.',
+        rationale: 'Several rated messages only replayed what was already said.',
+        confidence: 0.8, evidenceIds: ['case-1'],
+      })],
+    });
+
+    const first = await teacher.runManually();
+    expect(first?.created).toBe(1);
+    expect(first?.casesConsidered).toBeLessThanOrEqual(12);
+    const remaining = await repository.listUnprocessedMessageVerdicts(50);
+    expect(remaining).toHaveLength(25 - (first?.casesConsidered ?? 0));
+
+    await teacher.runManually();
+    expect((await repository.listUnprocessedMessageVerdicts(50)).length)
+      .toBeLessThan(remaining.length);
+    expect(policyStore.active().length).toBeGreaterThan(0);
+    expect((await teacher.status()).lastRun).toMatchObject({ result: 'success' });
   });
 
   it('the acceptance criterion: three dislikes become one principle that reaches a moment sharing none of their words', async () => {

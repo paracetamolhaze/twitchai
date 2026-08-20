@@ -74,6 +74,7 @@ export type ReactionRejectionReason =
   | 'borrowed_opinion'
   | 'generic_evaluator'
   | 'majority_echo'
+  | 'transcript_echo'
   // The operator specifically disliked a close match of this from the same account before. Not
   // NaturalnessGuard — it knows nothing about past operator judgement — and not a blacklist of
   // phrases: a per-persona comparison against messages that account was actually marked down for.

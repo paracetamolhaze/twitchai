@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { BrainInteractionClient } from '../brain/gemini-brain.service';
+import { BrainInteractionClient, BrainInteractionResponse } from '../brain/gemini-brain.service';
 import { Logger } from '../logger';
 import { MessageVerdictRecord } from '../personas/types';
 import { AppRepository } from '../persistence/repository';
@@ -19,7 +19,25 @@ import {
  *  about one message, and a Teacher shown two cases has nothing to generalize across. */
 export const MIN_NEW_VERDICTS_FOR_AUTO_RUN = 5;
 /** A batch past this is mostly older evidence the store has already absorbed, at rising token cost. */
-const MAX_CASES_PER_RUN = 40;
+/**
+ * How many cases one run may hold at once.
+ *
+ * Was 40, and three production runs at 24, 25 and 28 cases all came back truncated. The batch is
+ * what drives both how long the model thinks and how many actions it has to emit, so it is the term
+ * to shrink first. Twelve still shows a cluster plainly — the operator's own evidence arrives in
+ * threes and fours, and a Teacher that cannot see a pattern in twelve cases will not find one in
+ * forty either.
+ */
+const MAX_CASES_PER_RUN = 12;
+/**
+ * The whole budget for one Teacher answer, reasoning included.
+ *
+ * This is the fix for the observed failure. OpenRouter counts reasoning tokens against max_tokens
+ * for models that reason, so 2048 at high effort was spent thinking and the JSON was cut off mid
+ * object — finish_reason 'length', which the client reports as 'incomplete'. Latency told the same
+ * story: 15-18s for a response that never arrived.
+ */
+const TEACHER_MAX_OUTPUT_TOKENS = 8_192;
 /** Enough existing rules for the Teacher to recognise a duplicate, not so many it recites them. */
 const MAX_EXISTING_RULES_IN_CONTEXT = 30;
 /** Two automatic runs closer than this are almost always the same handful of verdicts twice. */
@@ -92,6 +110,48 @@ Positive verdicts are evidence too, but liking one message is not a rule. Draw a
 
 When a case is ambiguous, the note is vague, or nothing repeats, answer NO_CHANGE. Creating a rule from noise costs more than missing one, because every rule you keep takes a slot in a real decision. Reference only the case ids you were given, never invent one, and never include private reasoning in a rule or rationale.`;
 
+/** Why a run did not finish, in terms an operator can act on. Never a stack trace. */
+export type TeacherFailureCategory =
+  | 'transport_error'
+  | 'incomplete_response'
+  | 'empty_response'
+  | 'invalid_json'
+  | 'schema_mismatch'
+  | 'unexpected_error';
+
+export interface TeacherStatus {
+  running: boolean;
+  pendingFeedback: number;
+  model: string;
+  lastRun?: { at: number; result: 'success' | 'failed'; category?: TeacherFailureCategory; casesConsidered: number };
+}
+
+type TeacherAttempt =
+  | { ok: true; payload: unknown; response: BrainInteractionResponse }
+  | { ok: false; category: TeacherFailureCategory };
+
+/** Carries the category through the one throw site, so the catch does not have to re-derive it. */
+class TeacherRunError extends Error {
+  constructor(readonly category: TeacherFailureCategory) {
+    super(`teacher run failed: ${category}`);
+    this.name = 'TeacherRunError';
+  }
+}
+
+function categoryOf(cause: unknown): TeacherFailureCategory {
+  return cause instanceof Error && /fetch|network|timeout|ECONN/i.test(cause.message)
+    ? 'transport_error'
+    : 'unexpected_error';
+}
+
+/** Structural only: which keys the model got as far as emitting, never their contents. */
+function topLevelKeys(text: string): string[] {
+  return [...text.matchAll(/"([A-Za-z_][A-Za-z0-9_]{0,40})"\s*:/g)]
+    .map((match) => match[1] as string)
+    .filter((key, index, all) => all.indexOf(key) === index)
+    .slice(0, 8);
+}
+
 export interface FeedbackTeacherOptions {
   client: BrainInteractionClient;
   model: string;
@@ -119,10 +179,26 @@ export class FeedbackTeacher {
   private readonly now: () => number;
   private running = false;
   private lastRunAt = 0;
+  private lastRun?: { at: number; result: 'success' | 'failed'; category?: TeacherFailureCategory; casesConsidered: number };
 
   constructor(private readonly options: FeedbackTeacherOptions) {
     this.logger = options.logger.child('TEACHER');
     this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * What the dashboard needs to tell "your feedback is saved and waiting" apart from "training ran
+   * and took it into account" — and, after the three silent production failures, from "training
+   * tried and did not finish". A category, never a stack trace.
+   */
+  async status(): Promise<TeacherStatus> {
+    const pending = await this.options.repository.listUnprocessedMessageVerdicts(500);
+    return {
+      running: this.running,
+      pendingFeedback: pending.length,
+      model: this.options.model,
+      ...(this.lastRun ? { lastRun: this.lastRun } : {}),
+    };
   }
 
   /**
@@ -156,32 +232,31 @@ export class FeedbackTeacher {
       this.logger.info('TEACHER_RUN_STARTED', {
         trigger, feedbackCases: cases.length, existingRules: existing.length, model: this.options.model,
       });
-
-      const response = await this.options.client.create({
-        kind: 'teacher',
-        model: this.options.model,
-        input: JSON.stringify({
-          feedbackCases: cases,
-          existingRules: existing.map((rule) => ({
-            id: rule.id, scopeType: rule.scopeType, scopeKey: rule.scopeKey,
-            rule: rule.rule, confidence: rule.confidence, supportCount: rule.supportCount,
-          })),
-        }),
-        systemInstruction: TEACHER_SYSTEM_INSTRUCTION,
-        responseSchema: TEACHER_RESPONSE_SCHEMA,
-        // Rare, batched, and judged on how well it generalizes — the one call in this system where
-        // thinking budget is worth more than latency.
-        thinkingLevel: 'high',
-        maxOutputTokens: 2_048,
-        store: true,
+      const input = JSON.stringify({
+        feedbackCases: cases,
+        existingRules: existing.map((rule) => ({
+          id: rule.id, scopeType: rule.scopeType, scopeKey: rule.scopeKey,
+          rule: rule.rule, confidence: rule.confidence, supportCount: rule.supportCount,
+        })),
       });
-      if (response.status !== 'completed' || !response.outputText) {
-        throw new Error(`teacher response ${response.status}`);
-      }
-      this.options.usage.recordTeacherInteraction(response.usage);
 
-      const parsed = teacherResponseSchema.parse(JSON.parse(response.outputText));
+      // Rare, batched, and judged on how well it generalizes — the one call in this system where
+      // thinking budget is worth more than latency, so the first attempt asks for full effort. The
+      // repair attempt below exists because that is exactly what failed in production.
+      let attempt = await this.attempt(input, 'high');
+      if (!attempt.ok) {
+        // One retry, never a loop, and only a principled one: the observed failure was the model
+        // spending its whole budget reasoning, so the repair is to ask it to reason less on the same
+        // batch rather than to ask the same question again and hope. Same cases, same evidence ids,
+        // so a rule created on the second attempt rests on exactly what the first was shown.
+        this.logger.info('TEACHER_RETRYING', { trigger, reason: attempt.category });
+        attempt = await this.attempt(input, 'low');
+        if (!attempt.ok) throw new TeacherRunError(attempt.category);
+      }
+
+      const parsed = teacherResponseSchema.parse(attempt.payload);
       const { upserts, counts } = this.validateActions(parsed.actions, cases);
+      const response = attempt.response;
       // One transaction: the rules and the "these verdicts have been read" stamp land together or
       // neither does, so a failure here leaves the batch exactly as pending as it was.
       await this.options.policyStore.apply(upserts, verdicts.map((verdict) => verdict.id), this.now());
@@ -200,16 +275,100 @@ export class FeedbackTeacher {
         outputTokens: response.usage.outputTokens,
         ...(response.usage.costUsd !== undefined ? { costUsd: response.usage.costUsd } : {}),
       });
+      this.lastRun = { at: this.now(), result: 'success', casesConsidered: cases.length };
       return outcome;
     } catch (cause) {
       // Nothing was written: no rule is stored and no verdict is stamped, so the same batch is still
       // pending and the next run repeats it. A provider outage costs a call, never evidence.
-      this.logger.warn('TEACHER_RUN_FAILED', { trigger, cause });
+      const category = cause instanceof TeacherRunError ? cause.category : categoryOf(cause);
+      this.logger.warn('TEACHER_RUN_FAILED', { trigger, category, cause });
       this.lastRunAt = this.now();
+      this.lastRun = { at: this.now(), result: 'failed', category, casesConsidered: verdicts.length };
       return undefined;
     } finally {
       this.running = false;
     }
+  }
+
+  /**
+   * One model call, and everything that can be known about what came back.
+   *
+   * Separated from `run` so the retry is one call to the same code rather than a second copy of it,
+   * and so the diagnostic below happens on every attempt — including the one that fails. Usage is
+   * recorded whatever the outcome: an answer that arrived truncated was still billed, and leaving it
+   * out of the cost bucket made three failed production runs look free.
+   */
+  private async attempt(input: string, thinkingLevel: 'high' | 'low'): Promise<TeacherAttempt> {
+    const startedAt = this.now();
+    let response: BrainInteractionResponse;
+    try {
+      response = await this.options.client.create({
+        kind: 'teacher',
+        model: this.options.model,
+        input,
+        systemInstruction: TEACHER_SYSTEM_INSTRUCTION,
+        responseSchema: TEACHER_RESPONSE_SCHEMA,
+        thinkingLevel,
+        maxOutputTokens: TEACHER_MAX_OUTPUT_TOKENS,
+        store: true,
+      });
+    } catch (cause) {
+      this.logger.warn('TEACHER_RESPONSE_RECEIVED', {
+        model: this.options.model, thinkingLevel, latencyMs: this.now() - startedAt,
+        parsed: false, schemaValid: false, incompleteReason: 'transport_error', cause,
+      });
+      return { ok: false, category: 'transport_error' };
+    }
+    this.options.usage.recordTeacherInteraction(response.usage);
+
+    const text = response.outputText ?? '';
+    const diagnostic = {
+      model: this.options.model,
+      thinkingLevel,
+      latencyMs: this.now() - startedAt,
+      finishReason: response.finishReason ?? response.status,
+      responseChars: text.length,
+      outputTokens: response.usage.outputTokens,
+      thinkingTokens: response.usage.thoughtTokens,
+    };
+
+    if (response.status !== 'completed' || !text) {
+      this.logger.warn('TEACHER_RESPONSE_RECEIVED', {
+        ...diagnostic, parsed: false, schemaValid: false, actionCount: 0,
+        incompleteReason: response.status === 'completed' ? 'empty_response' : 'truncated_by_token_budget',
+      });
+      return { ok: false, category: response.status === 'completed' ? 'empty_response' : 'incomplete_response' };
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(text);
+    } catch (cause) {
+      // Bounded and structural only: the parse error, the size, and the top-level keys if the text
+      // got far enough to have any. Never the body — a model's reasoning is not ours to log.
+      this.logger.warn('TEACHER_RESPONSE_RECEIVED', {
+        ...diagnostic, parsed: false, schemaValid: false, actionCount: 0,
+        incompleteReason: 'invalid_json',
+        parseError: cause instanceof Error ? cause.message.slice(0, 200) : 'unknown',
+        topLevelKeys: topLevelKeys(text),
+      });
+      return { ok: false, category: 'invalid_json' };
+    }
+
+    const validated = teacherResponseSchema.safeParse(payload);
+    if (!validated.success) {
+      this.logger.warn('TEACHER_RESPONSE_RECEIVED', {
+        ...diagnostic, parsed: true, schemaValid: false, actionCount: 0,
+        incompleteReason: 'schema_mismatch',
+        schemaIssues: validated.error.issues.slice(0, 5).map((issue) => `${issue.path.join('.')}: ${issue.code}`),
+      });
+      return { ok: false, category: 'schema_mismatch' };
+    }
+
+    this.logger.info('TEACHER_RESPONSE_RECEIVED', {
+      ...diagnostic, parsed: true, schemaValid: true, actionCount: validated.data.actions.length,
+    });
+    return { ok: true, payload, response };
   }
 
   /**

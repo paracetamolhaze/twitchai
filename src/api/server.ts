@@ -23,6 +23,7 @@ import { ReactionDecisionRecord, ReactionTraceRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
 import { MessageVerdictRecord } from '../personas/types';
 import { LearnedPolicyRule, TeacherRunOutcome } from '../learning/learned-policy.types';
+import { TeacherStatus } from '../learning/feedback-teacher';
 import { DeliveryRecordSnapshot } from '../twitch/delivery-record';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
@@ -73,8 +74,10 @@ export interface ApiServerDependencies {
   setLearnedRuleStatus?: (id: string, status: 'active' | 'disabled') => Promise<LearnedPolicyRule | undefined>;
   deleteLearnedRule?: (id: string) => Promise<boolean>;
   trainLearnedRules?: () => Promise<
-    { ran: true; outcome: TeacherRunOutcome } | { ran: false; reason: 'teacher_unavailable' | 'nothing_to_learn' }
+    { ran: true; outcome: TeacherRunOutcome }
+    | { ran: false; reason: 'teacher_unavailable' | 'nothing_to_learn' | 'already_running' | 'failed'; category?: string }
   >;
+  teacherStatus?: () => Promise<TeacherStatus | undefined>;
   decisions?: () => ReactionDecisionRecord[];
   reactionTraces?: () => ReactionTraceRecord[];
   settings: () => Promise<Record<string, unknown>>;
@@ -359,6 +362,15 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     if (!dependencies.trainLearnedRules) return response.status(503).json({ error: 'Обучение недоступно' });
     try {
       return response.json(await dependencies.trainLearnedRules());
+    } catch (error) { return next(error); }
+  });
+  // Whether the last run finished, and how much feedback is still waiting. Read on page load; it
+  // touches no model and costs one select.
+  app.get('/api/learned-rules/status', async (_request, response, next) => {
+    if (!dependencies.teacherStatus) return response.status(503).json({ error: 'Обучение недоступно' });
+    try {
+      const status = await dependencies.teacherStatus();
+      return status ? response.json(status) : response.status(503).json({ error: 'Обучение недоступно' });
     } catch (error) { return next(error); }
   });
   app.get('/api/overview', (_request, response) => response.json(dependencies.overview()));

@@ -35,6 +35,13 @@ export interface BrainInteractionResponse {
   id: string;
   status: string;
   outputText?: string;
+  /**
+   * The transport's own word for why generation stopped, when it reports one. `status` collapses
+   * this to completed/incomplete, which was enough until a Teacher run failed three times in
+   * production saying only "incomplete" — the distinction between "ran out of budget" and anything
+   * else was the whole diagnosis and it was not in the log.
+   */
+  finishReason?: string;
   usage: BrainInteractionUsage;
 }
 

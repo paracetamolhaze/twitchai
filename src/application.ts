@@ -534,9 +534,22 @@ export class Application {
       deleteLearnedRule: (id) => this.learnedPolicy.remove(id),
       trainLearnedRules: async () => {
         if (!this.teacher) return { ran: false, reason: 'teacher_unavailable' as const };
+        const before = await this.teacher.status();
+        if (before.running) return { ran: false, reason: 'already_running' as const };
+        if (before.pendingFeedback === 0) return { ran: false, reason: 'nothing_to_learn' as const };
         const outcome = await this.teacher.runManually();
-        return outcome ? { ran: true as const, outcome } : { ran: false, reason: 'nothing_to_learn' as const };
+        if (outcome) return { ran: true as const, outcome };
+        // The batch was there and the run did not finish. Saying so is the whole point: the previous
+        // build reported this the same way as "nothing new", and three failed runs looked like an
+        // idle system rather than a broken one.
+        const after = await this.teacher.status();
+        return {
+          ran: false as const,
+          reason: 'failed' as const,
+          ...(after.lastRun?.category ? { category: after.lastRun.category } : {}),
+        };
       },
+      teacherStatus: () => this.teacher?.status() ?? Promise.resolve(undefined),
       decisions: () => [...this.decisions].reverse(),
       reactionTraces: () => [...this.reactionTraces].reverse(),
       settings: () => this.getSettings(),

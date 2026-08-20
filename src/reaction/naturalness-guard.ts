@@ -36,7 +36,9 @@ export type NaturalnessRejection =
   | 'semantic_echo'
   | 'borrowed_opinion'
   | 'generic_evaluator'
-  | 'majority_echo';
+  | 'majority_echo'
+  /** The message is a run of the transcript's own words in the transcript's own order. */
+  | 'transcript_echo';
 
 export interface NaturalnessInput {
   message: string;
@@ -127,12 +129,20 @@ export class NaturalnessGuard {
     const words = contentWords(message);
     // An emote, a laugh, a bare "?????" is a complete reaction and always passes.
     if (words.length === 0 || PURE_FEELING.test(message)) return { ok: true };
-    // A question asks for something, and a negation is very often a disagreement or a correction —
-    // the two cases most easily mistaken for an echo, because both reuse the subject by nature.
-    if (/[?？]/.test(message) || NEGATION.test(message)) return { ok: true };
 
     const event = input.event;
     if (!event) return { ok: true };
+
+    // Before any exemption below, because the live case that got through was exempted by one of
+    // them: "я умер нет ты жив ахахах" carries "нет" and read as a disagreement, when the negation
+    // was not the account's own — it belonged to the second speaker's line the message was copying.
+    // A run of the transcript's own words, in the transcript's own order, is a replay whoever was
+    // being addressed and whatever punctuation it happens to contain.
+    if (replaysTranscript(message, event)) return { ok: false, reason: 'transcript_echo' };
+
+    // A question asks for something, and a negation is very often a disagreement or a correction —
+    // the two cases most easily mistaken for an echo, because both reuse the subject by nature.
+    if (/[?？]/.test(message) || NEGATION.test(message)) return { ok: true };
     // Being spoken to changes what counts as a reaction: an answer repeats the question's words by
     // nature, and "олды на месте" to "Garena, you know what is this?" is exactly right.
     if ((event.directMentions?.length ?? 0) > 0 || event.audience === 'twitch_chat') return { ok: true };
@@ -186,6 +196,68 @@ export class NaturalnessGuard {
     // the instruction, which can at least reason about it.
     return { ok: true };
   }
+}
+
+/**
+ * Words long enough that reproducing them in order is no longer a coincidence.
+ *
+ * The whole residual message has to be the run, so this is not "shares four words with the stream"
+ * — it is "says exactly what the stream said, in the same order, and nothing else". Four is where a
+ * quoted fragment stops being a phrase two people could independently type: "я умер нет ты жив" is
+ * five, while "не успел уйти" is three and is an ordinary way to describe what happened.
+ */
+const MIN_REPLAY_WORDS = 4;
+
+/**
+ * A laugh as a whole token, so a replay cannot be laundered by appending one.
+ *
+ * The letter class carries both alphabets deliberately — Cyrillic х and Latin x are different
+ * codepoints, and leaving one out silently stops "ахахах" from being recognised as laughter at all.
+ * Restrictive enough that ordinary words are not laughs: "хоть" and "хочешь" both start with х and
+ * neither matches, because ь, ч and ш are not in the class.
+ */
+const LAUGH_TOKEN = /^(?:[аaхxеeиiяоoуy]*[хx][аaхxеeиiяоoуy]*|о+|е+|ы+|kekw|lul+|lol+|pog\p{L}*|omegalul|monkas|sadge)$/iu;
+
+/**
+ * Whether the message is the transcript's own words, in the transcript's own order.
+ *
+ * A sequence check rather than a bag-of-words one, and that is the point: every other rule here
+ * measures how much vocabulary two texts share, which says nothing about whether the account
+ * assembled a thought or copied a line. Reproducing four or more words consecutively is the one
+ * shape that cannot happen by accident, so it is also the one that can be rejected without needing
+ * to understand what was said.
+ *
+ * Speech and summary are checked separately rather than concatenated: joining them would create
+ * adjacency across a boundary that does not exist, and a message could be called a replay for
+ * spanning a join nobody spoke across.
+ */
+function replaysTranscript(message: string, event: NonNullable<NaturalnessInput['event']>): boolean {
+  // Laughter is stripped first, because "the same line plus a laugh" is the exact shape observed:
+  // a laugh on the end of somebody else's sentence does not make it this account's thought.
+  const spoken = transcriptTokens(message).filter((token) => !LAUGH_TOKEN.test(token));
+  if (spoken.length < MIN_REPLAY_WORDS) return false;
+  // Deliberately not visualContext: a scene description is written by the perception layer, not
+  // said by anyone, so matching it would punish an account for describing what it can see.
+  return [event.speech, event.summary]
+    .filter((source): source is string => Boolean(source))
+    .some((source) => containsRun(transcriptTokens(source), spoken));
+}
+
+/** Speaker labels dropped — "S:" and "O:" mark who is talking and are not part of what was said. */
+function transcriptTokens(value: string): string[] {
+  return (value.replace(/(?:^|[\s.!?,])[\p{Lu}]:\s*/gu, ' ').toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+}
+
+function containsRun(haystack: string[], needle: string[]): boolean {
+  if (needle.length === 0 || haystack.length < needle.length) return false;
+  for (let start = 0; start <= haystack.length - needle.length; start += 1) {
+    let matched = true;
+    for (let offset = 0; offset < needle.length; offset += 1) {
+      if (haystack[start + offset] !== needle[offset]) { matched = false; break; }
+    }
+    if (matched) return true;
+  }
+  return false;
 }
 
 interface Word { raw: string; key: string }
