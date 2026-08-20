@@ -92,6 +92,12 @@ export interface UsageSnapshot {
   driveBrain: BrainUsageSnapshot;
   /** cachedInputTokens / inputTokens for driveBrain, 0 when driveBrain has no input tokens yet. */
   driveCacheHitRatio: number;
+  /**
+   * The offline Feedback Teacher's own cost, lifetime. Kept out of `brain` on purpose: it runs a
+   * different model on a different schedule, and folding it in would make a handful of rare batch
+   * calls look like part of the per-decision cost of running a stream.
+   */
+  teacherBrain: BrainUsageSnapshot;
 }
 
 /**
@@ -245,6 +251,8 @@ export class UsageTracker {
   private currentBrainUsage = emptyBrainUsage();
   private readonly driveBrainUsage = emptyBrainUsage();
   private currentDriveBrainUsage = emptyBrainUsage();
+  /** No per-stream twin: a Teacher run is not part of any one stream and often happens between them. */
+  private readonly teacherBrainUsage = emptyBrainUsage();
   private readonly driveCounters: DriveUsageCounters = emptyDriveCounters();
   private currentDriveCounters: DriveUsageCounters = emptyDriveCounters();
 
@@ -374,6 +382,11 @@ export class UsageTracker {
     if (this.streamStartedAt !== undefined) addBrainUsage(this.currentBrainUsage, usage, metadata);
   }
 
+  /** The Feedback Teacher's own batch calls, which are neither decisions nor part of a stream. */
+  recordTeacherInteraction(usage: BrainInteractionUsageInput): void {
+    addBrainUsage(this.teacherBrainUsage, usage, { decision: false, latencyMs: 0 });
+  }
+
   /** Persona Drive's own slice of Brain cost — kept separate from recordBrainInteraction's bucket so it's independently visible after a stream. */
   recordDriveBrainInteraction(
     usage: BrainInteractionUsageInput,
@@ -482,6 +495,7 @@ export class UsageTracker {
       drive: { ...this.driveCounters },
       driveBrain,
       driveCacheHitRatio,
+      teacherBrain: brainSnapshot(this.teacherBrainUsage, this.brainPrices),
       currentStream: {
         active: this.streamStartedAt !== undefined,
         ...(this.currentStreamStartedAt !== undefined ? { startedAt: this.currentStreamStartedAt } : {}),

@@ -364,6 +364,13 @@ export interface MessageVerdictRecord {
    * BotHistory's own bounded window has already rotated the record out).
    */
   eventId?: string;
+  /**
+   * When a Teacher run last read this verdict as new evidence. Absent means it is still pending,
+   * which is what the dashboard shows the operator: a click that has been stored is a different
+   * thing from a click that has been generalized into a rule, and only the second one can change
+   * what gets written next.
+   */
+  processedAt?: number;
 }
 
 export interface BotMessageRecord {

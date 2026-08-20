@@ -1,4 +1,5 @@
 import { ReactionExample } from '../learning/types';
+import { LearnedPolicyRule, LearnedRuleStatus } from '../learning/learned-policy.types';
 import { StreamerMemory, StreamSession } from '../global-memory/types';
 import {
   BotMessageRecord,
@@ -33,6 +34,8 @@ export class MemoryRepository implements AppRepository {
   private messages: BotMessageRecord[] = [];
   private examples: ReactionExample[] = [];
   private readonly verdicts: MessageVerdictRecord[] = [];
+  private readonly processedVerdicts = new Set<string>();
+  private readonly learnedRules = new Map<string, LearnedPolicyRule>();
   private events: StreamEvent[] = [];
   private settings: Record<string, unknown> = {};
   private usage?: UsageSnapshot;
@@ -190,7 +193,10 @@ export class MemoryRepository implements AppRepository {
   async listReactionExamples(limit: number): Promise<ReactionExample[]> { return this.examples.slice(-limit).reverse().map(clone); }
   async saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void> { this.verdicts.push(clone(verdict)); }
   async listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
-    return this.verdicts.slice(-limit).reverse().map(clone);
+    return this.verdicts.slice(-limit).reverse().map((verdict) => ({
+      ...clone(verdict),
+      ...(this.processedVerdicts.has(verdict.id) ? { processedAt: verdict.createdAt } : {}),
+    }));
   }
   async saveStreamEvent(event: StreamEvent): Promise<void> {
     const index = this.events.findIndex((candidate) => candidate.id === event.id);
@@ -198,6 +204,40 @@ export class MemoryRepository implements AppRepository {
     else this.events.push(clone(event));
   }
   async listStreamEvents(limit: number): Promise<StreamEvent[]> { return this.events.slice(-limit).reverse().map(clone); }
+  async getStreamEvent(id: string): Promise<StreamEvent | undefined> {
+    const event = this.events.find((candidate) => candidate.id === id);
+    return event ? clone(event) : undefined;
+  }
+
+  async listUnprocessedMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
+    return this.verdicts.filter((item) => !this.processedVerdicts.has(item.id)).slice(0, limit).map(clone);
+  }
+
+  async listLearnedPolicyRules(): Promise<LearnedPolicyRule[]> {
+    return [...this.learnedRules.values()].sort((left, right) => right.updatedAt - left.updatedAt).map(clone);
+  }
+
+  async applyLearnedPolicyBatch(input: {
+    upserts: LearnedPolicyRule[];
+    processedVerdictIds: string[];
+    processedAt: number;
+  }): Promise<void> {
+    // The Postgres implementation holds one transaction; here the whole method is synchronous
+    // between awaits, so it is already all-or-nothing for the same reason.
+    for (const rule of input.upserts) this.learnedRules.set(rule.id, clone(rule));
+    for (const id of input.processedVerdictIds) this.processedVerdicts.add(id);
+  }
+
+  async setLearnedPolicyRuleStatus(id: string, status: LearnedRuleStatus): Promise<LearnedPolicyRule | undefined> {
+    const rule = this.learnedRules.get(id);
+    if (!rule) return undefined;
+    const updated: LearnedPolicyRule = { ...rule, status, updatedAt: Date.now() };
+    this.learnedRules.set(id, updated);
+    return clone(updated);
+  }
+
+  async deleteLearnedPolicyRule(id: string): Promise<boolean> { return this.learnedRules.delete(id); }
+
   async getSettings(): Promise<Record<string, unknown>> { return clone(this.settings); }
   async setSettings(settings: Record<string, unknown>): Promise<void> { this.settings = { ...this.settings, ...clone(settings) }; }
   async saveUsageSnapshot(snapshot: UsageSnapshot): Promise<void> { this.usage = clone(snapshot); }

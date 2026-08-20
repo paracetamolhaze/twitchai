@@ -22,6 +22,7 @@ import { BotAccountRecord } from '../persistence/repository';
 import { ReactionDecisionRecord, ReactionTraceRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
 import { MessageVerdictRecord } from '../personas/types';
+import { LearnedPolicyRule, TeacherRunOutcome } from '../learning/learned-policy.types';
 import { DeliveryRecordSnapshot } from '../twitch/delivery-record';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
@@ -68,6 +69,12 @@ export interface ApiServerDependencies {
   deliveryRecord?: () => DeliveryRecordSnapshot;
   rateMessage?: (verdict: Omit<MessageVerdictRecord, 'id' | 'createdAt'>) => Promise<void>;
   listMessageVerdicts?: () => Promise<MessageVerdictRecord[]>;
+  learnedRules?: () => LearnedPolicyRule[];
+  setLearnedRuleStatus?: (id: string, status: 'active' | 'disabled') => Promise<LearnedPolicyRule | undefined>;
+  deleteLearnedRule?: (id: string) => Promise<boolean>;
+  trainLearnedRules?: () => Promise<
+    { ran: true; outcome: TeacherRunOutcome } | { ran: false; reason: 'teacher_unavailable' | 'nothing_to_learn' }
+  >;
   decisions?: () => ReactionDecisionRecord[];
   reactionTraces?: () => ReactionTraceRecord[];
   settings: () => Promise<Record<string, unknown>>;
@@ -322,6 +329,36 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     if (!dependencies.listMessageVerdicts) return response.status(503).json({ error: 'Оценка сообщений недоступна' });
     try {
       return response.json(await dependencies.listMessageVerdicts());
+    } catch (error) { return next(error); }
+  });
+
+  // What the operator's verdicts have been generalized into. Read-only here; the two mutating
+  // routes below are the only way a rule changes outside a Teacher run.
+  app.get('/api/learned-rules', (_request, response) => {
+    if (!dependencies.learnedRules) return response.status(503).json({ error: 'Обучение недоступно' });
+    return response.json(dependencies.learnedRules());
+  });
+  app.patch('/api/learned-rules/:id', async (request, response, next) => {
+    if (!dependencies.setLearnedRuleStatus) return response.status(503).json({ error: 'Обучение недоступно' });
+    try {
+      const { status } = z.object({ status: z.enum(['active', 'disabled']) }).strict().parse(request.body);
+      const updated = await dependencies.setLearnedRuleStatus(request.params.id, status);
+      return updated ? response.json(updated) : response.status(404).json({ error: 'Правило не найдено' });
+    } catch (error) { return next(error); }
+  });
+  app.delete('/api/learned-rules/:id', async (request, response, next) => {
+    if (!dependencies.deleteLearnedRule) return response.status(503).json({ error: 'Обучение недоступно' });
+    try {
+      const deleted = await dependencies.deleteLearnedRule(request.params.id);
+      return deleted ? response.status(204).end() : response.status(404).json({ error: 'Правило не найдено' });
+    } catch (error) { return next(error); }
+  });
+  // The "обновить обучение" button. Never fired by simply opening the dashboard: a Teacher run costs
+  // a model call, and the operator asking for one is a different thing from the page loading.
+  app.post('/api/learned-rules/train', async (_request, response, next) => {
+    if (!dependencies.trainLearnedRules) return response.status(503).json({ error: 'Обучение недоступно' });
+    try {
+      return response.json(await dependencies.trainLearnedRules());
     } catch (error) { return next(error); }
   });
   app.get('/api/overview', (_request, response) => response.json(dependencies.overview()));

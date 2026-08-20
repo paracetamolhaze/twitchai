@@ -1,6 +1,7 @@
 import { Pool, PoolClient } from 'pg';
 import { StreamerMemory, StreamSession } from '../global-memory/types';
 import { ReactionExample } from '../learning/types';
+import { LearnedPolicyRule, LearnedRuleScope, LearnedRuleStatus } from '../learning/learned-policy.types';
 import {
   BotMessageRecord,
   MessageVerdictRecord,
@@ -404,24 +405,95 @@ export class PostgresRepository implements AppRepository {
   }
 
   async listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
-    const result = await this.pool.query<{
-      id: string; created_at: Date; username: string; message: string;
-      verdict: string; note: string | null; event_summary: string | null; event_id: string | null;
-    }>(
-      `SELECT id, created_at, username, message, verdict, note, event_summary, event_id
+    const result = await this.pool.query<MessageVerdictRow>(
+      `SELECT id, created_at, username, message, verdict, note, event_summary, event_id, processed_at
        FROM message_verdicts ORDER BY created_at DESC LIMIT $1`,
       [limit],
     );
-    return result.rows.map((row) => ({
-      id: row.id,
-      createdAt: row.created_at.getTime(),
-      username: row.username,
-      message: row.message,
-      verdict: row.verdict === 'good' ? 'good' as const : 'bad' as const,
-      ...(row.note ? { note: row.note } : {}),
-      ...(row.event_summary ? { eventSummary: row.event_summary } : {}),
-      ...(row.event_id ? { eventId: row.event_id } : {}),
-    }));
+    return result.rows.map(toMessageVerdict);
+  }
+
+  async listUnprocessedMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
+    const result = await this.pool.query<MessageVerdictRow>(
+      `SELECT id, created_at, username, message, verdict, note, event_summary, event_id, processed_at
+       FROM message_verdicts WHERE processed_at IS NULL ORDER BY created_at ASC LIMIT $1`,
+      [limit],
+    );
+    return result.rows.map(toMessageVerdict);
+  }
+
+  async getStreamEvent(id: string): Promise<StreamEvent | undefined> {
+    const result = await this.pool.query<{ payload: StreamEvent }>(
+      'SELECT payload FROM stream_events WHERE id=$1', [id],
+    );
+    return result.rows[0]?.payload;
+  }
+
+  async listLearnedPolicyRules(): Promise<LearnedPolicyRule[]> {
+    const result = await this.pool.query<LearnedPolicyRuleRow>(
+      `SELECT id, scope_type, scope_key, rule, rationale, confidence, support_count, positive_evidence,
+              negative_evidence, status, teacher_model, evidence_ids, created_at, updated_at, version
+       FROM learned_policy_rules ORDER BY updated_at DESC`,
+    );
+    return result.rows.map(toLearnedPolicyRule);
+  }
+
+  async applyLearnedPolicyBatch(input: {
+    upserts: LearnedPolicyRule[];
+    processedVerdictIds: string[];
+    processedAt: number;
+  }): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const rule of input.upserts) {
+        await client.query(
+          `INSERT INTO learned_policy_rules
+             (id, scope_type, scope_key, rule, rationale, confidence, support_count, positive_evidence,
+              negative_evidence, status, teacher_model, evidence_ids, created_at, updated_at, version)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+           ON CONFLICT (id) DO UPDATE SET
+             scope_type=EXCLUDED.scope_type, scope_key=EXCLUDED.scope_key, rule=EXCLUDED.rule,
+             rationale=EXCLUDED.rationale, confidence=EXCLUDED.confidence,
+             support_count=EXCLUDED.support_count, positive_evidence=EXCLUDED.positive_evidence,
+             negative_evidence=EXCLUDED.negative_evidence, status=EXCLUDED.status,
+             teacher_model=EXCLUDED.teacher_model, evidence_ids=EXCLUDED.evidence_ids,
+             updated_at=EXCLUDED.updated_at, version=EXCLUDED.version`,
+          [rule.id, rule.scopeType, rule.scopeKey, rule.rule, rule.rationale, rule.confidence,
+            rule.supportCount, rule.positiveEvidence, rule.negativeEvidence, rule.status,
+            rule.teacherModel, JSON.stringify(rule.evidenceIds), new Date(rule.createdAt),
+            new Date(rule.updatedAt), rule.version],
+        );
+      }
+      if (input.processedVerdictIds.length > 0) {
+        await client.query(
+          'UPDATE message_verdicts SET processed_at=$1 WHERE id = ANY($2::uuid[])',
+          [new Date(input.processedAt), input.processedVerdictIds],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async setLearnedPolicyRuleStatus(id: string, status: LearnedRuleStatus): Promise<LearnedPolicyRule | undefined> {
+    const result = await this.pool.query<LearnedPolicyRuleRow>(
+      `UPDATE learned_policy_rules SET status=$2, updated_at=NOW() WHERE id=$1
+       RETURNING id, scope_type, scope_key, rule, rationale, confidence, support_count, positive_evidence,
+                 negative_evidence, status, teacher_model, evidence_ids, created_at, updated_at, version`,
+      [id, status],
+    );
+    const row = result.rows[0];
+    return row ? toLearnedPolicyRule(row) : undefined;
+  }
+
+  async deleteLearnedPolicyRule(id: string): Promise<boolean> {
+    const result = await this.pool.query('DELETE FROM learned_policy_rules WHERE id=$1', [id]);
+    return (result.rowCount ?? 0) > 0;
   }
 
   async saveStreamEvent(event: StreamEvent): Promise<void> {
@@ -745,6 +817,52 @@ function mapStreamerMemory(row: StreamerMemoryRow): StreamerMemory {
     ...(row.resolved_at ? { resolvedAt: row.resolved_at.getTime() } : {}),
     ...(row.superseded_by ? { supersededBy: row.superseded_by } : {}),
     dedupeKey: row.dedupe_key,
+  };
+}
+
+interface MessageVerdictRow {
+  id: string; created_at: Date; username: string; message: string; verdict: string;
+  note: string | null; event_summary: string | null; event_id: string | null; processed_at: Date | null;
+}
+
+function toMessageVerdict(row: MessageVerdictRow): MessageVerdictRecord {
+  return {
+    id: row.id,
+    createdAt: row.created_at.getTime(),
+    username: row.username,
+    message: row.message,
+    verdict: row.verdict === 'good' ? 'good' : 'bad',
+    ...(row.note ? { note: row.note } : {}),
+    ...(row.event_summary ? { eventSummary: row.event_summary } : {}),
+    ...(row.event_id ? { eventId: row.event_id } : {}),
+    ...(row.processed_at ? { processedAt: row.processed_at.getTime() } : {}),
+  };
+}
+
+interface LearnedPolicyRuleRow {
+  id: string; scope_type: string; scope_key: string; rule: string; rationale: string;
+  confidence: string | number; support_count: number; positive_evidence: number;
+  negative_evidence: number; status: string; teacher_model: string; evidence_ids: unknown;
+  created_at: Date; updated_at: Date; version: number;
+}
+
+function toLearnedPolicyRule(row: LearnedPolicyRuleRow): LearnedPolicyRule {
+  return {
+    id: row.id,
+    scopeType: row.scope_type as LearnedRuleScope,
+    scopeKey: row.scope_key,
+    rule: row.rule,
+    rationale: row.rationale,
+    confidence: Number(row.confidence),
+    supportCount: Number(row.support_count),
+    positiveEvidence: Number(row.positive_evidence),
+    negativeEvidence: Number(row.negative_evidence),
+    status: row.status as LearnedRuleStatus,
+    teacherModel: row.teacher_model,
+    evidenceIds: Array.isArray(row.evidence_ids) ? row.evidence_ids.map(String) : [],
+    createdAt: row.created_at.getTime(),
+    updatedAt: row.updated_at.getTime(),
+    version: Number(row.version),
   };
 }
 

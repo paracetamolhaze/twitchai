@@ -53,6 +53,14 @@ export interface AppConfig {
     /** Set to route the Brain through OpenRouter instead of Gemini's stateful Interactions API. */
     apiKey?: string;
     brainModel: string;
+    /**
+     * The offline Feedback Teacher's model. It runs rarely, on a batch, and is judged on how well it
+     * generalizes rather than on latency, so a stronger and slower model is the right trade here and
+     * the wrong one for the per-event Brain. Defaults to the Brain's own model: shipping a default
+     * naming a model this deployment may not have access to would break the feature on first run,
+     * and one env var is a cheaper way to opt into a bigger one than a broken default is to fix.
+     */
+    teacherModel: string;
     appUrl?: string;
     appName: string;
   };
@@ -131,6 +139,7 @@ const envSchema = z.object({
   GEMINI_API_KEY: z.string().trim().optional(),
   OPENROUTER_API_KEY: z.string().trim().optional(),
   OPENROUTER_BRAIN_MODEL: z.string().trim().default('google/gemini-3.7-flash'),
+  OPENROUTER_TEACHER_MODEL: z.string().trim().optional(),
   OPENROUTER_APP_NAME: z.string().trim().default('twitch-ai'),
   GEMINI_LIVE_MODEL: z.string().trim().default('gemini-3.1-flash-live-preview'),
   // Text output would be both cheaper ($4.5/M against $12/M) and closer to what this layer does,
@@ -317,6 +326,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     openRouter: {
       apiKey: parsed.OPENROUTER_API_KEY,
       brainModel: parsed.OPENROUTER_BRAIN_MODEL,
+      teacherModel: parsed.OPENROUTER_TEACHER_MODEL || parsed.OPENROUTER_BRAIN_MODEL,
       ...(parsed.FRONTEND_URL ? { appUrl: parsed.FRONTEND_URL.split(',')[0] } : {}),
       appName: parsed.OPENROUTER_APP_NAME,
     },

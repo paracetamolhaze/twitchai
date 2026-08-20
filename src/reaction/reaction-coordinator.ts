@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { z } from 'zod';
 import { Logger } from '../logger';
 import { ReactionMemory } from '../learning/reaction-memory';
+import { LearnedPolicyStore } from '../learning/learned-policy-store';
 import { GlobalStreamerMemory } from '../global-memory/global-streamer-memory';
 import { BotHistory } from '../personas/bot-history';
 import { PersonaFeedbackStore } from '../personas/feedback-store';
@@ -50,6 +51,9 @@ export interface ReactionCoordinatorOptions {
    *  near-duplicate of a dislike, and no persona sees a live-approved example — the pre-existing
    *  behavior, for any wiring that predates this. */
   feedbackStore?: PersonaFeedbackStore;
+  /** Optional: what those verdicts have been generalized into. Absent means no decision carries
+   *  learned policy, which is exactly how this behaved before the Teacher existed. */
+  learnedPolicy?: LearnedPolicyStore;
   sender: ReactionSender;
   history: BotHistory;
   memory: ReactionMemory;
@@ -115,6 +119,10 @@ interface PendingContext {
   permittedUsernames: Set<string>;
   candidateCount: number;
   viewerByUsername: Map<string, string>;
+  /** Which learned rules were actually attached to this decision, for the decision log. Frozen at
+   *  payload time for the same reason coldStartActive is: what was in the prompt, not what is true
+   *  now. Ids and scopes only — the rule text is already in the payload and the store. */
+  learnedRulesApplied: Array<{ id: string; scope: string; scopeKey: string }>;
   expiresAt: number;
   timer: NodeJS.Timeout;
 }
@@ -403,6 +411,16 @@ export class ReactionCoordinator extends EventEmitter {
       // How many of `candidates` above were actually shown to the Brain — equal to it whenever the
       // pool was already small enough that shortlisting had nothing to trim.
       offered: pending.permittedUsernames.size,
+      // Which of the operator's learned rules this decision was actually given. Ids and scopes, so a
+      // run can be read as "the rule was attached and the message still came out that way" rather
+      // than guessed at; never the model's private reasoning about them.
+      learnedRulesApplied: pending.learnedRulesApplied.length,
+      ...(pending.learnedRulesApplied.length > 0
+        ? {
+          learnedRuleIds: pending.learnedRulesApplied.map((rule) => rule.id),
+          learnedRuleScopes: [...new Set(pending.learnedRulesApplied.map((rule) => rule.scope))],
+        }
+        : {}),
       selected: decision.selected.map((item) => item.username),
       silent: decision.silentCandidateCount,
       rejected: decision.rejected.length,
@@ -522,6 +540,9 @@ export class ReactionCoordinator extends EventEmitter {
       // signal exists to draw on, how many live examples actually reached a snapshot, and how many
       // candidate reactions were caught as a near-duplicate of something specifically disliked before.
       ...(this.options.feedbackStore ? { feedback: this.options.feedbackStore.snapshot() } : {}),
+      // And what those verdicts have been generalized into: how many rules exist, and how often any
+      // of them actually reached a decision this session.
+      ...(this.options.learnedPolicy ? { learnedPolicy: this.options.learnedPolicy.snapshot() } : {}),
     });
   }
 
@@ -701,6 +722,9 @@ export class ReactionCoordinator extends EventEmitter {
     const contextReadyAt = this.now();
     const expiresAt = contextReadyAt + this.contextTtlMs;
     const coldStartActive = this.options.coldStart?.()?.active ?? false;
+    // Narrowed to the shortlisted accounts, not the whole roster: a persona rule is only worth a
+    // slot when the account it belongs to could actually speak on this moment.
+    const learnedPolicy = this.options.learnedPolicy?.forDecision(event, offered.map((candidate) => candidate.username));
     this.removePending(event.id);
     const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
     this.pendingContexts.set(event.id, {
@@ -714,6 +738,7 @@ export class ReactionCoordinator extends EventEmitter {
       // about the whole room, not about the smaller set the Brain happened to be shown this time.
       candidateCount: candidates.length,
       viewerByUsername,
+      learnedRulesApplied: learnedPolicy?.applied ?? [],
     });
     this.options.usage.recordReactionContextPrepared();
     this.updateTrace(event.id, {
@@ -780,6 +805,18 @@ export class ReactionCoordinator extends EventEmitter {
       targetedPersonaContext,
       reactionExamples: reactionExamples.slice(0, 3),
       ...(coldStartActive ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
+      // Absent entirely when nothing was learned yet or nothing bears on this moment — an empty
+      // block would still cost tokens and still read as an instruction to consider something.
+      ...(learnedPolicy
+        ? {
+          learnedPolicy: {
+            guidance: learnedPolicy.guidance,
+            global: learnedPolicy.global,
+            topic: learnedPolicy.topic,
+            byPersona: learnedPolicy.byPersona,
+          },
+        }
+        : {}),
       deltas: [],
       constraints: {
         // The ceiling follows the moment, not just the crowd: an ordinary remark is one voice at
@@ -817,6 +854,10 @@ export class ReactionCoordinator extends EventEmitter {
       permittedUsernames: new Set(usernames.map((username) => username.toLowerCase())),
       candidateCount: usernames.length,
       viewerByUsername: new Map(),
+      // The drive builds its own payload in PersonaDriveService and does not route through
+      // prepareBrainEvent, so nothing was attached here; recorded as empty rather than left
+      // undefined so the decision log reads the same for both mechanisms.
+      learnedRulesApplied: [],
     });
     return id;
   }

@@ -18,7 +18,9 @@ import {
 } from './types';
 
 export interface BrainInteractionRequest {
-  kind: 'bootstrap' | 'decision';
+  /** 'teacher' is the offline batch learner — same transport and schema contract, its own model,
+   *  and never part of the stream's interaction chain. */
+  kind: 'bootstrap' | 'decision' | 'teacher';
   model: string;
   input: string;
   previousInteractionId?: string;

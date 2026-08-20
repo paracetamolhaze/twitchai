@@ -168,6 +168,22 @@ export interface BrainEventInput {
   reactionExamples: ReactionExample[];
   /** FIRST_MESSAGE_GATE, present only until this session's first message actually reaches Twitch. */
   firstMessageGate?: string;
+  /**
+   * What the operator's own verdicts have been generalized into, narrowed to what bears on this
+   * moment and these candidates.
+   *
+   * Dynamic, like firstMessageGate above and for the same reason: BRAIN_SYSTEM_INSTRUCTION is the
+   * cached prefix of standing principles and is already at its size budget, while this is absent on
+   * most decisions and different on the rest. Scopes are kept apart structurally — one call decides
+   * for several shortlisted accounts, so a rule learned about one of them must never arrive looking
+   * like a rule about all of them.
+   */
+  learnedPolicy?: {
+    guidance: string;
+    global: string[];
+    topic: string[];
+    byPersona: Record<string, string[]>;
+  };
   deltas: BrainDynamicDelta[];
   constraints: {
     maxReactions: number;

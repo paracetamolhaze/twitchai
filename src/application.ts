@@ -10,6 +10,9 @@ import { accumulatesMemory, AppConfig, normalizeChannel } from './config';
 import { GlobalStreamerMemory } from './global-memory/global-streamer-memory';
 import { StreamerMemory } from './global-memory/types';
 import { ReactionMemory } from './learning/reaction-memory';
+import { FeedbackTeacher } from './learning/feedback-teacher';
+import { LearnedPolicyStore } from './learning/learned-policy-store';
+import { LearnedRuleStatus } from './learning/learned-policy.types';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
 import { PersonaFeedbackStore } from './personas/feedback-store';
@@ -80,6 +83,8 @@ export class Application {
   private readonly personaRuntime: PersonaRuntimeStore;
   private readonly personaContext: PersonaContextBuilder;
   private readonly feedbackStore: PersonaFeedbackStore;
+  private readonly learnedPolicy: LearnedPolicyStore;
+  private teacher?: FeedbackTeacher;
   private readonly naturalnessGuard = new NaturalnessGuard();
   private readonly decisions: ReactionDecisionRecord[] = [];
   private readonly reactionTraces: ReactionTraceRecord[] = [];
@@ -163,6 +168,7 @@ export class Application {
     this.personaMemory = new PersonaMemory(this.repository);
     this.personaRuntime = new PersonaRuntimeStore();
     this.feedbackStore = new PersonaFeedbackStore(this.repository, this.logger);
+    this.learnedPolicy = new LearnedPolicyStore(this.repository, this.logger);
     this.personaContext = new PersonaContextBuilder(
       this.personaMemory, this.personaRuntime, undefined, undefined, this.feedbackStore,
     );
@@ -172,6 +178,7 @@ export class Application {
     await this.repository.initialize();
     this.databaseReady = true;
     await this.feedbackStore.load();
+    await this.learnedPolicy.load();
     if (!this.config.database.url) this.logger.warn('DATABASE_URL is not configured; using non-persistent in-memory storage');
     await this.personas.initialize();
     this.configureTwitchOAuth();
@@ -202,6 +209,7 @@ export class Application {
     this.coordinator = new ReactionCoordinator({
       naturalness: this.naturalnessGuard,
       feedbackStore: this.feedbackStore,
+      learnedPolicy: this.learnedPolicy,
       coldStart: () => this.streamSession.coldStartStatus(),
       onMessageSent: () => this.streamSession.markMessageSent(),
       policy: this.policy,
@@ -242,6 +250,42 @@ export class Application {
     const brainModel = this.config.openRouter.apiKey
       ? this.config.openRouter.brainModel
       : this.config.gemini.brainModel;
+
+    if (this.config.openRouter.apiKey) {
+      this.teacher = new FeedbackTeacher({
+        // Deliberately its own client instance rather than the Brain's. OpenRouterBrainClient
+        // retains conversations in a bounded map (40), and a Teacher run sharing it would push
+        // entries in until the live stream's own chain was evicted — the failure mode of which is a
+        // full session rebuild and a re-sent bootstrap, paid for by a feature meant to be nearly free.
+        client: new OpenRouterBrainClient({
+          apiKey: this.config.openRouter.apiKey,
+          logger: this.logger,
+          appName: this.config.openRouter.appName,
+          ...(this.config.openRouter.appUrl ? { appUrl: this.config.openRouter.appUrl } : {}),
+        }),
+        model: this.config.openRouter.teacherModel,
+        repository: this.repository,
+        policyStore: this.learnedPolicy,
+        personaProfile: (username) => {
+          const candidate = this.botManager.candidates().find((item) => item.username === username);
+          if (!candidate) return undefined;
+          const { persona } = candidate;
+          return {
+            interests: [
+              ...persona.interests.games, ...persona.interests.music,
+              ...persona.interests.food, ...persona.interests.other,
+            ].slice(0, 12),
+            expertise: persona.knowledge.expertise.slice(0, 8),
+            weakTopics: persona.knowledge.weakTopics.slice(0, 8),
+          };
+        },
+        recentChat: () => this.contextStore.snapshot().recentChat
+          .map(({ username, message, kind, timestamp }) => ({ username, message, kind, timestamp })),
+        usage: this.usage,
+        logger: this.logger,
+      });
+      this.logger.info('Feedback teacher enabled', { model: this.config.openRouter.teacherModel });
+    }
 
     if (brainClient) {
       this.usage.useBrainTransport(this.config.openRouter.apiKey ? 'openrouter' : 'google');
@@ -465,6 +509,12 @@ export class Application {
       rateMessage: async (verdict) => {
         const eventId = await this.resolveVerdictEventId(verdict.username, verdict.message);
         await this.feedbackStore.record({ ...verdict, ...(eventId ? { eventId } : {}) });
+        // The click is the only thing that ever produces new evidence, so it is also the only thing
+        // worth checking on — a background timer would wake up every minute to find nothing changed.
+        // Deliberately not awaited: a Teacher run takes seconds and the operator's button should not
+        // wait on it. Its own lock, threshold and cooldown decide whether anything actually happens.
+        void this.teacher?.maybeRunAutomatically()
+          .catch((cause: unknown) => this.logger.warn('Automatic teacher run failed', { cause }));
         if (verdict.verdict === 'bad') {
           this.classifyDislikedMessage(verdict.username, verdict.message, eventId);
           return;
@@ -479,6 +529,14 @@ export class Application {
         if (candidate) this.queuePersonaSnapshot(candidate.persona);
       },
       listMessageVerdicts: () => this.repository.listMessageVerdicts(100),
+      learnedRules: () => this.learnedPolicy.all(),
+      setLearnedRuleStatus: (id, status) => this.learnedPolicy.setStatus(id, status as LearnedRuleStatus),
+      deleteLearnedRule: (id) => this.learnedPolicy.remove(id),
+      trainLearnedRules: async () => {
+        if (!this.teacher) return { ran: false, reason: 'teacher_unavailable' as const };
+        const outcome = await this.teacher.runManually();
+        return outcome ? { ran: true as const, outcome } : { ran: false, reason: 'nothing_to_learn' as const };
+      },
       decisions: () => [...this.decisions].reverse(),
       reactionTraces: () => [...this.reactionTraces].reverse(),
       settings: () => this.getSettings(),

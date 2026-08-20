@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { io, Socket } from 'socket.io-client'
 
-type Page = 'overview' | 'bots' | 'brain' | 'memories' | 'chat' | 'settings'
+type Page = 'overview' | 'bots' | 'brain' | 'memories' | 'chat' | 'rules' | 'settings'
 type PersonaTab = 'main' | 'character' | 'family' | 'biography' | 'interests' | 'opinions' | 'speech' | 'twitch' | 'memory' | 'quality'
 type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'DISABLED'
 type BrainState = 'STOPPED' | 'OFFLINE' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'FATAL_CONFIG_ERROR' | 'DISABLED'
@@ -493,6 +493,7 @@ const pages: Array<{ id: Page; label: string; glyph: string }> = [
   { id: 'brain', label: 'Мозг стрима', glyph: '◇' },
   { id: 'memories', label: 'Память стримера', glyph: '◌' },
   { id: 'chat', label: 'Чат', glyph: '≡' },
+  { id: 'rules', label: 'Обученные правила', glyph: '✦' },
   { id: 'settings', label: 'Настройки', glyph: '⚙' },
 ]
 
@@ -636,7 +637,9 @@ async function loadDashboard(): Promise<void> {
     ])
     // Reading a record costs nothing, so it loads with everything else instead of behind a button.
     void loadDeliveryRecord()
-    void api<MessageVerdict[]>('/api/message-verdicts').then((items) => { messageVerdicts.value = items })
+    void refreshVerdicts()
+    // Reading the rules is a plain select; only the training button ever costs a model call.
+    void loadLearnedRules()
     Object.assign(overview, overviewData)
     Object.assign(usage, usageData)
     bots.value = botData
@@ -771,14 +774,119 @@ const deliveryRecord = ref<DeliveryRecordSnapshot | undefined>()
 
 interface MessageVerdict {
   id: string; createdAt: number; username: string; message: string
-  verdict: 'good' | 'bad'; note?: string; eventSummary?: string
+  verdict: 'good' | 'bad'; note?: string; eventSummary?: string; processedAt?: number
 }
 const messageVerdicts = ref<MessageVerdict[]>([])
 const verdictBusy = ref(false)
 
-function verdictFor(message: ChatMessage): 'good' | 'bad' | undefined {
+function verdictRecordFor(message: ChatMessage): MessageVerdict | undefined {
   return messageVerdicts.value.find((item) => item.message === message.message
-    && item.username.toLowerCase() === message.username.toLowerCase())?.verdict
+    && item.username.toLowerCase() === message.username.toLowerCase())
+}
+
+function verdictFor(message: ChatMessage): 'good' | 'bad' | undefined {
+  return verdictRecordFor(message)?.verdict
+}
+
+/**
+ * Whether the operator's click has only been stored, or has also been read by a training run. Two
+ * states rather than a progress bar: what matters is telling "saved" apart from "already generalized
+ * into a rule", because only the second one can change anything the accounts write next.
+ */
+function verdictStatusLabel(message: ChatMessage): string {
+  const record = verdictRecordFor(message)
+  if (!record) return ''
+  return record.processedAt ? 'учтено обучением' : 'ожидает обучения'
+}
+
+interface LearnedRule {
+  id: string
+  scopeType: 'global' | 'persona' | 'topic'
+  scopeKey: string
+  rule: string
+  rationale: string
+  confidence: number
+  supportCount: number
+  positiveEvidence: number
+  negativeEvidence: number
+  status: 'active' | 'disabled' | 'superseded'
+  teacherModel: string
+  evidenceIds: string[]
+  createdAt: number
+  updatedAt: number
+  version: number
+}
+const learnedRules = ref<LearnedRule[]>([])
+const rulesBusy = ref(false)
+const trainingResult = ref('')
+
+const pendingVerdictCount = computed(() => messageVerdicts.value.filter((item) => !item.processedAt).length)
+
+function scopeLabel(rule: LearnedRule): string {
+  if (rule.scopeType === 'global') return 'все аккаунты'
+  return rule.scopeType === 'persona' ? `аккаунт ${rule.scopeKey}` : `тема «${rule.scopeKey}»`
+}
+
+function ruleStatusLabel(rule: LearnedRule): string {
+  if (rule.status === 'active') return 'активно'
+  return rule.status === 'disabled' ? 'выключено вручную' : 'заменено обучением'
+}
+
+async function loadLearnedRules(): Promise<void> {
+  try {
+    learnedRules.value = await api<LearnedRule[]>('/api/learned-rules')
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  }
+}
+
+async function setRuleStatus(rule: LearnedRule, status: 'active' | 'disabled'): Promise<void> {
+  rulesBusy.value = true
+  try {
+    await api(`/api/learned-rules/${rule.id}`, { method: 'PATCH', body: JSON.stringify({ status }) })
+    await loadLearnedRules()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    rulesBusy.value = false
+  }
+}
+
+async function deleteRule(rule: LearnedRule): Promise<void> {
+  if (!window.confirm('Удалить правило? Обучение может вывести его заново из тех же оценок.')) return
+  rulesBusy.value = true
+  try {
+    await api(`/api/learned-rules/${rule.id}`, { method: 'DELETE' })
+    await loadLearnedRules()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    rulesBusy.value = false
+  }
+}
+
+/** The explicit button. Nothing here runs on page load: a training run costs a model call. */
+async function trainNow(): Promise<void> {
+  rulesBusy.value = true
+  trainingResult.value = ''
+  try {
+    const result = await api<
+      { ran: true; outcome: { created: number; updated: number; disabled: number; unchanged: number; rejected: number; casesConsidered: number } }
+      | { ran: false; reason: string }
+    >('/api/learned-rules/train', { method: 'POST' })
+    trainingResult.value = result.ran
+      ? `Разобрано оценок: ${result.outcome.casesConsidered}. Создано ${result.outcome.created}, обновлено ${result.outcome.updated}, отключено ${result.outcome.disabled}, без изменений ${result.outcome.unchanged}.`
+      : (result.reason === 'nothing_to_learn' ? 'Новых оценок пока нет.' : 'Обучение недоступно: не настроен OpenRouter.')
+    await Promise.all([loadLearnedRules(), refreshVerdicts()])
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    rulesBusy.value = false
+  }
+}
+
+async function refreshVerdicts(): Promise<void> {
+  messageVerdicts.value = await api<MessageVerdict[]>('/api/message-verdicts')
 }
 
 /**
@@ -804,7 +912,7 @@ async function rateMessage(message: ChatMessage, verdict: 'good' | 'bad'): Promi
         ...(note ? { note } : {}),
       }),
     })
-    messageVerdicts.value = await api<MessageVerdict[]>('/api/message-verdicts')
+    await refreshVerdicts()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -1833,8 +1941,40 @@ onBeforeUnmount(() => {
 
         <template v-else-if="activePage === 'chat'">
           <div class="page-heading"><div><p class="eyebrow">КОНТЕКСТ В РЕАЛЬНОМ ВРЕМЕНИ</p><h1>Чат Twitch</h1></div><p class="muted">Сообщения зрителей, ботов и системы отмечены отдельно.</p></div>
-          <p class="muted">Оценка сохраняется как обратная связь для этого аккаунта: удачное сообщение может стать примером стиля наравне с авторскими, неудачное исключается из примеров и помогает отклонять похожие ответы позже. Комментарий сохраняется для истории, а не пересказывается модели.</p>
-          <section class="panel chat-feed"><article v-for="message in [...chat].reverse()" :key="message.id" :class="['chat-line', message.kind]"><time>{{ formatTime(message.timestamp) }}</time><span class="kind-chip">{{ kindLabel(message.kind) }}</span><strong>{{ message.displayName }}</strong><p>{{ message.message }}</p><span v-if="message.kind === 'bot'" class="verdict-actions"><button type="button" :class="['text-button', verdictFor(message) === 'good' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'good')">нравится</button><button type="button" :class="['text-button', verdictFor(message) === 'bad' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'bad')">не нравится</button></span></article><div v-if="!chat.length" class="empty-state">Сообщения появятся, когда хотя бы один бот войдёт в канал.</div></section>
+          <p class="muted">Оценка сохраняется как обратная связь для этого аккаунта: удачное сообщение может стать примером стиля наравне с авторскими, неудачное исключается из примеров и помогает отклонять похожие ответы позже. Комментарий сохраняется и разбирается обучением, а не пересказывается модели напрямую. Накопив несколько оценок, обучение выводит из них общие правила — их видно на вкладке «Обученные правила».</p>
+          <section class="panel chat-feed"><article v-for="message in [...chat].reverse()" :key="message.id" :class="['chat-line', message.kind]"><time>{{ formatTime(message.timestamp) }}</time><span class="kind-chip">{{ kindLabel(message.kind) }}</span><strong>{{ message.displayName }}</strong><p>{{ message.message }}</p><span v-if="message.kind === 'bot'" class="verdict-actions"><button type="button" :class="['text-button', verdictFor(message) === 'good' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'good')">нравится</button><button type="button" :class="['text-button', verdictFor(message) === 'bad' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'bad')">не нравится</button><small v-if="verdictStatusLabel(message)" class="verdict-status">{{ verdictStatusLabel(message) }}</small></span></article><div v-if="!chat.length" class="empty-state">Сообщения появятся, когда хотя бы один бот войдёт в канал.</div></section>
+        </template>
+
+        <template v-else-if="activePage === 'rules'">
+          <div class="page-heading">
+            <div><p class="eyebrow">ЧЕМУ НАУЧИЛИ ОЦЕНКИ</p><h1>Обученные правила</h1></div>
+            <p class="muted">Оценки разбираются пачками, и повторяющиеся замечания превращаются в общие правила. Правила попадают в решения по смыслу, а не по совпадению слов, поэтому действуют и на фразы, которых раньше не было.</p>
+          </div>
+          <section class="panel rules-controls">
+            <div>
+              <strong>{{ pendingVerdictCount }}</strong>
+              <span class="muted"> оценок ждут обучения. Обучение запускается само, когда их накопится достаточно.</span>
+            </div>
+            <button type="button" class="primary" :disabled="rulesBusy" @click="trainNow">Обновить обучение</button>
+          </section>
+          <p v-if="trainingResult" class="muted">{{ trainingResult }}</p>
+          <section class="panel rules-list">
+            <article v-for="rule in learnedRules" :key="rule.id" :class="['rule-line', rule.status]">
+              <div class="rule-head">
+                <span class="kind-chip">{{ scopeLabel(rule) }}</span>
+                <span class="kind-chip">{{ ruleStatusLabel(rule) }}</span>
+                <span class="muted">уверенность {{ Math.round(rule.confidence * 100) }}% · подтверждений {{ rule.supportCount }} (👍 {{ rule.positiveEvidence }} / 👎 {{ rule.negativeEvidence }}) · обновлено {{ formatTime(rule.updatedAt) }}</span>
+              </div>
+              <p class="rule-text">{{ rule.rule }}</p>
+              <p class="muted">{{ rule.rationale }}</p>
+              <div class="rule-actions">
+                <button v-if="rule.status === 'active'" type="button" class="text-button" :disabled="rulesBusy" @click="setRuleStatus(rule, 'disabled')">выключить</button>
+                <button v-else type="button" class="text-button" :disabled="rulesBusy" @click="setRuleStatus(rule, 'active')">включить</button>
+                <button type="button" class="text-button danger" :disabled="rulesBusy" @click="deleteRule(rule)">удалить</button>
+              </div>
+            </article>
+            <div v-if="!learnedRules.length" class="empty-state">Правил пока нет. Оцените несколько сообщений в чате, и обучение выведет из них общие принципы.</div>
+          </section>
         </template>
 
         <template v-else>

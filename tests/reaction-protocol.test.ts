@@ -8,6 +8,8 @@ import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { PersonaFeedbackStore } from '../src/personas/feedback-store';
+import { LearnedPolicyStore } from '../src/learning/learned-policy-store';
+import { LearnedPolicyRule } from '../src/learning/learned-policy.types';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { SHORTLIST_TARGET_SIZE } from '../src/reaction/candidate-shortlist';
 import { NaturalnessGuard } from '../src/reaction/naturalness-guard';
@@ -47,6 +49,7 @@ async function setup(
   now: () => number = () => event.timestamp,
   captureLogs = false,
   feedbackStore?: PersonaFeedbackStore,
+  learnedPolicy?: LearnedPolicyStore,
 ) {
   const sendResult = senderResult;
   // Most cases here silence the logger; the ones asserting on what a decision records need to read
@@ -99,6 +102,7 @@ async function setup(
     policy,
     naturalness: new NaturalnessGuard(),
     ...(feedbackStore ? { feedbackStore } : {}),
+    ...(learnedPolicy ? { learnedPolicy } : {}),
     coldStart,
     onMessageSent: () => { messageSentCalls += 1; },
     sender: {
@@ -896,6 +900,70 @@ describe('single-session reaction protocol', () => {
       );
       expect(prepared.candidateStates?.map((state) => state.username).sort()).toEqual([...mentioned].sort());
       await coordinator.stop();
+    });
+  });
+
+  describe('learned policy reaching a real decision payload', () => {
+    async function policyStoreWith(rules: Array<Partial<LearnedPolicyRule> & { id: string }>): Promise<LearnedPolicyStore> {
+      const repository = new MemoryRepository();
+      await repository.initialize();
+      await repository.applyLearnedPolicyBatch({
+        upserts: rules.map((partial) => ({
+          scopeType: 'global' as const, scopeKey: '', rule: 'A rule.', rationale: 'because',
+          confidence: 0.85, supportCount: 2, positiveEvidence: 0, negativeEvidence: 2,
+          status: 'active' as const, teacherModel: 'test/teacher', evidenceIds: [],
+          createdAt: 1_000, updatedAt: 1_000, version: 1, ...partial,
+        })),
+        processedVerdictIds: [], processedAt: 1_000,
+      });
+      const store = new LearnedPolicyStore(repository, new Logger('TEST', 'error'));
+      await store.load();
+      return store;
+    }
+
+    it('carries a global rule into the event payload without touching the permanent instruction', async () => {
+      const learnedPolicy = await policyStoreWith([{
+        id: 'r1', rule: 'Do not restate an opinion the stream already expressed just to agree with it.',
+      }]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, learnedPolicy);
+      const prepared = await coordinator.prepareBrainEvent(event, 0);
+      expect(prepared.learnedPolicy?.global)
+        .toEqual(['Do not restate an opinion the stream already expressed just to agree with it.']);
+      expect(prepared.learnedPolicy?.guidance).toContain('operator');
+      await coordinator.stop();
+    });
+
+    it('keys a persona rule to its own account, so one account\'s correction is not read as everyone\'s', async () => {
+      const learnedPolicy = await policyStoreWith([{
+        id: 'r1', scopeType: 'persona', scopeKey: 'bot-two',
+        rule: 'bot-two must not give confident advice about Dota.',
+      }]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, learnedPolicy);
+      const prepared = await coordinator.prepareBrainEvent(event, 0);
+      expect(prepared.learnedPolicy?.byPersona).toEqual({
+        'bot-two': ['bot-two must not give confident advice about Dota.'],
+      });
+      expect(prepared.learnedPolicy?.global).toEqual([]);
+      await coordinator.stop();
+    });
+
+    it('omits the block entirely when nothing has been learned', async () => {
+      const learnedPolicy = await policyStoreWith([]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, learnedPolicy);
+      const prepared = await coordinator.prepareBrainEvent(event, 0);
+      expect(prepared).not.toHaveProperty('learnedPolicy');
+      await coordinator.stop();
+    });
+
+    it('records which rules a decision was given, in the decision log rather than the payload', async () => {
+      const learnedPolicy = await policyStoreWith([{ id: 'r1', rule: 'A standing correction.' }]);
+      const { coordinator, logged } = await setup(true, () => event.timestamp, true, undefined, learnedPolicy);
+      await coordinator.prepareBrainEvent(event, 0);
+      await coordinator.submitBatch({ eventId: event.id, reactions: [] });
+      const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated');
+      expect(decision).toMatchObject({ learnedRulesApplied: 1, learnedRuleIds: ['r1'], learnedRuleScopes: ['global'] });
+      await coordinator.stop();
+      vi.restoreAllMocks();
     });
   });
 

@@ -1,4 +1,5 @@
 import { ReactionExample } from '../learning/types';
+import { LearnedPolicyRule, LearnedRuleStatus } from '../learning/learned-policy.types';
 import { StreamerMemory, StreamSession } from '../global-memory/types';
 import {
   BotMessageRecord,
@@ -115,8 +116,29 @@ export interface AppRepository {
   listReactionExamples(limit: number): Promise<ReactionExample[]>;
   saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void>;
   listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]>;
+  /** Verdicts no Teacher run has counted yet, oldest first so a batch reads in the order it happened. */
+  listUnprocessedMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]>;
   saveStreamEvent(event: StreamEvent): Promise<void>;
   listStreamEvents(limit: number): Promise<StreamEvent[]>;
+  /** One event by id, for rebuilding the moment a rated message answered. */
+  getStreamEvent(id: string): Promise<StreamEvent | undefined>;
+  listLearnedPolicyRules(): Promise<LearnedPolicyRule[]>;
+  /**
+   * Applies one Teacher run's whole result, or none of it.
+   *
+   * All-or-nothing because a half-applied run is worse than a failed one: a rule created without the
+   * verdicts that justified it being marked processed would be re-derived and double-counted on the
+   * next run, and a verdict marked processed without its rule stored would lose the evidence for
+   * good. `processedVerdictIds` are stamped in the same transaction as the rule writes.
+   */
+  applyLearnedPolicyBatch(input: {
+    upserts: LearnedPolicyRule[];
+    processedVerdictIds: string[];
+    processedAt: number;
+  }): Promise<void>;
+  /** Operator-driven status change from the dashboard. Returns the updated rule, or undefined. */
+  setLearnedPolicyRuleStatus(id: string, status: LearnedRuleStatus): Promise<LearnedPolicyRule | undefined>;
+  deleteLearnedPolicyRule(id: string): Promise<boolean>;
   getSettings(): Promise<Record<string, unknown>>;
   setSettings(settings: Record<string, unknown>): Promise<void>;
   saveUsageSnapshot(snapshot: UsageSnapshot): Promise<void>;
