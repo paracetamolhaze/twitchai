@@ -955,15 +955,43 @@ describe('single-session reaction protocol', () => {
       await coordinator.stop();
     });
 
-    it('records which rules a decision was given, in the decision log rather than the payload', async () => {
+    it('records which rules a decision was given as supplied, never as applied', async () => {
+      // A live run logged three rules "applied" on a decision that broke one of them. The backend
+      // knows what it put in the payload and cannot see whether the model honoured it, so the name
+      // has to say the weaker, true thing.
       const learnedPolicy = await policyStoreWith([{ id: 'r1', rule: 'A standing correction.' }]);
       const { coordinator, logged } = await setup(true, () => event.timestamp, true, undefined, learnedPolicy);
       await coordinator.prepareBrainEvent(event, 0);
       await coordinator.submitBatch({ eventId: event.id, reactions: [] });
       const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated');
-      expect(decision).toMatchObject({ learnedRulesApplied: 1, learnedRuleIds: ['r1'], learnedRuleScopes: ['global'] });
+      expect(decision).toMatchObject({ learnedRulesSupplied: 1, learnedRuleIds: ['r1'], learnedRuleScopes: ['global'] });
+      expect(decision).not.toHaveProperty('learnedRulesApplied');
       await coordinator.stop();
       vi.restoreAllMocks();
+    });
+
+    it('places learned policy ahead of the style material it has to override', async () => {
+      // It used to sit second to last, behind the persona context, the examples and the speech
+      // fingerprint — a constraint read after the evidence it contradicts is a footnote, and a live
+      // run produced exactly the shape one of the rules forbade.
+      const learnedPolicy = await policyStoreWith([{ id: 'r1', rule: 'A standing correction.' }]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, learnedPolicy);
+      const prepared = await coordinator.prepareBrainEvent(event, 0);
+      const keys = Object.keys(prepared);
+      expect(keys.indexOf('learnedPolicy')).toBeGreaterThanOrEqual(0);
+      for (const later of ['reactionExamples', 'targetedPersonaContext', 'candidateStates', 'recentAccountMessages']) {
+        expect(keys.indexOf('learnedPolicy')).toBeLessThan(keys.indexOf(later));
+      }
+      await coordinator.stop();
+    });
+
+    it('states that a rule outranks style and that silence is an allowed way to obey it', async () => {
+      const learnedPolicy = await policyStoreWith([{ id: 'r1', rule: 'A standing correction.' }]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, learnedPolicy);
+      const prepared = await coordinator.prepareBrainEvent(event, 0);
+      expect(prepared.learnedPolicy?.guidance).toContain('outrank style');
+      expect(prepared.learnedPolicy?.guidance).toContain('silence');
+      await coordinator.stop();
     });
   });
 

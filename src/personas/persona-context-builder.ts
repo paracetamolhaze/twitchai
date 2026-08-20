@@ -186,7 +186,8 @@ export class PersonaContextBuilder {
       writesHowOften(persona.behavior.activity.chatFrequency),
       persona.speech.punctuationStyle,
       persona.speech.capitalizationStyle,
-      `сарказм ${persona.behavior.sarcasmLevel}, сленг ${persona.behavior.slangLevel}, мат ${persona.speech.profanityLevel}`,
+      `сарказм ${persona.behavior.sarcasmLevel}, сленг ${persona.behavior.slangLevel}`,
+      swearsHowMuch(persona.speech.profanityLevel),
       `лексика: ${safeTexts(persona.speech.vocabulary.filter((word) => !signatures.has(normalizedPhrase(word))), 6).join(', ')}`,
       `изредка, далеко не в каждом сообщении: ${favouriteExpressions.join(', ')}`,
       laughTendency(persona),
@@ -638,6 +639,27 @@ function laughTendency(persona: BotPersona): string {
  * event lists the model reads to decide whether to answer, which made it look like a rule about
  * this moment. It is not: the backend already enforces the spacing. Here it belongs to the voice.
  */
+/**
+ * How coarsely this person actually talks, said rather than scored.
+ *
+ * `мат 0.68` was the entire signal, and it lost. A live run on a stream whose own speech carried
+ * "Бля, честно, не понимаю", "я ебал" and "имбовая хуйня" produced sanitized neutral replies from
+ * every account, and the reason is visible in the canon rather than in any filter: across 30
+ * personas, exactly three of 480 authored message examples contain profanity and not one has any in
+ * its vocabulary list. A number in a fingerprint cannot outweigh 480 examples that all read clean —
+ * the model has no evidence of the register, only a statistic about it. Nothing in the pipeline
+ * strips profanity: there is no sanitizer, the policy guard has no such filter, and the instruction
+ * never mentions it. Saying it in words is the same repair `writesHowOften` and `laughTendency`
+ * already are, and it stays per-character: a persona authored at 0 is described as not swearing, and
+ * that is equally true of them.
+ */
+function swearsHowMuch(level: number): string {
+  if (level <= 0.02) return 'не ругается матом';
+  if (level < 0.15) return 'мат почти не использует';
+  if (level < 0.4) return 'может выругаться, когда правда цепляет';
+  return 'мат для него обычная часть речи, не редкость';
+}
+
 function writesHowOften(frequency: PersonaActivityPattern['chatFrequency']): string {
   return ({
     'very-low': 'пишет очень редко, больше читает',
@@ -696,14 +718,23 @@ function sharedTokenRatio(left: Set<string>, right: Set<string>): number {
  * plausible once real live messages are in the pool alongside curated canon — cannot both land in a
  * five-line budget. `DUPLICATE_EXAMPLE_RATIO` reuses `sharedTokenRatio`, the same overlap measure
  * `selectDiverseExamples` already uses for the shape-example pool below.
+ *
+ * Signature and laughter openers go to the back here too, which `selectShapeExamples` has done for
+ * a while and this one never did — and this is the path that actually feeds per-event generation. A
+ * live run had a learned rule against formulaic laughter openers in the payload and produced "ахаха
+ * что вы там задумали" anyway, with nothing holding those examples back on the way in. Held back
+ * rather than dropped: if a character's only relevant examples open that way, showing them is still
+ * better than showing nothing.
  */
 function selectSpeechExamples(persona: BotPersona, query: string, limit: number, filter: ModelTextFilter, liveExamples: string[] = []): string[] {
   const queryTokens = semanticTokens(query);
   const ranked = [...liveExamples, ...persona.speech.messageExamples]
     .map((example, index) => ({ example, index, score: relevanceScore(queryTokens, example) }))
     .sort((left, right) => right.score - left.score || left.index - right.index);
+  const ordinary = ranked.filter(({ example }) => !leadsWithSignature(example, persona));
+  const signature = ranked.filter(({ example }) => leadsWithSignature(example, persona));
   const picked: Array<{ example: string; tokens: Set<string> }> = [];
-  for (const candidate of ranked) {
+  for (const candidate of [...ordinary, ...signature]) {
     if (picked.length >= limit) break;
     const safe = modelSafeText(candidate.example, filter);
     if (!safe) continue;

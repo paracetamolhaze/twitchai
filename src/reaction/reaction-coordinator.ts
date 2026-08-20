@@ -122,7 +122,7 @@ interface PendingContext {
   /** Which learned rules were actually attached to this decision, for the decision log. Frozen at
    *  payload time for the same reason coldStartActive is: what was in the prompt, not what is true
    *  now. Ids and scopes only — the rule text is already in the payload and the store. */
-  learnedRulesApplied: Array<{ id: string; scope: string; scopeKey: string }>;
+  learnedRulesSupplied: Array<{ id: string; scope: string; scopeKey: string }>;
   expiresAt: number;
   timer: NodeJS.Timeout;
 }
@@ -413,14 +413,15 @@ export class ReactionCoordinator extends EventEmitter {
       // How many of `candidates` above were actually shown to the Brain — equal to it whenever the
       // pool was already small enough that shortlisting had nothing to trim.
       offered: pending.permittedUsernames.size,
-      // Which of the operator's learned rules this decision was actually given. Ids and scopes, so a
-      // run can be read as "the rule was attached and the message still came out that way" rather
-      // than guessed at; never the model's private reasoning about them.
-      learnedRulesApplied: pending.learnedRulesApplied.length,
-      ...(pending.learnedRulesApplied.length > 0
+      // Supplied, not applied. The backend knows exactly what it put in the payload and cannot see
+      // whether the model honoured it — a live run reported three rules "applied" on a decision that
+      // broke one of them, which is the kind of number that hides a bug instead of surfacing it.
+      // Whether a rule was obeyed is a question for the operator's next verdict, not for this line.
+      learnedRulesSupplied: pending.learnedRulesSupplied.length,
+      ...(pending.learnedRulesSupplied.length > 0
         ? {
-          learnedRuleIds: pending.learnedRulesApplied.map((rule) => rule.id),
-          learnedRuleScopes: [...new Set(pending.learnedRulesApplied.map((rule) => rule.scope))],
+          learnedRuleIds: pending.learnedRulesSupplied.map((rule) => rule.id),
+          learnedRuleScopes: [...new Set(pending.learnedRulesSupplied.map((rule) => rule.scope))],
         }
         : {}),
       selected: decision.selected.map((item) => item.username),
@@ -742,7 +743,7 @@ export class ReactionCoordinator extends EventEmitter {
       // about the whole room, not about the smaller set the Brain happened to be shown this time.
       candidateCount: candidates.length,
       viewerByUsername,
-      learnedRulesApplied: learnedPolicy?.applied ?? [],
+      learnedRulesSupplied: learnedPolicy?.supplied ?? [],
     });
     this.options.usage.recordReactionContextPrepared();
     this.updateTrace(event.id, {
@@ -781,6 +782,21 @@ export class ReactionCoordinator extends EventEmitter {
     return {
       event,
       triggerKind: 'external_stream_event',
+      // Ahead of the style material rather than after it. A live run had all three active rules in
+      // the payload, one of them forbidding formulaic laughter openers, and produced "ахаха что вы
+      // там задумали" anyway — the rules sat second to last, behind the speech fingerprint, the
+      // examples and the persona context they are supposed to override. A constraint read after the
+      // evidence it contradicts is a footnote.
+      ...(learnedPolicy
+        ? {
+          learnedPolicy: {
+            guidance: learnedPolicy.guidance,
+            global: learnedPolicy.global,
+            topic: learnedPolicy.topic,
+            byPersona: learnedPolicy.byPersona,
+          },
+        }
+        : {}),
       availableBots: offered.map((candidate) => candidate.username),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
@@ -809,18 +825,6 @@ export class ReactionCoordinator extends EventEmitter {
       targetedPersonaContext,
       reactionExamples: reactionExamples.slice(0, 3),
       ...(coldStartActive ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
-      // Absent entirely when nothing was learned yet or nothing bears on this moment — an empty
-      // block would still cost tokens and still read as an instruction to consider something.
-      ...(learnedPolicy
-        ? {
-          learnedPolicy: {
-            guidance: learnedPolicy.guidance,
-            global: learnedPolicy.global,
-            topic: learnedPolicy.topic,
-            byPersona: learnedPolicy.byPersona,
-          },
-        }
-        : {}),
       deltas: [],
       constraints: {
         // The ceiling follows the moment, not just the crowd: an ordinary remark is one voice at
@@ -861,7 +865,7 @@ export class ReactionCoordinator extends EventEmitter {
       // The drive builds its own payload in PersonaDriveService and does not route through
       // prepareBrainEvent, so nothing was attached here; recorded as empty rather than left
       // undefined so the decision log reads the same for both mechanisms.
-      learnedRulesApplied: [],
+      learnedRulesSupplied: [],
     });
     return id;
   }

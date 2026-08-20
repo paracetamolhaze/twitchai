@@ -122,6 +122,17 @@ const MIN_WORDS_FOR_MAJORITY_ECHO = 3;
  */
 const MAJORITY_ECHO_RATIO = 0.5;
 
+/**
+ * Up to this many content words, "all of them came from the event" is itself the whole finding.
+ *
+ * Two rather than one because the one-word case and the two-word case are the same thing — the
+ * message is a quote and nothing else — and majority echo already starts at three. Deliberately not
+ * a lower transcript-replay threshold: that check runs before the question and negation exemptions
+ * because a four-word run is a replay whatever punctuation it carries, while a single echoed word
+ * genuinely can be an answer, a correction or a disagreement, so this one runs after them.
+ */
+const MAX_SHORT_ECHO_WORDS = 2;
+
 export class NaturalnessGuard {
   /** Whether this is a reaction, or only a demonstration that the input was understood. */
   check(input: NaturalnessInput): NaturalnessVerdict {
@@ -187,6 +198,17 @@ export class NaturalnessGuard {
     // Доте были добрее": two of three words are the event's own, and a laugh is not a new thought.
     if (words.length >= MIN_WORDS_FOR_MAJORITY_ECHO && echoed / words.length >= MAJORITY_ECHO_RATIO) {
       return { ok: false, reason: 'majority_echo' };
+    }
+
+    // The same measure carried down to messages too short for a ratio to mean anything: everything
+    // the message says was just said, and there is nothing else in it. "здорово" answering "Здорово,
+    // чат" is the whole message being one word the stream had just used — a greeting returned as an
+    // echo rather than answered. Reached only after the exemptions above, which is what keeps the
+    // honest short replies legal: "рапира?" is a question, "не рапира" is a negation, "ку" and
+    // "дарова" answer a greeting with a different word and so leave residue, and "пуджа" answering
+    // "кого брать?" was never in the event at all.
+    if (words.length <= MAX_SHORT_ECHO_WORDS && residue.length === 0) {
+      return { ok: false, reason: 'transcript_echo' };
     }
 
     // Scene labels are deliberately not here. "Планёрка на улице пошла" and "чисто домашний вайб

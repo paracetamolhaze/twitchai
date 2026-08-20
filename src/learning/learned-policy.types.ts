@@ -98,5 +98,5 @@ export interface LearnedPolicyForDecision {
   topic: string[];
   byPersona: Record<string, string[]>;
   /** Ids and scopes of exactly what was attached, for the decision log. Never sent to the model. */
-  applied: Array<{ id: string; scope: LearnedRuleScope; scopeKey: string }>;
+  supplied: Array<{ id: string; scope: LearnedRuleScope; scopeKey: string }>;
 }

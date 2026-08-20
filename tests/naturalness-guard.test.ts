@@ -264,6 +264,70 @@ describe('transcript replay — the stream\'s own words in the stream\'s own ord
   });
 });
 
+/**
+ * The first live run that actually had learned policy in the payload. Both grounded against the
+ * events they answered, from the production log.
+ */
+describe('short echo — the whole message is a word the stream just used', () => {
+  it('rejects a greeting handed straight back', () => {
+    // 13:02:21. The stream said "Здорово, чат" and the account said "здорово" — the greeting
+    // returned rather than answered.
+    const verdict = guard.check({
+      message: 'здорово',
+      event: speech('O: посчитай. 1 2 3. Или на эту, да. S: Здорово, чат. O: А обратно как? О. Толя? S: Сейчас бабах будет.',
+        { type: 'question' }),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'transcript_echo' });
+  });
+
+  it('lets a greeting answered with a different word through', () => {
+    for (const message of ['ку', 'дарова', 'привет']) {
+      expect(guard.check({
+        message,
+        event: speech('S: Здорово, чат.', { type: 'question' }),
+      }).ok).toBe(true);
+    }
+  });
+
+  it('lets a short answer through when the word was never in the event', () => {
+    const verdict = guard.check({
+      message: 'пуджа',
+      event: speech('S: кого брать?', { type: 'question' }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets a quoted word through when it is asking something', () => {
+    const verdict = guard.check({
+      message: 'рапира?',
+      event: speech('O: там рапира собирается'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets a one-word correction through, which is the case this must never break', () => {
+    // The existing fixture: "баранина" against "это свинина?" — the word is not in the event, so
+    // there is residue and nothing fires.
+    const verdict = guard.check({
+      message: 'баранина',
+      event: speech('S: это свинина? O: не знаю, похоже на свинину', { type: 'question' }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('lets a negated echo through, because a negation is usually a disagreement', () => {
+    const verdict = guard.check({
+      message: 'не здорово',
+      event: speech('S: Здорово, чат.'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('still lets a pure laugh through', () => {
+    expect(guard.check({ message: 'ахахах', event: speech('S: Здорово, чат.') }).ok).toBe(true);
+  });
+});
+
 describe('what the naturalness guard must never touch', () => {
   it('lets a one-word correction through even though it repeats the subject', () => {
     const verdict = guard.check({

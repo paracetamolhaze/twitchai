@@ -137,6 +137,45 @@ describe('PersonaContextBuilder with live feedback examples', () => {
     expect(snapshot.speechFingerprint).toContain('распознаваемая одобренная фраза для снапшота');
   });
 
+  it('carries a coarse persona\'s register into the snapshot as a habit, not as a number', async () => {
+    // The live symptom was sanitized replies on a stream whose own speech was heavily profane. The
+    // cause is representational: profanityLevel reached the model only inside "мат 0.68", against
+    // 480 authored examples of which three contain any profanity at all. Nothing strips it — this
+    // pins that the register is actually stated.
+    const { builder, persona } = await setup();
+    persona.speech.profanityLevel = 0.7;
+    expect(builder.buildBrainSnapshot('griffin0502', persona).speechFingerprint)
+      .toContain('мат для него обычная часть речи');
+  });
+
+  it('describes a clean persona as clean, so the register stays per-character', async () => {
+    const { builder, persona } = await setup();
+    persona.speech.profanityLevel = 0;
+    const fingerprint = builder.buildBrainSnapshot('griffin0502', persona).speechFingerprint;
+    expect(fingerprint).toContain('не ругается матом');
+    expect(fingerprint).not.toContain('обычная часть речи');
+  });
+
+  it('no stage of the pipeline removes profanity from an authored example', async () => {
+    // There is no sanitizer anywhere — not in modelSafeText, not in the policy guard, not in the
+    // instruction. This fails the moment one is introduced by accident.
+    const { builder, persona } = await setup(['бля я так и знал что так будет', 'нормально сыграли']);
+    const context = await builder.build({
+      username: 'griffin0502', persona, event, recentMessages: [], directMention: false,
+    });
+    expect(context.speech.messageExamples).toContain('бля я так и знал что так будет');
+  });
+
+  it('holds a laughter-opening example behind an ordinary one of equal relevance', async () => {
+    // The path that feeds per-event generation now does what the bootstrap path already did. A live
+    // run produced "ахаха что вы там задумали" while a learned rule forbade exactly that opener.
+    const { builder, persona } = await setup(['ахах ну это конечно сильно', 'ну это конечно сильно']);
+    const context = await builder.build({
+      username: 'griffin0502', persona, event, recentMessages: [], directMention: false,
+    });
+    expect(context.speech.messageExamples[0]).toBe('ну это конечно сильно');
+  });
+
   it('works unchanged when no feedback store is supplied — existing wiring keeps behaving as before', async () => {
     const repository = new MemoryRepository();
     const memory = new PersonaMemory(repository, { now: () => 1_700_000_000_000 });

@@ -123,14 +123,14 @@ describe('learned policy retrieval for one decision', () => {
     expect(Object.keys(policy?.byPersona ?? {})).toHaveLength(3);
   });
 
-  it('reports which rules were applied, for the decision log rather than for the model', async () => {
+  it('reports which rules were supplied, for the decision log rather than for the model', async () => {
     const { store } = await storeWith([
       rule({ id: 'r-global' }),
       rule({ id: 'r-persona', scopeType: 'persona', scopeKey: 'griffin0502', rule: 'griffin0502 rule.' }),
     ]);
     const policy = store.forDecision(streamEvent(), ['griffin0502']);
-    expect(policy?.applied.map((item) => item.id).sort()).toEqual(['r-global', 'r-persona']);
-    expect(policy?.applied.map((item) => item.scope).sort()).toEqual(['global', 'persona']);
+    expect(policy?.supplied.map((item) => item.id).sort()).toEqual(['r-global', 'r-persona']);
+    expect(policy?.supplied.map((item) => item.scope).sort()).toEqual(['global', 'persona']);
   });
 
   it('keeps the attached policy inside a measured character budget', async () => {
@@ -152,8 +152,8 @@ describe('learned policy retrieval for one decision', () => {
 
   it('counts rules only for scopes that actually reached a decision', async () => {
     const { store } = await storeWith([rule({ id: 'r1' })]);
-    expect(store.snapshot()).toMatchObject({ activeRules: 1, rulesApplied: 0, decisionsWithPolicy: 0 });
+    expect(store.snapshot()).toMatchObject({ activeRules: 1, rulesSupplied: 0, decisionsWithPolicy: 0 });
     store.forDecision(streamEvent(), ['griffin0502']);
-    expect(store.snapshot()).toMatchObject({ rulesApplied: 1, decisionsWithPolicy: 1 });
+    expect(store.snapshot()).toMatchObject({ rulesSupplied: 1, decisionsWithPolicy: 1 });
   });
 });

@@ -33,11 +33,15 @@ const MIN_TOPIC_RELEVANCE = 0.15;
  * reason: the permanent instruction is a cached prefix of standing principles, and this is a
  * conditional block that is absent on most decisions and different on the rest.
  */
-const POLICY_GUIDANCE = 'Learned from this channel operator\'s own judgement on earlier messages. '
-  + 'Treat these as standing corrections to how you decide and write, not as forbidden words: they '
-  + 'describe mistakes to avoid making again and shapes that worked. A rule under global applies to '
-  + 'everyone; a rule under byPersona applies only to that one account and says nothing about the '
-  + 'others; a rule under topic applies because this particular moment matches it.';
+const POLICY_GUIDANCE = 'Learned from this channel operator\'s own judgement on messages these '
+  + 'accounts already sent. They outrank style. A speech fingerprint, a favourite form and an '
+  + 'example describe how somebody tends to sound; a rule here is what this channel actually wanted, '
+  + 'so where the two pull apart the rule wins — including when the habit is this character\'s own. '
+  + 'Check the thought against the applicable rules before writing it. If the natural one would '
+  + 'break a rule, take a different thought that genuinely fits this moment, or say nothing: silence '
+  + 'is a correct outcome, and rewording a thought that breaks a rule until it slips past is not. A '
+  + 'rule under global applies to everyone; one under byPersona applies only to that account and '
+  + 'says nothing about the others; one under topic applies because this moment matches it.';
 
 /**
  * Everything the operator's verdicts have been generalized into, and the retrieval that puts a few
@@ -50,7 +54,7 @@ const POLICY_GUIDANCE = 'Learned from this channel operator\'s own judgement on 
 export class LearnedPolicyStore {
   private rules: LearnedPolicyRule[] = [];
   private readonly logger: Logger;
-  private applied = 0;
+  private supplied = 0;
   private decisionsWithPolicy = 0;
 
   constructor(private readonly repository: PolicyRepository, logger: Logger) {
@@ -133,36 +137,36 @@ export class LearnedPolicyStore {
       : [];
 
     const byPersona: Record<string, string[]> = {};
-    const personaApplied: LearnedPolicyRule[] = [];
+    const personaSupplied: LearnedPolicyRule[] = [];
     for (const username of candidateUsernames) {
-      if (personaApplied.length >= MAX_PERSONA_RULES_TOTAL) break;
+      if (personaSupplied.length >= MAX_PERSONA_RULES_TOTAL) break;
       const forAccount = usable
         .filter((rule) => rule.scopeType === 'persona' && rule.scopeKey.toLowerCase() === username.toLowerCase())
         .sort(byConfidenceThenRecency)
         .slice(0, MAX_PERSONA_RULES_PER_ACCOUNT);
       if (forAccount.length === 0) continue;
       byPersona[username] = forAccount.map((rule) => rule.rule);
-      personaApplied.push(...forAccount);
+      personaSupplied.push(...forAccount);
     }
 
-    const applied = [...global, ...topic, ...personaApplied];
-    if (applied.length === 0) return undefined;
-    this.applied += applied.length;
+    const supplied = [...global, ...topic, ...personaSupplied];
+    if (supplied.length === 0) return undefined;
+    this.supplied += supplied.length;
     this.decisionsWithPolicy += 1;
     return {
       guidance: POLICY_GUIDANCE,
       global: global.map((rule) => rule.rule),
       topic: topic.map((rule) => rule.rule),
       byPersona,
-      applied: applied.map((rule) => ({ id: rule.id, scope: rule.scopeType, scopeKey: rule.scopeKey })),
+      supplied: supplied.map((rule) => ({ id: rule.id, scope: rule.scopeType, scopeKey: rule.scopeKey })),
     };
   }
 
-  snapshot(): { activeRules: number; disabledRules: number; rulesApplied: number; decisionsWithPolicy: number } {
+  snapshot(): { activeRules: number; disabledRules: number; rulesSupplied: number; decisionsWithPolicy: number } {
     return {
       activeRules: this.rules.filter((rule) => rule.status === 'active').length,
       disabledRules: this.rules.filter((rule) => rule.status !== 'active').length,
-      rulesApplied: this.applied,
+      rulesSupplied: this.supplied,
       decisionsWithPolicy: this.decisionsWithPolicy,
     };
   }
