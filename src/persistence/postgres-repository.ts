@@ -396,19 +396,19 @@ export class PostgresRepository implements AppRepository {
 
   async saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void> {
     await this.pool.query(
-      `INSERT INTO message_verdicts (id, created_at, username, message, verdict, note, event_summary)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      `INSERT INTO message_verdicts (id, created_at, username, message, verdict, note, event_summary, event_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [verdict.id, new Date(verdict.createdAt), verdict.username, verdict.message, verdict.verdict,
-        verdict.note ?? null, verdict.eventSummary ?? null],
+        verdict.note ?? null, verdict.eventSummary ?? null, verdict.eventId ?? null],
     );
   }
 
   async listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
     const result = await this.pool.query<{
       id: string; created_at: Date; username: string; message: string;
-      verdict: string; note: string | null; event_summary: string | null;
+      verdict: string; note: string | null; event_summary: string | null; event_id: string | null;
     }>(
-      `SELECT id, created_at, username, message, verdict, note, event_summary
+      `SELECT id, created_at, username, message, verdict, note, event_summary, event_id
        FROM message_verdicts ORDER BY created_at DESC LIMIT $1`,
       [limit],
     );
@@ -420,6 +420,7 @@ export class PostgresRepository implements AppRepository {
       verdict: row.verdict === 'good' ? 'good' as const : 'bad' as const,
       ...(row.note ? { note: row.note } : {}),
       ...(row.event_summary ? { eventSummary: row.event_summary } : {}),
+      ...(row.event_id ? { eventId: row.event_id } : {}),
     }));
   }
 

@@ -11,6 +11,7 @@ const MIGRATIONS = [
   '006_global_streamer_memory.sql',
   '007_bot_message_event_id_text.sql',
   '008_message_verdicts.sql',
+  '009_message_verdicts_event_id.sql',
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

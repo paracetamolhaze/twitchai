@@ -76,6 +76,93 @@ describe('what the naturalness guard turns into silence', () => {
   });
 });
 
+/**
+ * A second live run, taken once activity was already at a reasonable level (18 sent reactions of 71
+ * decisions), surfaced a longer-message version of the same failure — and, just as instructively, a
+ * cluster of near-misses that the existing rules already handle correctly for reasons worth pinning
+ * explicitly rather than leaving as an accident of the fixtures nobody wrote.
+ */
+describe('majority echo — a length the first pass did not reach', () => {
+  it('rejects most of a short message being the event\'s own words with a laugh on top', () => {
+    // 11:58:11. "Как бы я хотела, чтобы все в Доте были добрее" — two of three words reused
+    // verbatim, and a laugh does not add a third.
+    const verdict = guard.check({
+      message: 'добрее в доте ахах',
+      event: speech('O: Ну я держусь. O: Как бы я хотела, чтобы все в Доте были добрее. S: Как бы я хотел, чтобы вы все были подо мной. O: Глаз подняли. Скинь мне.',
+        { type: 'funny' }),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'majority_echo' });
+  });
+
+  it('leaves a negated echo alone — the existing negation exemption, not a new rule', () => {
+    // 11:41:55. "Фармите, пацаны, главное" — reused almost word for word, but a real live example
+    // of why negation stays exempt: this is advice framed as what not to do, not a restatement.
+    const verdict = guard.check({
+      message: 'главное не отдаваться пока фармите',
+      event: speech('O: Да, нормально, да. S: Фармите, пацаны, главное. Всё'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('rejects a bare necessity standing in for a conclusion marker, even at just two content words', () => {
+    // 11:54:54, against real (garbled) transcription output. "конца" is the event's own word, and
+    // "надо" restates "я хочу... играть всегда" as a duty instead of a want — the same shape
+    // semantic_echo already catches for "получается", now reached through NECESSITY_MARKER.
+    const verdict = guard.check({
+      message: 'до конца надо',
+      event: speech('): ... Underlord... Speaker 1 (0 O: ...несвою, блядь. O: O: Я хочу до конца играть всегда. O:'),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'semantic_echo' });
+  });
+
+  it('does not treat a bare echoed word plus one unrelated word as necessity — the floor is the marker set, not word count', () => {
+    // "готов" answering "ты готов?" reuses the event's own word and must stay legal; pairing it with
+    // an ordinary second word that is not in NECESSITY_MARKER must not manufacture a rejection either.
+    const verdict = guard.check({
+      message: 'готов реально',
+      event: speech('S: ты готов?', { type: 'question' }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('does not reach for a paraphrase that shares no surface words with the event', () => {
+    // 11:39:23. "не гудите... не тильтуйте... чё вы орёте" and "спокойно, без криков" are the same
+    // thought with no word in common — meaning, not shape, and majority echo cannot see it any more
+    // than the three rules above it can. Honest gap, not a missed catch.
+    const verdict = guard.check({
+      message: 'спокойно, без криков',
+      event: speech('S: Во-первых, не гудите. Во-вторых, не тильтуйте. S: Опять, блядь, ну типа уже вёб S: Не тильтуйте. Чё вы орё'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('still catches a marker-word echo the original three rules were built for, once not addressed to chat', () => {
+    // 11:47:43, real event — sent live because perception tagged this as audience:'twitch_chat'
+    // when the actual speech ("Пацаны, это камбэк сейчас будет... на низ бежим") is the streamer
+    // directing teammates, not talking to chat; the direct-address exemption exists for exactly the
+    // case it was built for, and a misclassified audience is a perception-layer question, not a
+    // naturalness one. Without that misclassification the existing semantic_echo rule already
+    // catches this shape — 'получается' is an inference marker, 'камбэк' is the event's own word,
+    // and the one residual word is exactly the tolerance that rule already allows.
+    const verdict = guard.check({
+      message: 'камбэк пошел получается',
+      event: speech('O: Там Заебись. Пацаны, это камбэк сейчас будет. На низ, на низ, пожалуйста. Все на низ бежим. На низ бежим. O: А Лёша, ты ты зафармил крипов? O: На низ На низ, ой, наверх, парни, надо уже идти. O: На низ, на низ. Мы пойдём, если что. Вниз, вниз, пожалуйста. O: За сорок',
+        { type: 'question' }),
+    });
+    expect(verdict).toEqual({ ok: false, reason: 'semantic_echo' });
+  });
+
+  it('lets a real Dota reaction through — short, on-topic, and not majority echo', () => {
+    // 11:37:49. "Т2 пушат, ребят. Надо дефа" and "тп на базу и встречать" share no surface word at
+    // all; short and Dota-vocabulary is not itself a reason to touch a message.
+    const verdict = guard.check({
+      message: 'тп на базу и встречать',
+      event: speech('O: Т2 пушат, ребят. S: Надо дефа'),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+});
+
 describe('what the naturalness guard must never touch', () => {
   it('lets a one-word correction through even though it repeats the subject', () => {
     const verdict = guard.check({

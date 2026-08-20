@@ -14,11 +14,29 @@ import { StreamEvent } from '../stream-brain/types';
  * and the ones that do not are left alone rather than guessed at. Rejection means silence for that
  * moment — nothing is rewritten and nobody else is asked to try instead, because a repaired version
  * of a message with no reaction in it is the same message with different words.
+ *
+ * A second live run, once activity was already at a reasonable level, showed two more versions of
+ * the same failure. "добрее в доте ахах" after the stream said "чтобы все в Доте были добрее" reuses
+ * two of its three words verbatim, and the third is a laugh — not a GENERIC_VERDICT, ENDORSEMENT or
+ * INFERENCE_MARKER word, so none of the three specific rules fired, and a laugh on top does not make
+ * an echo a reaction; `majority_echo` closes that by measuring how much of the message came from the
+ * event directly rather than requiring the leftover to belong to a known marker set. "до конца надо"
+ * after "я хочу до конца играть всегда" restates the same intent as a duty instead of a want, and
+ * NECESSITY_MARKER gives semantic_echo the same reach for that shape it already had for "therefore".
+ * Both stay narrow on purpose: `majority_echo` only applies at three content words or more, since a
+ * single echoed word in a very short message is unremarkable ("готов" answering "ты готов?"), not
+ * evidence of restating, and NECESSITY_MARKER excludes "стоит"/"следует" because both also mean
+ * "costs" and "follows". "главное не отдаваться пока фармите" carries a negation and is exempted
+ * above for the usual reason (a negation is very often a disagreement). Some cases stayed out of
+ * reach deliberately: a paraphrase sharing no surface words with the event ("спокойно, без криков"
+ * after "не гудите... не тильтуйте") needs meaning, not shape, and stays with the
+ * instruction, same as a scene label always has.
  */
 export type NaturalnessRejection =
   | 'semantic_echo'
   | 'borrowed_opinion'
-  | 'generic_evaluator';
+  | 'generic_evaluator'
+  | 'majority_echo';
 
 export interface NaturalnessInput {
   message: string;
@@ -61,6 +79,15 @@ const INFERENCE_MARKER = new Set([
   'получается', 'получаются', 'выходит', 'значит', 'итого', 'короче', 'типа', 'сути',
 ]);
 
+/**
+ * Bare necessity, with nothing to say what for. "до конца надо" after "я хочу до конца играть
+ * всегда": the event supplies the subject and "надо" restates the same intent as a duty instead of
+ * a want, adding no reason of its own. Deliberately small and unambiguous — "стоит" and "следует"
+ * are left out because both also mean "costs" and "follows", and a residue that happens to be one of
+ * those words is as likely to be a real, substantive claim as a bare necessity marker.
+ */
+const NECESSITY_MARKER = new Set(['надо', 'нужно', 'необходимо', 'придется', 'придётся']);
+
 const NEGATION = /(?:^|[^\p{L}])(?:не|нет|ни|неа|nope|not|no)(?![\p{L}])/iu;
 
 /** Laughter, emotes, interjections, bare punctuation — a whole reaction with no content in it. */
@@ -75,6 +102,23 @@ const STOP = new Set([
 
 /** Every observed instance was five words or fewer; past this the extra words carry something. */
 const MAX_SUSPECT_WORDS = 6;
+
+/**
+ * Below this many content words, one of them matching the event is unremarkable rather than
+ * suspicious — "готов" answering "ты готов?" is a normal one-word reply, not an echo, and the ratio
+ * below has no room to tell a real short reaction from a coincidence at one or two words. Majority
+ * echo only applies once there is enough of a message for "most of it is the event" to mean anything.
+ */
+const MIN_WORDS_FOR_MAJORITY_ECHO = 3;
+
+/**
+ * How much of a short message can already be the event's own words before what remains reads as
+ * restating it rather than reacting to it. Half plus everything left over failing to add a new
+ * stance is the same bar `borrowed_opinion` and `generic_evaluator` already apply to their own
+ * narrower residue categories; this measures the same thing directly instead of requiring the
+ * leftover word to be a member of a specific marker set.
+ */
+const MAJORITY_ECHO_RATIO = 0.5;
 
 export class NaturalnessGuard {
   /** Whether this is a reaction, or only a demonstration that the input was understood. */
@@ -101,8 +145,9 @@ export class NaturalnessGuard {
     const verdict = residue.filter((word) => GENERIC_VERDICT.has(word.raw));
     const endorsement = residue.filter((word) => ENDORSEMENT.has(word.raw));
     const inference = residue.filter((word) => INFERENCE_MARKER.has(word.raw));
-    const substantive = residue.filter((word) => !GENERIC_VERDICT.has(word.raw)
-      && !ENDORSEMENT.has(word.raw) && !INFERENCE_MARKER.has(word.raw));
+    const necessity = residue.filter((word) => NECESSITY_MARKER.has(word.raw));
+    const substantive = residue.filter((word) => !GENERIC_VERDICT.has(word.raw) && !ENDORSEMENT.has(word.raw)
+      && !INFERENCE_MARKER.has(word.raw) && !NECESSITY_MARKER.has(word.raw));
 
     // Subject from the stream plus a grade, and nothing else. "Яндекс это мощно конечно".
     if (echoed > 0 && verdict.length > 0 && substantive.length === 0) {
@@ -117,11 +162,21 @@ export class NaturalnessGuard {
       return { ok: false, reason: 'borrowed_opinion' };
     }
 
-    // A conclusion the stream had already reached, announced as though it were news. "ровесники
-    // получается" after "27 too / Same? / Yeah, same": one bare noun restating it, and a marker
-    // saying the message is reporting rather than reacting.
-    if (inference.length > 0 && verdict.length === 0 && substantive.length <= 1) {
+    // A conclusion the stream had already reached, announced as though it were news — or the same
+    // intent handed back as a duty. "ровесники получается" after "27 too / Same? / Yeah, same": one
+    // bare noun restating it, and a marker saying the message is reporting rather than reacting. "до
+    // конца надо" after "я хочу до конца играть всегда": the same shape with a necessity marker
+    // standing in for the conclusion marker.
+    if ((inference.length > 0 || necessity.length > 0) && verdict.length === 0 && substantive.length <= 1) {
       return { ok: false, reason: 'semantic_echo' };
+    }
+
+    // Most of a short message is the event's own words, and no marker word explains the rest — the
+    // gap the three rules above leave, since they only fire when the leftover happens to be a
+    // GENERIC_VERDICT/ENDORSEMENT/INFERENCE_MARKER word. "добрее в доте ахах" after "чтобы все в
+    // Доте были добрее": two of three words are the event's own, and a laugh is not a new thought.
+    if (words.length >= MIN_WORDS_FOR_MAJORITY_ECHO && echoed / words.length >= MAJORITY_ECHO_RATIO) {
+      return { ok: false, reason: 'majority_echo' };
     }
 
     // Scene labels are deliberately not here. "Планёрка на улице пошла" and "чисто домашний вайб

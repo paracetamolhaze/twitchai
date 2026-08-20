@@ -19,6 +19,8 @@ export class ContextStore {
   private streamContext = '';
   private isLive = false;
   private botUsernames: string[] = [];
+  /** Set once a genuinely new logical stream session begins; unset means "use the rolling window". */
+  private sessionStartedAt?: number;
   private chat: ChatMessage[] = [];
   private events: StreamEvent[] = [];
   /** What was actually said, as transcribed — kept apart from perception's retelling of it. */
@@ -42,6 +44,23 @@ export class ContextStore {
 
   addChat(message: ChatMessage): void {
     this.chat.push(message);
+    this.prune();
+  }
+
+  /**
+   * Marks a genuinely new logical stream session. Chat retention from here is bounded by this
+   * moment rather than by the rolling `chatWindowMs` clock, so a dashboard reading the snapshot
+   * hours into a stream still sees everything this evening actually said instead of a rolling few
+   * minutes of it — the window a real run cut nineteen sent messages down to about six by the time
+   * anyone looked. Call only for a new session, not a resumed one (the same 'new'/'resumed'
+   * distinction StreamSession itself makes): a resumed session keeps whatever it already has.
+   */
+  beginSession(startedAt = this.now()): void {
+    this.sessionStartedAt = startedAt;
+    // Pruning is what drops the previous evening, rather than an unconditional clear: everything
+    // older than the boundary goes, everything at or after it stays. The two differ only when
+    // `startedAt` is in the past, and there the prune is the answer that does not throw away
+    // messages that genuinely belong to the session being declared.
     this.prune();
   }
 
@@ -80,7 +99,10 @@ export class ContextStore {
   }
 
   private prune(): void {
-    const cutoff = this.now() - this.chatWindowMs;
+    // Once a session boundary is known, chat is bounded by it rather than by a rolling clock. The
+    // rolling window survives as the fallback for whenever no session has begun yet — construction
+    // time, and any caller that never adopts beginSession — which is the exact previous behavior.
+    const cutoff = this.sessionStartedAt ?? (this.now() - this.chatWindowMs);
     this.chat = this.chat.filter((message) => message.timestamp >= cutoff);
     if (this.chat.length > this.maxChatMessages) {
       this.chat.splice(0, this.chat.length - this.maxChatMessages);

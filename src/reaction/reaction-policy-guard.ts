@@ -27,6 +27,8 @@ export interface ValidateReactionBatchInput {
   permittedUsernames: Set<string>;
   currentCandidates: ReactionBotCandidate[];
   isDuplicate: (username: string, message: string) => Promise<boolean>;
+  /** Optional: whether this account was specifically marked down for a close match before. */
+  isDisliked?: (username: string, message: string) => boolean;
 }
 
 export interface PolicyBatchResult {
@@ -135,6 +137,7 @@ export class ReactionPolicyGuard {
       }
       if (this.availableCapacity() <= 0) { reject('global_rate_limit'); continue; }
       if (await input.isDuplicate(username, message)) { reject('recent_duplicate'); continue; }
+      if (input.isDisliked?.(username, message)) { reject('disliked_near_duplicate'); continue; }
 
       const reservationId = randomUUID();
       // Transport spacing, not the human-typing simulation removed in b650a98: the first accepted

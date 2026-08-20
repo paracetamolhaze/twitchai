@@ -1,6 +1,7 @@
 import { ChatMessage, StreamEvent } from '../stream-brain/types';
 import { BrainPersonaSnapshot } from '../brain/types';
 import { isAccountClassificationQuestion } from '../shared/account-classification';
+import { PersonaFeedbackStore } from './feedback-store';
 import { PersonaMemory, relevanceScore, semanticTokens } from './persona-memory';
 import { PersonaRuntimeStore } from './persona-runtime-store';
 import {
@@ -148,6 +149,11 @@ export class PersonaContextBuilder {
     private readonly runtime: PersonaRuntimeStore,
     private readonly maxCanonItems = 6,
     private readonly maxMemoryItems = 6,
+    /**
+     * Optional so every existing construction site keeps working unchanged. Absent, a persona's
+     * examples are exactly the authored catalog, same as before this existed.
+     */
+    private readonly feedbackStore?: PersonaFeedbackStore,
   ) {}
 
   buildBrainSnapshot(username: string, persona: BotPersona): BrainPersonaSnapshot {
@@ -172,6 +178,9 @@ export class PersonaContextBuilder {
     // from the vocabulary line, and examples that lead with a signature phrase are held back.
     const favouriteExpressions = safeTexts(persona.speech.favoriteExpressions, 2);
     const signatures = new Set(favouriteExpressions.map(normalizedPhrase));
+    const liveExamples = this.feedbackStore?.approvedExamplesFor(username) ?? [];
+    const shapeExamples = selectShapeExamples(persona, 3, textFilter, liveExamples);
+    this.feedbackStore?.recordExamplesUsed(countLiveExamplesUsed(shapeExamples, liveExamples, textFilter));
     const speechParts = [
       `в среднем ${persona.speech.averageMessageWords} слов, обычно ${persona.behavior.verbosity.minWords}–${persona.behavior.verbosity.maxWords}`,
       writesHowOften(persona.behavior.activity.chatFrequency),
@@ -181,7 +190,7 @@ export class PersonaContextBuilder {
       `лексика: ${safeTexts(persona.speech.vocabulary.filter((word) => !signatures.has(normalizedPhrase(word))), 6).join(', ')}`,
       `изредка, далеко не в каждом сообщении: ${favouriteExpressions.join(', ')}`,
       laughTendency(persona),
-      `как выглядят его сообщения в среднем, не что писать: ${selectShapeExamples(persona, 3, textFilter).join(' / ')}`,
+      `как выглядят его сообщения в среднем, не что писать: ${shapeExamples.join(' / ')}`,
     ].filter(Boolean);
     return {
       username,
@@ -273,6 +282,9 @@ export class PersonaContextBuilder {
     const textFilter = modelTextFilter(input.persona);
     const safeText = (value: string): string => modelSafeText(value, textFilter);
     const safeTexts = (values: string[], limit: number): string[] => modelSafeTexts(values, limit, textFilter);
+    const liveExamples = this.feedbackStore?.approvedExamplesFor(input.username) ?? [];
+    const speechExamples = selectSpeechExamples(input.persona, eventTopic, 5, textFilter, liveExamples);
+    this.feedbackStore?.recordExamplesUsed(countLiveExamplesUsed(speechExamples, liveExamples, textFilter));
 
     return {
       username: input.username,
@@ -295,7 +307,7 @@ export class PersonaContextBuilder {
         emojiPreferences: safeTexts(input.persona.speech.emojiPreferences, 4),
         twitchEmotes: safeTexts(input.persona.speech.twitchEmotes, 4),
         profanityLevel: input.persona.speech.profanityLevel,
-        messageExamples: selectSpeechExamples(input.persona, eventTopic, 5, textFilter),
+        messageExamples: speechExamples,
       },
       behavior: {
         styleInstructions: safeText(input.persona.behavior.styleInstructions),
@@ -554,11 +566,18 @@ function canonDocuments(persona: BotPersona): CanonDocument[] {
  * run, two of the three examples shown were signature lines. They go to the back of the pool now,
  * used only when there is nothing else, so what the model sees first is length, rhythm, punctuation
  * and register — the things that actually differ between people.
+ *
+ * `liveExamples` — this account's own operator-approved live messages — join the same pool ahead of
+ * the authored catalog and go through the identical signature check and the identical greedy
+ * diversity pass below. Nothing here reserves them a slot or treats them as more trustworthy than
+ * canon; they only get picked when they are genuinely the most different thing left in the pool,
+ * which is what lets one gradually stand in for a weaker authored line rather than being appended
+ * on top of the existing budget.
  */
-function selectShapeExamples(persona: BotPersona, limit: number, filter: ModelTextFilter): string[] {
+function selectShapeExamples(persona: BotPersona, limit: number, filter: ModelTextFilter, liveExamples: string[] = []): string[] {
   const ordinary: string[] = [];
   const signature: string[] = [];
-  for (const example of persona.speech.messageExamples) {
+  for (const example of [...liveExamples, ...persona.speech.messageExamples]) {
     (leadsWithSignature(example, persona) ? signature : ordinary).push(example);
   }
   const picked = selectDiverseExamples(ordinary, limit, filter);
@@ -671,14 +690,47 @@ function sharedTokenRatio(left: Set<string>, right: Set<string>): number {
   return shared / Math.min(left.size, right.size);
 }
 
-function selectSpeechExamples(persona: BotPersona, query: string, limit: number, filter: ModelTextFilter): string[] {
+/**
+ * The same relevance ranking as before `liveExamples` existed, with one addition: a candidate that
+ * shares too much of an already-picked one is skipped rather than taken, so two close paraphrases —
+ * plausible once real live messages are in the pool alongside curated canon — cannot both land in a
+ * five-line budget. `DUPLICATE_EXAMPLE_RATIO` reuses `sharedTokenRatio`, the same overlap measure
+ * `selectDiverseExamples` already uses for the shape-example pool below.
+ */
+function selectSpeechExamples(persona: BotPersona, query: string, limit: number, filter: ModelTextFilter, liveExamples: string[] = []): string[] {
   const queryTokens = semanticTokens(query);
-  return persona.speech.messageExamples
+  const ranked = [...liveExamples, ...persona.speech.messageExamples]
     .map((example, index) => ({ example, index, score: relevanceScore(queryTokens, example) }))
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .map(({ example }) => modelSafeText(example, filter))
-    .filter(Boolean)
-    .slice(0, limit);
+    .sort((left, right) => right.score - left.score || left.index - right.index);
+  const picked: Array<{ example: string; tokens: Set<string> }> = [];
+  for (const candidate of ranked) {
+    if (picked.length >= limit) break;
+    const safe = modelSafeText(candidate.example, filter);
+    if (!safe) continue;
+    const tokens = semanticTokens(safe);
+    if (picked.some((chosen) => sharedTokenRatio(tokens, chosen.tokens) >= DUPLICATE_EXAMPLE_RATIO)) continue;
+    picked.push({ example: safe, tokens });
+  }
+  return picked.map(({ example }) => example);
+}
+
+/** Past this much shared vocabulary with an already-picked example, a candidate reads as the same
+ *  line said slightly differently rather than a genuinely separate example. */
+const DUPLICATE_EXAMPLE_RATIO = 0.6;
+
+/**
+ * How many of the examples that actually reached a payload came from the live-approved pool.
+ *
+ * Compares like with like on purpose: what the selection functions return has already been through
+ * `modelSafeText`, and the live examples arrive raw, so matching the two directly would silently
+ * undercount every example the filter touched at all — and this counter exists specifically to
+ * answer "did my clicks reach the generation layer", where a silent undercount is the one answer
+ * that must not be possible.
+ */
+function countLiveExamplesUsed(used: string[], liveExamples: string[], filter: ModelTextFilter): number {
+  if (liveExamples.length === 0) return 0;
+  const liveSafeForms = new Set(liveExamples.map((example) => modelSafeText(example, filter)).filter(Boolean));
+  return used.filter((example) => liveSafeForms.has(example)).length;
 }
 
 function expandRelationWords(value: string): string {

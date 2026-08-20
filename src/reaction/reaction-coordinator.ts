@@ -5,6 +5,7 @@ import { Logger } from '../logger';
 import { ReactionMemory } from '../learning/reaction-memory';
 import { GlobalStreamerMemory } from '../global-memory/global-streamer-memory';
 import { BotHistory } from '../personas/bot-history';
+import { PersonaFeedbackStore } from '../personas/feedback-store';
 import { PersonaContextBuilder } from '../personas/persona-context-builder';
 import { PersonaMemory } from '../personas/persona-memory';
 import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
@@ -45,6 +46,10 @@ export interface ReactionCoordinatorOptions {
    * this is a reaction at all. Optional so existing wiring keeps working without it.
    */
   naturalness?: NaturalnessGuard;
+  /** Optional: the operator's like/dislike history. Absent means no message is ever rejected as a
+   *  near-duplicate of a dislike, and no persona sees a live-approved example — the pre-existing
+   *  behavior, for any wiring that predates this. */
+  feedbackStore?: PersonaFeedbackStore;
   sender: ReactionSender;
   history: BotHistory;
   memory: ReactionMemory;
@@ -139,7 +144,7 @@ interface SessionDecisionStats {
    * rejecting a third of everything generated has a class that is too wide.
    */
   naturalnessChecked: number;
-  naturalnessRejected: Record<'semantic_echo' | 'borrowed_opinion' | 'generic_evaluator', number>;
+  naturalnessRejected: Record<'semantic_echo' | 'borrowed_opinion' | 'generic_evaluator' | 'majority_echo', number>;
   naturalnessGuardMs: number;
   /**
    * How much of the strict quality window's cost fell on each mechanism. A live run spent this on
@@ -166,6 +171,14 @@ interface SessionDecisionStats {
     noticesShown: number;
     paddingShown: number;
   };
+  /**
+   * Per-account breakdown of the same three numbers the aggregates above already total, so a run
+   * where messages landed on six of twenty-nine connected accounts can be read as "that is what
+   * their interests and shortlist ranking actually produced" or "the shortlist keeps favoring the
+   * same few" without re-deriving either from raw per-decision lines. Never used to equalize
+   * anything at decision time — this is read-only, after the fact.
+   */
+  personaStats: Record<string, { shortlisted: number; notices: number; selected: number }>;
 }
 
 function emptySessionStats(): SessionDecisionStats {
@@ -178,11 +191,18 @@ function emptySessionStats(): SessionDecisionStats {
     rejectedReactions: 0,
     attention: { notices: 0, 'passes over': 0, 'no strong pattern': 0 },
     naturalnessChecked: 0,
-    naturalnessRejected: { semantic_echo: 0, borrowed_opinion: 0, generic_evaluator: 0 },
+    naturalnessRejected: { semantic_echo: 0, borrowed_opinion: 0, generic_evaluator: 0, majority_echo: 0 },
     naturalnessGuardMs: 0,
     coldStart: { streamEventDecisions: 0, driveDecisions: 0 },
     shortlist: { shortlistedSum: 0, reducedEvents: 0, noticesShown: 0, paddingShown: 0 },
+    personaStats: {},
   };
+}
+
+function personaStatsFor(
+  stats: SessionDecisionStats, username: string,
+): { shortlisted: number; notices: number; selected: number } {
+  return stats.personaStats[username] ??= { shortlisted: 0, notices: 0, selected: 0 };
 }
 
 const batchEnvelopeSchema = z.object({
@@ -302,6 +322,9 @@ export class ReactionCoordinator extends EventEmitter {
       permittedUsernames: pending.permittedUsernames,
       currentCandidates: this.options.candidates(),
       isDuplicate: (username, message) => this.options.history.isDuplicate(username, message),
+      isDisliked: this.options.feedbackStore
+        ? (username, message) => this.options.feedbackStore!.isNearDuplicateOfDisliked(username, message)
+        : undefined,
     });
     const allRejections = [...itemRejections, ...naturalnessRejections, ...result.rejected];
     for (const rejection of result.rejected) {
@@ -364,6 +387,7 @@ export class ReactionCoordinator extends EventEmitter {
     tally.selected += decision.selected.length;
     if (decision.selected.length === 0) tally.silent += 1;
     this.session.rejectedReactions += decision.rejected.length;
+    for (const reaction of decision.selected) personaStatsFor(this.session, reaction.username).selected += 1;
     if (pending.coldStartActive) {
       if (trigger.kind === 'stream_event') this.session.coldStart.streamEventDecisions += 1;
       else this.session.coldStart.driveDecisions += 1;
@@ -446,11 +470,12 @@ export class ReactionCoordinator extends EventEmitter {
       personaDriveSelected: driven.selected,
       rejectedReactions: stats.rejectedReactions,
       naturalnessChecked: stats.naturalnessChecked,
-      naturalnessRejected: stats.naturalnessRejected.semantic_echo
-        + stats.naturalnessRejected.borrowed_opinion + stats.naturalnessRejected.generic_evaluator,
+      naturalnessRejected: stats.naturalnessRejected.semantic_echo + stats.naturalnessRejected.borrowed_opinion
+        + stats.naturalnessRejected.generic_evaluator + stats.naturalnessRejected.majority_echo,
       naturalnessSemanticEcho: stats.naturalnessRejected.semantic_echo,
       naturalnessBorrowedOpinion: stats.naturalnessRejected.borrowed_opinion,
       naturalnessGenericEvaluator: stats.naturalnessRejected.generic_evaluator,
+      naturalnessMajorityEcho: stats.naturalnessRejected.majority_echo,
       naturalnessGuardMs: Number(stats.naturalnessGuardMs.toFixed(1)),
       // How much of the above happened under the strict first-message bar, and whether it is still
       // up. A live run put all eighteen of its stream-event decisions and all three of its Persona
@@ -488,6 +513,15 @@ export class ReactionCoordinator extends EventEmitter {
       driveDroppedSuperseded: drive.droppedSuperseded,
       driveSurvivedNewerEvent: drive.survivedNewerEvent,
       driveMessages: drive.messages,
+      // Per-account breakdown of the three aggregates above (shortlistNoticesShown+shortlistPaddingShown,
+      // streamEventSelected+personaDriveSelected) — whether messages landing on a handful of accounts
+      // out of a much larger connected pool is their own interests and shortlist ranking doing their
+      // job, or the same few winning every time regardless of the moment.
+      personaDistribution: stats.personaStats,
+      // The operator's like/dislike history, read once per summary rather than per decision: how much
+      // signal exists to draw on, how many live examples actually reached a snapshot, and how many
+      // candidate reactions were caught as a near-duplicate of something specifically disliked before.
+      ...(this.options.feedbackStore ? { feedback: this.options.feedbackStore.snapshot() } : {}),
     });
   }
 
@@ -626,11 +660,14 @@ export class ReactionCoordinator extends EventEmitter {
     this.session.shortlist.shortlistedSum += offered.length;
     if (shortlist.reduced) this.session.shortlist.reducedEvents += 1;
     for (const candidate of candidates) {
-      this.session.attention[shortlist.attentionByUsername.get(candidate.username) ?? 'no strong pattern'] += 1;
+      const attention = shortlist.attentionByUsername.get(candidate.username) ?? 'no strong pattern';
+      this.session.attention[attention] += 1;
+      if (attention === 'notices') personaStatsFor(this.session, candidate.username).notices += 1;
     }
     for (const candidate of offered) {
       if (shortlist.attentionByUsername.get(candidate.username) === 'notices') this.session.shortlist.noticesShown += 1;
       else this.session.shortlist.paddingShown += 1;
+      personaStatsFor(this.session, candidate.username).shortlisted += 1;
     }
 
     const targetedCandidates = directTargets.size > 0 ? offered : [];

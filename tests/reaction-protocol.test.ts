@@ -7,6 +7,7 @@ import { PersonaContextBuilder } from '../src/personas/persona-context-builder';
 import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
+import { PersonaFeedbackStore } from '../src/personas/feedback-store';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { SHORTLIST_TARGET_SIZE } from '../src/reaction/candidate-shortlist';
 import { NaturalnessGuard } from '../src/reaction/naturalness-guard';
@@ -45,6 +46,7 @@ async function setup(
   senderResult: SenderResult = true,
   now: () => number = () => event.timestamp,
   captureLogs = false,
+  feedbackStore?: PersonaFeedbackStore,
 ) {
   const sendResult = senderResult;
   // Most cases here silence the logger; the ones asserting on what a decision records need to read
@@ -96,6 +98,7 @@ async function setup(
   const coordinator = new ReactionCoordinator({
     policy,
     naturalness: new NaturalnessGuard(),
+    ...(feedbackStore ? { feedbackStore } : {}),
     coldStart,
     onMessageSent: () => { messageSentCalls += 1; },
     sender: {
@@ -892,6 +895,44 @@ describe('single-session reaction protocol', () => {
         { ...event, id: 'many-mentions-event', directMentions: mentioned }, 0,
       );
       expect(prepared.candidateStates?.map((state) => state.username).sort()).toEqual([...mentioned].sort());
+      await coordinator.stop();
+    });
+  });
+
+  describe('operator feedback: near-duplicate-of-disliked suppression', () => {
+    async function feedbackStoreWith(verdict: { username: string; message: string; verdict: 'good' | 'bad' }): Promise<PersonaFeedbackStore> {
+      const store = new PersonaFeedbackStore(
+        { saveMessageVerdict: async () => undefined, listMessageVerdicts: async () => [] },
+        new Logger('TEST', 'error'),
+      );
+      await store.record(verdict);
+      return store;
+    }
+
+    it('rejects a reaction that closely matches a message this account was disliked for before', async () => {
+      const feedbackStore = await feedbackStoreWith({ username: 'bot-one', message: 'го дальше по классике чё как', verdict: 'bad' });
+      const { coordinator } = await setup(true, () => event.timestamp, false, feedbackStore);
+      await coordinator.prepareBrainEvent(event, 0);
+      const result = await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{ username: 'bot-one', message: 'го дальше по классике чё как' }],
+      });
+      expect(result.accepted).toEqual([]);
+      expect(result.rejected).toEqual(expect.arrayContaining([
+        expect.objectContaining({ username: 'bot-one', reason: 'disliked_near_duplicate' }),
+      ]));
+      await coordinator.stop();
+    });
+
+    it('still accepts a genuinely different message from the same account', async () => {
+      const feedbackStore = await feedbackStoreWith({ username: 'bot-one', message: 'го дальше по классике чё как', verdict: 'bad' });
+      const { coordinator } = await setup(true, () => event.timestamp, false, feedbackStore);
+      await coordinator.prepareBrainEvent(event, 0);
+      const result = await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{ username: 'bot-one', message: 'кто-нибудь смотрел новый сериал' }],
+      });
+      expect(result.accepted.map((item) => item.username)).toEqual(['bot-one']);
       await coordinator.stop();
     });
   });

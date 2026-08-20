@@ -68,11 +68,16 @@ export type ReactionRejectionReason =
   | 'global_rate_limit'
   | 'recent_duplicate'
   // NaturalnessGuard. Not a policy or safety refusal: the message was well-formed and allowed, and
-  // simply was not a reaction to anything. Kept as three codes rather than one so a live run shows
-  // which shape is actually leaking, and so an over-eager class can be found and narrowed.
+  // simply was not a reaction to anything. Kept as separate codes rather than one so a live run
+  // shows which shape is actually leaking, and so an over-eager class can be found and narrowed.
   | 'semantic_echo'
   | 'borrowed_opinion'
   | 'generic_evaluator'
+  | 'majority_echo'
+  // The operator specifically disliked a close match of this from the same account before. Not
+  // NaturalnessGuard — it knows nothing about past operator judgement — and not a blacklist of
+  // phrases: a per-persona comparison against messages that account was actually marked down for.
+  | 'disliked_near_duplicate'
   | 'invalid_item';
 
 export interface ReactionRejection {

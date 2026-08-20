@@ -1,6 +1,7 @@
 import { Logger } from '../logger';
 import { BrainDecision, BrainDriveCandidate, BrainDriveOpportunityInput, FIRST_MESSAGE_GATE } from '../brain/types';
 import { ReactionBatchResult, ReactionBotCandidate } from '../reaction/types';
+import { normalizeForLookup } from '../shared/similarity';
 import { ContextStore } from '../stream-brain/context-store';
 import { ColdStartStatus } from '../stream-brain/stream-session';
 import { UsageTracker } from '../usage/usage-tracker';
@@ -416,11 +417,6 @@ export class PersonaDriveService {
   private pruneWindow(timestamps: number[], now: number): void {
     while (timestamps[0] !== undefined && timestamps[0] <= now - HOURLY_WINDOW_MS) timestamps.shift();
   }
-}
-
-/** Matches a chat echo back to the stored record it came from, ignoring whitespace differences. */
-function normalizeForLookup(value: string): string {
-  return value.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 /** Weighted random sampling without replacement — probabilistic candidate selection, not round-robin. */

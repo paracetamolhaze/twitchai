@@ -357,6 +357,13 @@ export interface MessageVerdictRecord {
   note?: string;
   /** What the message was answering, when it is still known. */
   eventSummary?: string;
+  /**
+   * The StreamEvent this message answered, resolved server-side from BotHistory by matching
+   * (username, normalized message) at the moment the verdict is recorded — the frontend never
+   * learns or sends this. Absent when no match survived (an autonomous Persona Drive message, or
+   * BotHistory's own bounded window has already rotated the record out).
+   */
+  eventId?: string;
 }
 
 export interface BotMessageRecord {

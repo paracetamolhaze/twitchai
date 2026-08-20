@@ -12,6 +12,7 @@ import { StreamerMemory } from './global-memory/types';
 import { ReactionMemory } from './learning/reaction-memory';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
+import { PersonaFeedbackStore } from './personas/feedback-store';
 import { PersonaContextBuilder } from './personas/persona-context-builder';
 import { PersonaDriveService } from './personas/persona-drive.service';
 import { PersonaMemory } from './personas/persona-memory';
@@ -49,6 +50,7 @@ import { UsageTracker } from './usage/usage-tracker';
 import { isAccountClassificationQuestion } from './shared/account-classification';
 
 import { detectSpokenReactionSignal } from './shared/bot-mention-matcher';
+import { normalizeForLookup } from './shared/similarity';
 
 const TWITCH_OAUTH_REFRESH_INTERVAL_MS = 60_000;
 const TWITCH_OAUTH_REFRESH_LEAD_MS = 5 * 60_000;
@@ -77,6 +79,8 @@ export class Application {
   private readonly personaMemory: PersonaMemory;
   private readonly personaRuntime: PersonaRuntimeStore;
   private readonly personaContext: PersonaContextBuilder;
+  private readonly feedbackStore: PersonaFeedbackStore;
+  private readonly naturalnessGuard = new NaturalnessGuard();
   private readonly decisions: ReactionDecisionRecord[] = [];
   private readonly reactionTraces: ReactionTraceRecord[] = [];
   private botManager!: TwitchBotManager;
@@ -130,7 +134,10 @@ export class Application {
     this.repository = config.database.url
       ? new PostgresRepository(config.database.url, config.database.ssl)
       : new MemoryRepository();
-    this.contextStore = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 200, maxEvents: 100 });
+    // chatWindowMs is now only the fallback used before the first logical session begins (see
+    // ContextStore.beginSession); maxChatMessages is the real bound on a session's retained chat,
+    // large enough that an ordinary evening never comes close to it.
+    this.contextStore = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 5_000, maxEvents: 100 });
     this.personas = new PersonaStore(this.repository);
     this.policy = new ReactionPolicyGuard({
       globalMessagesPer30Seconds: config.reaction.globalMessagesPer30Seconds,
@@ -155,12 +162,16 @@ export class Application {
     this.history = new BotHistory(this.repository, 50);
     this.personaMemory = new PersonaMemory(this.repository);
     this.personaRuntime = new PersonaRuntimeStore();
-    this.personaContext = new PersonaContextBuilder(this.personaMemory, this.personaRuntime);
+    this.feedbackStore = new PersonaFeedbackStore(this.repository, this.logger);
+    this.personaContext = new PersonaContextBuilder(
+      this.personaMemory, this.personaRuntime, undefined, undefined, this.feedbackStore,
+    );
   }
 
   async start(): Promise<void> {
     await this.repository.initialize();
     this.databaseReady = true;
+    await this.feedbackStore.load();
     if (!this.config.database.url) this.logger.warn('DATABASE_URL is not configured; using non-persistent in-memory storage');
     await this.personas.initialize();
     this.configureTwitchOAuth();
@@ -189,7 +200,8 @@ export class Application {
     });
     await this.botManager.initialize();
     this.coordinator = new ReactionCoordinator({
-      naturalness: new NaturalnessGuard(),
+      naturalness: this.naturalnessGuard,
+      feedbackStore: this.feedbackStore,
       coldStart: () => this.streamSession.coldStartStatus(),
       onMessageSent: () => this.streamSession.markMessageSent(),
       policy: this.policy,
@@ -451,10 +463,20 @@ export class Application {
       usage: () => this.usage.snapshot(),
       deliveryRecord: () => this.deliveryRecord.snapshot(),
       rateMessage: async (verdict) => {
-        await this.repository.saveMessageVerdict({
-          id: randomUUID(), createdAt: Date.now(), ...verdict,
-        });
-        this.logger.info('Message rated by operator', { username: verdict.username, verdict: verdict.verdict });
+        const eventId = await this.resolveVerdictEventId(verdict.username, verdict.message);
+        await this.feedbackStore.record({ ...verdict, ...(eventId ? { eventId } : {}) });
+        if (verdict.verdict === 'bad') {
+          this.classifyDislikedMessage(verdict.username, verdict.message, eventId);
+          return;
+        }
+        // A like changes what this account's example pool contains, and the per-event path picks that
+        // up on the very next decision because it rebuilds from the store every time. The session
+        // bootstrap does not: its speech fingerprint was composed once and lives in the Brain's
+        // interaction chain. Re-send that one persona's snapshot through the same delta the persona
+        // editor already uses — bounded to 50 pending, drained on the next existing Brain call, so
+        // no extra request — instead of leaving the operator to restart the stream for it to land.
+        const candidate = this.botManager.candidates().find((item) => item.username === verdict.username);
+        if (candidate) this.queuePersonaSnapshot(candidate.persona);
       },
       listMessageVerdicts: () => this.repository.listMessageVerdicts(100),
       decisions: () => [...this.decisions].reverse(),
@@ -638,6 +660,8 @@ export class Application {
             coldStartWindowMs: coldStart.windowMs,
           });
           if (continuity === 'new') {
+            // A fresh evening's chat panel should not open showing the tail end of a previous one.
+            this.contextStore.beginSession(session.startedAt);
             // Scheduled only for a genuinely new evening, and left alone on resume. This is a
             // one-shot wall-clock timer anchored to this session's own startedAt: a pause does not
             // touch it, because the whole point is that the window keeps counting through a pause
@@ -906,6 +930,34 @@ export class Application {
   private queueBrainDelta(delta: BrainDynamicDelta): void {
     if (!this.mediaStreaming) return;
     this.geminiBrain?.queueDelta(delta);
+  }
+
+  /**
+   * Which StreamEvent a rated message answered, resolved from BotHistory rather than sent by the
+   * frontend, which never learns this. The same (username, normalized message) lookup
+   * `PersonaDriveService.aiChainDepth` already uses to match a chat echo back to its record — absent
+   * when the message was autonomous (Persona Drive) or has already rotated out of BotHistory's own
+   * bounded window.
+   */
+  private async resolveVerdictEventId(username: string, message: string): Promise<string | undefined> {
+    const normalized = normalizeForLookup(message);
+    const history = await this.history.recent(username);
+    return history.find((record) => normalizeForLookup(record.message) === normalized)?.eventId;
+  }
+
+  /**
+   * Best-effort regression statistics, never a live decision input: whether the deterministic
+   * naturalness guard itself would already have flagged a message the operator disliked, and which
+   * of its classes. The triggering event has to still be in ContextStore's own recent window at the
+   * moment of the click; once it has rolled out there is nothing honest left to classify against,
+   * and none is logged rather than guessed at.
+   */
+  private classifyDislikedMessage(username: string, message: string, eventId: string | undefined): void {
+    if (!eventId) return;
+    const event = this.contextStore.snapshot().recentEvents.find((candidate) => candidate.id === eventId);
+    if (!event) return;
+    const verdict = this.naturalnessGuard.check({ message, event });
+    this.logger.info('FEEDBACK_DISLIKE_CLASSIFIED', { username, eventId, class: verdict.reason ?? 'none' });
   }
 
   private queuePersonaSnapshot(persona: BotPersona): void {

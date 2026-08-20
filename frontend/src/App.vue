@@ -782,8 +782,11 @@ function verdictFor(message: ChatMessage): 'good' | 'bad' | undefined {
 }
 
 /**
- * A verdict is worth more than a rule here: it reaches the decision layer as an example of what
- * this channel wanted, and the note explains a miss better than any instruction can.
+ * A liked message becomes an extra candidate example for that account's own voice, alongside its
+ * authored canon; a disliked one is excluded from that pool and checked against future drafts from
+ * the same account. The note is not summarized or fed to the model — it is kept for audit and for
+ * building future regression fixtures, since guessing at what free text means would be worse than
+ * not reading it.
  */
 async function rateMessage(message: ChatMessage, verdict: 'good' | 'bad'): Promise<void> {
   const note = verdict === 'bad'
@@ -1830,7 +1833,7 @@ onBeforeUnmount(() => {
 
         <template v-else-if="activePage === 'chat'">
           <div class="page-heading"><div><p class="eyebrow">КОНТЕКСТ В РЕАЛЬНОМ ВРЕМЕНИ</p><h1>Чат Twitch</h1></div><p class="muted">Сообщения зрителей, ботов и системы отмечены отдельно.</p></div>
-          <p class="muted">Оценка сообщения бота попадает прямо в решения: удачные становятся примерами того, как здесь пишут, неудачные — списком того, чего делать не надо. Правилами вкус передаётся плохо, примерами хорошо.</p>
+          <p class="muted">Оценка сохраняется как обратная связь для этого аккаунта: удачное сообщение может стать примером стиля наравне с авторскими, неудачное исключается из примеров и помогает отклонять похожие ответы позже. Комментарий сохраняется для истории, а не пересказывается модели.</p>
           <section class="panel chat-feed"><article v-for="message in [...chat].reverse()" :key="message.id" :class="['chat-line', message.kind]"><time>{{ formatTime(message.timestamp) }}</time><span class="kind-chip">{{ kindLabel(message.kind) }}</span><strong>{{ message.displayName }}</strong><p>{{ message.message }}</p><span v-if="message.kind === 'bot'" class="verdict-actions"><button type="button" :class="['text-button', verdictFor(message) === 'good' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'good')">нравится</button><button type="button" :class="['text-button', verdictFor(message) === 'bad' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'bad')">не нравится</button></span></article><div v-if="!chat.length" class="empty-state">Сообщения появятся, когда хотя бы один бот войдёт в канал.</div></section>
         </template>
 
