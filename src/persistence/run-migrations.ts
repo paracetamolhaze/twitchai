@@ -13,6 +13,7 @@ const MIGRATIONS = [
   '008_message_verdicts.sql',
   '009_message_verdicts_event_id.sql',
   '010_learned_policy_rules.sql',
+  '011_persona_minds.sql',
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

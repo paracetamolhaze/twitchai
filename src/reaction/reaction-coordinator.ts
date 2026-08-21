@@ -7,13 +7,14 @@ import { LearnedPolicyStore } from '../learning/learned-policy-store';
 import { GlobalStreamerMemory } from '../global-memory/global-streamer-memory';
 import { BotHistory } from '../personas/bot-history';
 import { PersonaFeedbackStore } from '../personas/feedback-store';
+import { PersonaMindStore } from '../personas/persona-mind';
 import { PersonaContextBuilder } from '../personas/persona-context-builder';
 import { PersonaMemory } from '../personas/persona-memory';
 import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
 import { ContextStore } from '../stream-brain/context-store';
 import { StreamEvent } from '../stream-brain/types';
 import { ColdStartStatus } from '../stream-brain/stream-session';
-import { BrainEventInput, FIRST_MESSAGE_GATE } from '../brain/types';
+import { BrainEventInput, FIRST_MESSAGE_GATE, PERSONAL_SOURCE_TYPES } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
 import { shortlistCandidates } from './candidate-shortlist';
 import { NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
@@ -54,6 +55,9 @@ export interface ReactionCoordinatorOptions {
   /** Optional: what those verdicts have been generalized into. Absent means no decision carries
    *  learned policy, which is exactly how this behaved before the Teacher existed. */
   learnedPolicy?: LearnedPolicyStore;
+  /** Optional: each persona's living state. Absent means no decision carries mind slices and no
+   *  motive is recorded against a mind — the pre-existing behavior. */
+  mind?: PersonaMindStore;
   sender: ReactionSender;
   history: BotHistory;
   memory: ReactionMemory;
@@ -180,6 +184,21 @@ interface SessionDecisionStats {
     paddingShown: number;
   };
   /**
+   * Where sent messages came from, by the Brain's own structured account of it. The number that
+   * matters over a run is the ratio of personal sources to 'none': after Living Persona the
+   * event-only message with no personal origin should be the rare exception.
+   */
+  motives: {
+    personalSource: number;
+    eventEmotion: number;
+    noSource: number;
+    unreported: number;
+    questionsFromKnowledgeGap: number;
+    callbacksFromMemory: number;
+    relationshipMotives: number;
+    lifeStateMotives: number;
+  };
+  /**
    * Per-account breakdown of the same three numbers the aggregates above already total, so a run
    * where messages landed on six of twenty-nine connected accounts can be read as "that is what
    * their interests and shortlist ranking actually produced" or "the shortlist keeps favoring the
@@ -205,6 +224,10 @@ function emptySessionStats(): SessionDecisionStats {
     naturalnessGuardMs: 0,
     coldStart: { streamEventDecisions: 0, driveDecisions: 0 },
     shortlist: { shortlistedSum: 0, reducedEvents: 0, noticesShown: 0, paddingShown: 0 },
+    motives: {
+      personalSource: 0, eventEmotion: 0, noSource: 0, unreported: 0,
+      questionsFromKnowledgeGap: 0, callbacksFromMemory: 0, relationshipMotives: 0, lifeStateMotives: 0,
+    },
     personaStats: {},
   };
 }
@@ -222,6 +245,11 @@ const batchEnvelopeSchema = z.object({
 const reactionItemSchema = z.object({
   username: z.string().min(1).max(50).refine((value) => value.trim().length > 0),
   message: z.string().max(REACTION_MESSAGE_PROTOCOL_MAX_CHARACTERS),
+  // Observability, not policy: why the Brain says this message exists. Optional so an older or
+  // quirky payload without them still parses.
+  motive: z.string().trim().max(40).optional(),
+  sourceType: z.string().trim().max(40).optional(),
+  sourceRef: z.string().trim().max(120).optional(),
 }).strict();
 
 export class ReactionCoordinator extends EventEmitter {
@@ -368,6 +396,19 @@ export class ReactionCoordinator extends EventEmitter {
       this.schedule(plan);
     }
     if (result.accepted.length === 0) this.options.usage.recordSkipped();
+    // Why each sent message exists, by the Brain's own structured account. Counted only for
+    // messages that actually survived the guards: a motive on a rejected draft is not behaviour.
+    const reactionByUser = new Map(parsed.reactions.map((item) => [item.username.trim().toLowerCase(), item]));
+    const sentMotives: Array<{ username: string; motive: string; sourceType: string; sourceRef?: string }> = [];
+    for (const plan of result.accepted) {
+      const submitted = reactionByUser.get(plan.bot.username.toLowerCase());
+      const motive = submitted?.motive?.trim() || 'unreported';
+      const sourceType = submitted?.sourceType?.trim() || 'unreported';
+      const sourceRef = submitted?.sourceRef?.trim();
+      sentMotives.push({ username: plan.bot.username, motive, sourceType, ...(sourceRef ? { sourceRef } : {}) });
+      this.tallyMotive(motive, sourceType);
+      this.options.mind?.recordMotive(plan.bot.username, motive, sourceType, sourceRef, plan.message);
+    }
     const decision: ReactionDecisionRecord = {
       eventId: parsed.eventId,
       timestamp: decisionAt,
@@ -377,7 +418,7 @@ export class ReactionCoordinator extends EventEmitter {
       silentCandidateCount: Math.max(0, pending.candidateCount - parsed.reactions.length),
     };
     this.emitDecision(decision);
-    this.logDecision(pending, decision);
+    this.logDecision(pending, decision, sentMotives);
     return {
       eventId: parsed.eventId,
       accepted: result.accepted.map((plan) => ({ username: plan.bot.username, delayMs: plan.delayMs })),
@@ -390,7 +431,24 @@ export class ReactionCoordinator extends EventEmitter {
    * model's private reasoning: what kind of trigger it was, who could have spoken, who did, how
    * many stayed silent, whether anything was thrown away, and how old the moment was by then.
    */
-  private logDecision(pending: PendingContext, decision: ReactionDecisionRecord): void {
+  private tallyMotive(motive: string, sourceType: string): void {
+    const tally = this.session.motives;
+    if (sourceType === 'unreported') tally.unreported += 1;
+    else if (sourceType === 'none') tally.noSource += 1;
+    else if (sourceType === 'event_emotion') tally.eventEmotion += 1;
+    else if (PERSONAL_SOURCE_TYPES.has(sourceType)) tally.personalSource += 1;
+    else tally.unreported += 1;
+    if (motive === 'ask' && (sourceType === 'knowledge_gap' || sourceType === 'curiosity')) tally.questionsFromKnowledgeGap += 1;
+    if (sourceType === 'memory') tally.callbacksFromMemory += 1;
+    if (sourceType === 'relationship') tally.relationshipMotives += 1;
+    if (sourceType === 'current_life') tally.lifeStateMotives += 1;
+  }
+
+  private logDecision(
+    pending: PendingContext,
+    decision: ReactionDecisionRecord,
+    sentMotives: Array<{ username: string; motive: string; sourceType: string; sourceRef?: string }> = [],
+  ): void {
     const trigger = pending.trigger;
     const tally = this.session.byTrigger[trigger.kind];
     tally.decisions += 1;
@@ -418,6 +476,10 @@ export class ReactionCoordinator extends EventEmitter {
       // broke one of them, which is the kind of number that hides a bug instead of surfacing it.
       // Whether a rule was obeyed is a question for the operator's next verdict, not for this line.
       learnedRulesSupplied: pending.learnedRulesSupplied.length,
+      // The audit trail the operator asked for: not reasoning, the structured origin. Reading
+      // "а сколько там аренда?" next to motive=ask source=knowledge_gap(china_rent) is the whole
+      // point of the field.
+      ...(sentMotives.length > 0 ? { motives: sentMotives } : {}),
       ...(pending.learnedRulesSupplied.length > 0
         ? {
           learnedRuleIds: pending.learnedRulesSupplied.map((rule) => rule.id),
@@ -548,6 +610,17 @@ export class ReactionCoordinator extends EventEmitter {
       // And what those verdicts have been generalized into: how many rules exist, and how often any
       // of them actually reached a decision this session.
       ...(this.options.learnedPolicy ? { learnedPolicy: this.options.learnedPolicy.snapshot() } : {}),
+      // Where the evening's sent messages came from. reactionsWithoutPersonalSource is the number
+      // that has to stay near zero for the accounts to read as people rather than commentators.
+      reactionsWithPersonalSource: stats.motives.personalSource,
+      reactionsFromEventEmotion: stats.motives.eventEmotion,
+      reactionsWithoutPersonalSource: stats.motives.noSource,
+      reactionsMotiveUnreported: stats.motives.unreported,
+      questionsFromKnowledgeGap: stats.motives.questionsFromKnowledgeGap,
+      callbacksFromMemory: stats.motives.callbacksFromMemory,
+      relationshipMotives: stats.motives.relationshipMotives,
+      lifeStateMotives: stats.motives.lifeStateMotives,
+      ...(this.options.mind ? { mind: this.options.mind.snapshot() } : {}),
     });
   }
 
@@ -730,6 +803,12 @@ export class ReactionCoordinator extends EventEmitter {
     // Narrowed to the shortlisted accounts, not the whole roster: a persona rule is only worth a
     // slot when the account it belongs to could actually speak on this moment.
     const learnedPolicy = this.options.learnedPolicy?.forDecision(event, offered.map((candidate) => candidate.username));
+    const offeredUsernames = offered.map((candidate) => candidate.username);
+    // The slice reflects the mind as it stood when the moment arrived; ingestion runs after, so a
+    // fact heard in this very event shows up in minds from the NEXT decision on, not this one.
+    const mindContext = this.options.mind?.forEvent(event, offeredUsernames);
+    void this.options.mind?.ingestFromEvent(event, offeredUsernames)
+      .catch((cause: unknown) => this.logger.warn('Mind ingestion failed', { eventId: event.id, cause }));
     this.removePending(event.id);
     const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
     this.pendingContexts.set(event.id, {
@@ -797,6 +876,9 @@ export class ReactionCoordinator extends EventEmitter {
           },
         }
         : {}),
+      // Beside the learned rules and for the same reason: this is the material the style fields
+      // must not outrank — who these people are tonight, ahead of how they tend to sound.
+      ...(mindContext ? { mindContext } : {}),
       availableBots: offered.map((candidate) => candidate.username),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),

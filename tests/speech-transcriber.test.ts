@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Logger } from '../src/logger';
-import { SpeechTranscriber, withoutRepeatedTail } from '../src/transcription/speech-transcriber';
+import { looksLikeModelMeta, SpeechTranscriber, withoutRepeatedTail } from '../src/transcription/speech-transcriber';
 
 const SAMPLE_RATE = 16_000;
 
@@ -209,5 +209,27 @@ describe('SpeechTranscriber', () => {
     expect(usage[0]).toMatchObject({ costUsd: 0.0004, failed: false });
     // Two seconds of speech plus the short pause that closed the window.
     expect(usage[0]?.audioSeconds).toBeCloseTo(2.46, 2);
+  });
+});
+
+describe('model meta-output leaking as a transcript', () => {
+  it('catches the exact production leak and its near shapes', () => {
+    // The real string that reached a StreamEvent as if someone had said it on stream.
+    expect(looksLikeModelMeta('thought The user wants transcription of the speech in the provided video clip. The speakers are talking about the game.')).toBe(true);
+    expect(looksLikeModelMeta('The user wants a transcription of the audio.')).toBe(true);
+    expect(looksLikeModelMeta('I will transcribe the provided audio clip now.')).toBe(true);
+    expect(looksLikeModelMeta('As an AI language model, I cannot hear tone.')).toBe(true);
+  });
+
+  it('never touches real bilingual speech, even English-heavy lines', () => {
+    for (const speech of [
+      'S: Здорово, чат. O: Го обзор на труханы',
+      'S: I support Yandex. Yandex so good.',
+      'O: он сказал think about it и ушёл',
+      'S: юзер в чате спрашивает про доту',
+      'клип получился смешной, надо сохранить',
+    ]) {
+      expect(looksLikeModelMeta(speech)).toBe(false);
+    }
   });
 });

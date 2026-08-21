@@ -45,6 +45,10 @@ export interface PlannedReaction {
 export interface SubmittedReaction {
   username: string;
   message: string;
+  /** Why the message exists, as the Brain reported it — carried through for the audit trail only. */
+  motive?: string;
+  sourceType?: string;
+  sourceRef?: string;
 }
 
 export interface ReactionBatch {

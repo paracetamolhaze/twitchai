@@ -9,6 +9,7 @@ import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
 import { PersonaFeedbackStore } from '../src/personas/feedback-store';
 import { LearnedPolicyStore } from '../src/learning/learned-policy-store';
+import { PersonaMindRecord, PersonaMindStore } from '../src/personas/persona-mind';
 import { LearnedPolicyRule } from '../src/learning/learned-policy.types';
 import { MemoryRepository } from '../src/persistence/memory-repository';
 import { SHORTLIST_TARGET_SIZE } from '../src/reaction/candidate-shortlist';
@@ -50,6 +51,7 @@ async function setup(
   captureLogs = false,
   feedbackStore?: PersonaFeedbackStore,
   learnedPolicy?: LearnedPolicyStore,
+  mind?: PersonaMindStore,
 ) {
   const sendResult = senderResult;
   // Most cases here silence the logger; the ones asserting on what a decision records need to read
@@ -103,6 +105,7 @@ async function setup(
     naturalness: new NaturalnessGuard(),
     ...(feedbackStore ? { feedbackStore } : {}),
     ...(learnedPolicy ? { learnedPolicy } : {}),
+    ...(mind ? { mind } : {}),
     coldStart,
     onMessageSent: () => { messageSentCalls += 1; },
     sender: {
@@ -991,6 +994,83 @@ describe('single-session reaction protocol', () => {
       const prepared = await coordinator.prepareBrainEvent(event, 0);
       expect(prepared.learnedPolicy?.guidance).toContain('outrank style');
       expect(prepared.learnedPolicy?.guidance).toContain('silence');
+      await coordinator.stop();
+    });
+  });
+
+  describe('living persona state reaching a real decision', () => {
+    async function mindStoreWith(minds: PersonaMindRecord[]): Promise<PersonaMindStore> {
+      const repository = new MemoryRepository();
+      await repository.initialize();
+      for (const record of minds) await repository.savePersonaMind(record);
+      const store = new PersonaMindStore(repository, new Logger('TEST', 'error'), () => event.timestamp);
+      await store.load();
+      return store;
+    }
+
+    function mindFor(username: string, overrides: Partial<PersonaMindRecord> = {}): PersonaMindRecord {
+      return {
+        personaId: `account-${username}`, username, seedVersion: 1,
+        knowledge: [], curiosities: [], openLoops: [], life: [], people: [],
+        moment: { mood: 'спокойное настроение', energy: 0.7, attention: 'watching', updatedAt: event.timestamp },
+        createdAt: event.timestamp, updatedAt: event.timestamp, ...overrides,
+      };
+    }
+
+    it('carries a relevant mind slice ahead of the style material, and omits irrelevant candidates', async () => {
+      const mindStore = await mindStoreWith([mindFor('bot-one', {
+        curiosities: [{
+          id: 'c1', topic: 'ультимейты и решающие моменты', question: 'почему решающий ультимейт так часто мажут',
+          status: 'open', strength: 0.9, createdAt: event.timestamp, updatedAt: event.timestamp,
+        }],
+      }), mindFor('bot-two')]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, undefined, mindStore);
+      const prepared = await coordinator.prepareBrainEvent(event, 0);
+      expect(prepared.mindContext?.byPersona['bot-one']?.join(' ')).toContain('ультимейт');
+      expect(prepared.mindContext?.byPersona['bot-two']).toBeUndefined();
+      const keys = Object.keys(prepared);
+      for (const later of ['reactionExamples', 'targetedPersonaContext', 'candidateStates']) {
+        expect(keys.indexOf('mindContext')).toBeLessThan(keys.indexOf(later));
+      }
+      await coordinator.stop();
+    });
+
+    it('omits the mind block entirely when nothing personal connects anyone to the moment', async () => {
+      const mindStore = await mindStoreWith([mindFor('bot-one'), mindFor('bot-two')]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, undefined, mindStore);
+      const prepared = await coordinator.prepareBrainEvent(event, 0);
+      expect(prepared).not.toHaveProperty('mindContext');
+      await coordinator.stop();
+    });
+
+    it('counts and records the motive behind every sent message, and logs it as its structured origin', async () => {
+      const mindStore = await mindStoreWith([mindFor('bot-one')]);
+      const { coordinator, logged } = await setup(true, () => event.timestamp, true, undefined, undefined, mindStore);
+      await coordinator.prepareBrainEvent(event, 0);
+      await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{
+          username: 'bot-one', message: 'а почему он вообще туда пошёл',
+          motive: 'ask', sourceType: 'knowledge_gap', sourceRef: 'решающие ультимейты',
+        }],
+      });
+      const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated');
+      expect(decision?.motives).toEqual([{
+        username: 'bot-one', motive: 'ask', sourceType: 'knowledge_gap', sourceRef: 'решающие ультимейты',
+      }]);
+      expect(mindStore.lastMotives('bot-one')[0]).toMatchObject({ motive: 'ask', sourceType: 'knowledge_gap' });
+      await coordinator.stop();
+      vi.restoreAllMocks();
+    });
+
+    it('a reaction without motive fields still parses, counted as unreported rather than rejected', async () => {
+      const { coordinator } = await setup();
+      await coordinator.prepareBrainEvent(event, 0);
+      const result = await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{ username: 'bot-one', message: 'ну и моменты пошли' }],
+      });
+      expect(result.accepted.map((item) => item.username)).toEqual(['bot-one']);
       await coordinator.stop();
     });
   });

@@ -9,6 +9,7 @@ import {
   PersonaMemoryItem,
   PersonaRelationship,
 } from '../personas/types';
+import { PersonaMindRecord } from '../personas/persona-mind';
 import { StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
 
@@ -122,6 +123,10 @@ export interface AppRepository {
   listStreamEvents(limit: number): Promise<StreamEvent[]>;
   /** One event by id, for rebuilding the moment a rated message answered. */
   getStreamEvent(id: string): Promise<StreamEvent | undefined>;
+  /** The dynamic half of each persona — see src/personas/persona-mind.ts for what a mind holds. */
+  listPersonaMinds(): Promise<PersonaMindRecord[]>;
+  savePersonaMind(record: PersonaMindRecord): Promise<void>;
+  deletePersonaMind(personaId: string): Promise<boolean>;
   listLearnedPolicyRules(): Promise<LearnedPolicyRule[]>;
   /**
    * Applies one Teacher run's whole result, or none of it.

@@ -230,6 +230,20 @@ export class SpeechTranscriber {
         audioSeconds: audioMs / 1000,
         failed: false,
       });
+      if (result.text !== undefined && looksLikeModelMeta(result.text)) {
+        // A transcription model occasionally answers ABOUT the task instead of doing it —
+        // production once returned "thought The user wants transcription of the speech in the
+        // provided video clip...", which then flowed into a StreamEvent as if someone had said it
+        // on stream. That text is untrusted model meta-output, not speech, and it stops here: the
+        // one boundary every transcript crosses. Deliberately narrow — explicit assistant-voice
+        // markers only, never a general English filter, because this stream genuinely mixes
+        // Russian and English speech.
+        this.stats.failures += 1;
+        this.logger.warn('Transcriber returned model meta-output instead of speech; dropped', {
+          audioMs, characters: result.text?.length ?? 0,
+        });
+        return;
+      }
       const text = withoutRepeatedTail(this.stats.lastTranscript, result.text);
       if (!text) return;
       this.stats.transcriptsReceived += 1;
@@ -246,6 +260,24 @@ export class SpeechTranscriber {
       this.inFlight -= 1;
     }
   }
+}
+
+/**
+ * Whether a "transcript" is actually the model talking about its task. Each pattern is a phrase no
+ * streamer says and every leaking assistant preamble does: the literal reasoning marker, the
+ * third-person description of "the user", the description of the input clip, or an "as an AI"
+ * disclaimer. A run of them anchored at the start or naming the task is required — single ordinary
+ * English words never match, so bilingual speech is untouched.
+ */
+export function looksLikeModelMeta(text: string): boolean {
+  const value = text.trim();
+  if (!value) return false;
+  return /^(?:thought|thinking|okay,? (?:the|so the) user)\b/i.test(value)
+    || /\bthe user (?:wants|is asking|asked for|requested)\b/i.test(value)
+    || /\b(?:provided|attached) (?:video|audio) (?:clip|file|segment)\b/i.test(value)
+    || /\btranscription of the (?:speech|audio|video)\b/i.test(value)
+    || /\bas an ai(?: language)? model\b/i.test(value)
+    || /^i (?:will|need to|am going to) transcribe\b/i.test(value);
 }
 
 function rms(frame: Buffer): number {

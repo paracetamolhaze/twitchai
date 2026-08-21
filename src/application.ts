@@ -19,6 +19,7 @@ import { PersonaFeedbackStore } from './personas/feedback-store';
 import { PersonaContextBuilder } from './personas/persona-context-builder';
 import { PersonaDriveService } from './personas/persona-drive.service';
 import { PersonaMemory } from './personas/persona-memory';
+import { PersonaMindStore } from './personas/persona-mind';
 import { PersonaRuntimeStore } from './personas/persona-runtime-store';
 import { PersonaStore } from './personas/persona-store';
 import { BotPersona } from './personas/types';
@@ -84,6 +85,7 @@ export class Application {
   private readonly personaContext: PersonaContextBuilder;
   private readonly feedbackStore: PersonaFeedbackStore;
   private readonly learnedPolicy: LearnedPolicyStore;
+  private readonly mindStore: PersonaMindStore;
   private teacher?: FeedbackTeacher;
   private readonly naturalnessGuard = new NaturalnessGuard();
   private readonly decisions: ReactionDecisionRecord[] = [];
@@ -169,6 +171,7 @@ export class Application {
     this.personaRuntime = new PersonaRuntimeStore();
     this.feedbackStore = new PersonaFeedbackStore(this.repository, this.logger);
     this.learnedPolicy = new LearnedPolicyStore(this.repository, this.logger);
+    this.mindStore = new PersonaMindStore(this.repository, this.logger);
     this.personaContext = new PersonaContextBuilder(
       this.personaMemory, this.personaRuntime, undefined, undefined, this.feedbackStore,
     );
@@ -179,6 +182,7 @@ export class Application {
     this.databaseReady = true;
     await this.feedbackStore.load();
     await this.learnedPolicy.load();
+    await this.mindStore.load();
     if (!this.config.database.url) this.logger.warn('DATABASE_URL is not configured; using non-persistent in-memory storage');
     await this.personas.initialize();
     this.configureTwitchOAuth();
@@ -206,10 +210,15 @@ export class Application {
       credentialProvider: this.twitchOAuth,
     });
     await this.botManager.initialize();
+    // The migration path for the existing accounts: every persona without a stored mind gets one
+    // seeded from its own canon, once. Enrichment, never replacement — the canon is only read.
+    await this.mindStore.ensureSeeded(this.botManager.candidates()
+      .map(({ username, persona }) => ({ username, persona })));
     this.coordinator = new ReactionCoordinator({
       naturalness: this.naturalnessGuard,
       feedbackStore: this.feedbackStore,
       learnedPolicy: this.learnedPolicy,
+      mind: this.mindStore,
       coldStart: () => this.streamSession.coldStartStatus(),
       onMessageSent: () => this.streamSession.markMessageSent(),
       policy: this.policy,
@@ -343,6 +352,8 @@ export class Application {
     if (this.geminiBrain) {
       this.personaDrive = new PersonaDriveService({
         coldStart: () => this.streamSession.coldStartStatus(),
+        learnedPolicy: this.learnedPolicy,
+        mind: this.mindStore,
         enabled: this.config.personaDrive.enabled,
         minIntervalMs: this.config.personaDrive.minIntervalMs,
         maxIntervalMs: this.config.personaDrive.maxIntervalMs,
@@ -529,6 +540,13 @@ export class Application {
         if (candidate) this.queuePersonaSnapshot(candidate.persona);
       },
       listMessageVerdicts: () => this.repository.listMessageVerdicts(100),
+      personaMinds: () => this.mindStore.overview(),
+      reseedPersonaMind: async (username) => {
+        const candidate = this.botManager.candidates().find((item) => item.username === username);
+        if (!candidate) return false;
+        await this.mindStore.reseed(username, candidate.persona);
+        return true;
+      },
       learnedRules: () => this.learnedPolicy.all(),
       setLearnedRuleStatus: (id, status) => this.learnedPolicy.setStatus(id, status as LearnedRuleStatus),
       deleteLearnedRule: (id) => this.learnedPolicy.remove(id),
@@ -733,6 +751,11 @@ export class Application {
           if (continuity === 'new') {
             // A fresh evening's chat panel should not open showing the tail end of a previous one.
             this.contextStore.beginSession(session.startedAt);
+            // And a fresh evening is when off-stream life advances: yesterday's concerns wind
+            // down, new mundane ones appear, tonight's mood derives from what is going on. Once
+            // per genuinely new session, never per event, never a model call.
+            void this.mindStore.lifeTick(Date.now())
+              .catch((cause: unknown) => this.logger.warn('Mind life tick failed', { cause }));
             // Scheduled only for a genuinely new evening, and left alone on resume. This is a
             // one-shot wall-clock timer anchored to this session's own startedAt: a pause does not
             // touch it, because the whole point is that the window keeps counting through a pause

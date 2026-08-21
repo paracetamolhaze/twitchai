@@ -5,7 +5,9 @@ import { normalizeForLookup } from '../shared/similarity';
 import { ContextStore } from '../stream-brain/context-store';
 import { ColdStartStatus } from '../stream-brain/stream-session';
 import { UsageTracker } from '../usage/usage-tracker';
+import { LearnedPolicyStore } from '../learning/learned-policy-store';
 import { BotHistory } from './bot-history';
+import { PersonaMindStore } from './persona-mind';
 import { CHAT_FREQUENCY_WEIGHT } from './chat-frequency-weight';
 import { arbitrateDriveReaction } from './persona-drive-arbitration';
 import { PersonaMemory } from './persona-memory';
@@ -27,6 +29,17 @@ export interface PersonaDriveServiceOptions {
   isStreamLive: () => boolean;
   isBrainReady: () => boolean;
   contextStore: ContextStore;
+  /**
+   * The operator's learned rules. Their absence here was a confirmed production bypass: a drive
+   * message went out with zero rules supplied while every stream-event decision carried three.
+   */
+  learnedPolicy?: LearnedPolicyStore;
+  /**
+   * Each candidate's living state. With it present, a drive tick means "someone is carrying their
+   * own unfinished thought", never "the chat is quiet, invent something" — a tick where no
+   * candidate carries anything is skipped before the model is ever called.
+   */
+  mind?: PersonaMindStore;
   personaMemory: PersonaMemory;
   personaRuntime: PersonaRuntimeStore;
   history: BotHistory;
@@ -47,7 +60,9 @@ export interface PersonaDriveServiceOptions {
     type: string; summary: string; speech?: string;
   }, coldStartActive?: boolean) => string;
   /** ReactionCoordinator.submitBatch, wrapped as (requestId, reactions) => ... */
-  submitReaction: (requestId: string, reactions: Array<{ username: string; message: string }>) => Promise<ReactionBatchResult>;
+  submitReaction: (requestId: string, reactions: Array<{
+    username: string; message: string; motive?: string; sourceType?: string; sourceRef?: string;
+  }>) => Promise<ReactionBatchResult>;
   /**
    * Durable memory the Brain proposed on this tick. Every decision may carry some, and until this
    * existed the ones from spontaneous initiation were parsed and then dropped on the floor.
@@ -193,6 +208,18 @@ export class PersonaDriveService {
     }
     this.logger.info('PERSONA_DRIVE_CANDIDATES', { candidates: candidateUsernames });
 
+    // The timer is only the opportunity; one of these is the reason. No open curiosity, no
+    // callback, no live concern across every candidate means nobody has a thought of their own to
+    // finish — and a spontaneous message without one is exactly the "чат молчит, придумай
+    // что-нибудь" behaviour this layer must not have. Skipped locally, before any model cost.
+    const mindContext = o.mind?.forDrive(candidateUsernames);
+    if (o.mind && !mindContext) {
+      o.usage.recordDriveLocalSkip();
+      this.logger.info('PERSONA_DRIVE_SKIPPED', { reason: 'no_internal_motive' });
+      return;
+    }
+    const learnedPolicy = o.learnedPolicy?.forDecision(undefined, candidateUsernames);
+
     const driveCandidates = await this.buildCandidateInputs(candidateUsernames);
     for (const candidate of driveCandidates) {
       for (const memory of candidate.recalledMemories) {
@@ -248,6 +275,17 @@ export class PersonaDriveService {
         ? { secondsSinceLastObservation: Math.round((now - lastObservationAt) / 1000) }
         : {}),
       ...(coldStartActive ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
+      ...(learnedPolicy
+        ? {
+          learnedPolicy: {
+            guidance: learnedPolicy.guidance,
+            global: learnedPolicy.global,
+            topic: learnedPolicy.topic,
+            byPersona: learnedPolicy.byPersona,
+          },
+        }
+        : {}),
+      ...(mindContext ? { mindContext } : {}),
       deltas: [],
     };
 
@@ -260,7 +298,14 @@ export class PersonaDriveService {
       newest ? { type: newest.type, summary: newest.summary, ...(newest.speech ? { speech: newest.speech } : {}) } : undefined,
       coldStartActive,
     );
-    this.logger.info('PERSONA_DRIVE_BRAIN_CALL', { requestId, candidates: candidateUsernames });
+    this.logger.info('PERSONA_DRIVE_BRAIN_CALL', {
+      requestId,
+      candidates: candidateUsernames,
+      // The number whose absence hid the bypass: a drive call must account for its rules the same
+      // way an event decision does.
+      learnedRulesSupplied: learnedPolicy?.supplied.length ?? 0,
+      mindCandidates: mindContext ? Object.keys(mindContext.byPersona).length : 0,
+    });
     const decision = await o.evaluateOpportunity(input);
 
     if (!decision) {
@@ -320,7 +365,13 @@ export class PersonaDriveService {
     // stale, a repeat, or beaten by something more important — so, unlike before, it survives.
     if (newerEventArrived) o.usage.recordDriveSurvivedNewerEvent();
 
-    const result = await o.submitReaction(requestId, [{ username: reaction.username, message: reaction.message }]);
+    const result = await o.submitReaction(requestId, [{
+      username: reaction.username,
+      message: reaction.message,
+      ...(reaction.motive ? { motive: reaction.motive } : {}),
+      ...(reaction.sourceType ? { sourceType: reaction.sourceType } : {}),
+      ...(reaction.sourceRef ? { sourceRef: reaction.sourceRef } : {}),
+    }]);
     if (result.accepted.length > 0) {
       const sentAt = this.now();
       this.lastAnyAutonomousMessageAt = sentAt;

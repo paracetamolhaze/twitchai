@@ -24,6 +24,7 @@ import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/typ
 import { MessageVerdictRecord } from '../personas/types';
 import { LearnedPolicyRule, TeacherRunOutcome } from '../learning/learned-policy.types';
 import { TeacherStatus } from '../learning/feedback-teacher';
+import { PersonaMindStore } from '../personas/persona-mind';
 import { DeliveryRecordSnapshot } from '../twitch/delivery-record';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import { LaunchedTwitchAuthorization, TwitchOAuthStatus } from '../twitch/oauth-service';
@@ -70,6 +71,9 @@ export interface ApiServerDependencies {
   deliveryRecord?: () => DeliveryRecordSnapshot;
   rateMessage?: (verdict: Omit<MessageVerdictRecord, 'id' | 'createdAt'>) => Promise<void>;
   listMessageVerdicts?: () => Promise<MessageVerdictRecord[]>;
+  /** Operator-only inspection of each account's living state. Read-only plus reseed. */
+  personaMinds?: () => ReturnType<PersonaMindStore['overview']>;
+  reseedPersonaMind?: (username: string) => Promise<boolean>;
   learnedRules?: () => LearnedPolicyRule[];
   setLearnedRuleStatus?: (id: string, status: 'active' | 'disabled') => Promise<LearnedPolicyRule | undefined>;
   deleteLearnedRule?: (id: string) => Promise<boolean>;
@@ -332,6 +336,20 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     if (!dependencies.listMessageVerdicts) return response.status(503).json({ error: 'Оценка сообщений недоступна' });
     try {
       return response.json(await dependencies.listMessageVerdicts());
+    } catch (error) { return next(error); }
+  });
+
+  // Each account's living state — what they know, wonder about, and are living through. Plain
+  // reads; the only mutation is an explicit reseed, which rebuilds one mind from its own canon.
+  app.get('/api/persona-minds', (_request, response) => {
+    if (!dependencies.personaMinds) return response.status(503).json({ error: 'Персоны недоступны' });
+    return response.json(dependencies.personaMinds());
+  });
+  app.post('/api/persona-minds/:username/reseed', async (request, response, next) => {
+    if (!dependencies.reseedPersonaMind) return response.status(503).json({ error: 'Персоны недоступны' });
+    try {
+      const done = await dependencies.reseedPersonaMind(request.params.username);
+      return done ? response.status(204).end() : response.status(404).json({ error: 'Аккаунт не найден' });
     } catch (error) { return next(error); }
   });
 

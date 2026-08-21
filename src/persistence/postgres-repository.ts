@@ -2,6 +2,7 @@ import { Pool, PoolClient } from 'pg';
 import { StreamerMemory, StreamSession } from '../global-memory/types';
 import { ReactionExample } from '../learning/types';
 import { LearnedPolicyRule, LearnedRuleScope, LearnedRuleStatus } from '../learning/learned-policy.types';
+import { PersonaMindRecord } from '../personas/persona-mind';
 import {
   BotMessageRecord,
   MessageVerdictRecord,
@@ -427,6 +428,28 @@ export class PostgresRepository implements AppRepository {
       'SELECT payload FROM stream_events WHERE id=$1', [id],
     );
     return result.rows[0]?.payload;
+  }
+
+  async listPersonaMinds(): Promise<PersonaMindRecord[]> {
+    const result = await this.pool.query<{ mind: PersonaMindRecord }>('SELECT mind FROM persona_minds');
+    return result.rows.map((row) => row.mind);
+  }
+
+  async savePersonaMind(record: PersonaMindRecord): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO persona_minds (persona_id, username, mind, seed_version, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (persona_id) DO UPDATE SET
+         username=EXCLUDED.username, mind=EXCLUDED.mind, seed_version=EXCLUDED.seed_version,
+         updated_at=EXCLUDED.updated_at`,
+      [record.personaId, record.username, record, record.seedVersion,
+        new Date(record.createdAt), new Date(record.updatedAt)],
+    );
+  }
+
+  async deletePersonaMind(personaId: string): Promise<boolean> {
+    const result = await this.pool.query('DELETE FROM persona_minds WHERE persona_id=$1', [personaId]);
+    return (result.rowCount ?? 0) > 0;
   }
 
   async listLearnedPolicyRules(): Promise<LearnedPolicyRule[]> {

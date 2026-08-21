@@ -184,6 +184,16 @@ export interface BrainEventInput {
     topic: string[];
     byPersona: Record<string, string[]>;
   };
+  /**
+   * The slice of each candidate's own life that bears on this moment — knowledge and gaps,
+   * curiosities, this week's concerns, remembered stream facts, tonight's mood. Only candidates
+   * with something relevant appear; the absence of an entry is itself the signal that this moment
+   * is not for that person. Built deterministically by PersonaMindStore — no model call.
+   */
+  mindContext?: {
+    guidance: string;
+    byPersona: Record<string, string[]>;
+  };
   deltas: BrainDynamicDelta[];
   constraints: {
     maxReactions: number;
@@ -262,6 +272,27 @@ export interface BrainDriveOpportunityInput {
   secondsSinceLastObservation?: number;
   /** FIRST_MESSAGE_GATE, present only until this session's first message actually reaches Twitch. */
   firstMessageGate?: string;
+  /**
+   * The operator's learned rules, exactly as the external-event path carries them. Their absence
+   * here was a production bug: a drive decision went out with learnedRulesSupplied: 0 while every
+   * stream-event decision carried three rules, so spontaneous messages bypassed everything the
+   * operator had taught.
+   */
+  learnedPolicy?: {
+    guidance: string;
+    global: string[];
+    topic: string[];
+    byPersona: Record<string, string[]>;
+  };
+  /**
+   * What each drive candidate is already carrying — open curiosities, callbacks, a live concern.
+   * This is what a spontaneous message is FOR: the timer is only the opportunity, one of these is
+   * the reason. A tick where no candidate carries anything is skipped before the model is called.
+   */
+  mindContext?: {
+    guidance: string;
+    byPersona: Record<string, string[]>;
+  };
   deltas: BrainDynamicDelta[];
 }
 
@@ -284,9 +315,35 @@ export const FIRST_MESSAGE_GATE = 'Nothing has been sent this session yet. A fir
   + 'or a correction. It must not be built out of an earlier evening. Otherwise stay silent; there '
   + 'will be a better one.';
 
+/**
+ * Why a message exists, in inspectable structured form rather than hidden reasoning. `motive` is
+ * the social act (ask, tease, correct, joke…); `sourceType` is where it personally came from — a
+ * knowledge gap, a belief, a memory, a relationship, this week's life, or plain emotion. 'none'
+ * means the model found no personal origin, which the backend counts rather than blocks: the goal
+ * is that it becomes rare, and visible when it is not.
+ */
+export const REACTION_MOTIVES = [
+  'ask', 'tease', 'disagree', 'agree', 'correct', 'recall', 'share_experience', 'react',
+  'joke', 'answer', 'support', 'warn', 'advise', 'continue_thread', 'other',
+] as const;
+
+export const REACTION_SOURCE_TYPES = [
+  'knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life',
+  'expertise', 'event_emotion', 'chat', 'none',
+] as const;
+
+/** Source types that mean the message came from somewhere inside this particular person. */
+export const PERSONAL_SOURCE_TYPES: ReadonlySet<string> = new Set([
+  'knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life', 'expertise', 'chat',
+]);
+
 export interface BrainReaction {
   username: string;
   message: string;
+  motive?: string;
+  sourceType?: string;
+  /** Free-form pointer at the specific source — a topic, a person, a remembered line. */
+  sourceRef?: string;
 }
 
 export type BrainMemoryUpdate =

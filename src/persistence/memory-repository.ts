@@ -1,5 +1,6 @@
 import { ReactionExample } from '../learning/types';
 import { LearnedPolicyRule, LearnedRuleStatus } from '../learning/learned-policy.types';
+import { PersonaMindRecord } from '../personas/persona-mind';
 import { StreamerMemory, StreamSession } from '../global-memory/types';
 import {
   BotMessageRecord,
@@ -36,6 +37,7 @@ export class MemoryRepository implements AppRepository {
   private readonly verdicts: MessageVerdictRecord[] = [];
   private readonly processedVerdicts = new Set<string>();
   private readonly learnedRules = new Map<string, LearnedPolicyRule>();
+  private readonly minds = new Map<string, PersonaMindRecord>();
   private events: StreamEvent[] = [];
   private settings: Record<string, unknown> = {};
   private usage?: UsageSnapshot;
@@ -212,6 +214,10 @@ export class MemoryRepository implements AppRepository {
   async listUnprocessedMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
     return this.verdicts.filter((item) => !this.processedVerdicts.has(item.id)).slice(0, limit).map(clone);
   }
+
+  async listPersonaMinds(): Promise<PersonaMindRecord[]> { return [...this.minds.values()].map(clone); }
+  async savePersonaMind(record: PersonaMindRecord): Promise<void> { this.minds.set(record.personaId, clone(record)); }
+  async deletePersonaMind(personaId: string): Promise<boolean> { return this.minds.delete(personaId); }
 
   async listLearnedPolicyRules(): Promise<LearnedPolicyRule[]> {
     return [...this.learnedRules.values()].sort((left, right) => right.updatedAt - left.updatedAt).map(clone);

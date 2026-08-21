@@ -101,6 +101,11 @@ const decisionSchema = z.object({
   reactions: z.array(z.object({
     username: z.string().min(1).max(50),
     message: z.string().max(2_000),
+    // Tolerant on purpose: motive and source are observability about why a message exists, and a
+    // provider dropping them must never cost the decision itself.
+    motive: z.string().trim().max(40).optional(),
+    sourceType: z.string().trim().max(40).optional(),
+    sourceRef: z.string().trim().max(120).optional(),
   }).strict()).max(10),
   memoryUpdates: z.array(memoryUpdateSchema).max(8).default([]),
 }).strict();
@@ -121,9 +126,24 @@ export const BRAIN_DECISION_RESPONSE_SCHEMA = {
     reactions: {
       type: 'array',
       items: {
-        type: 'object', additionalProperties: false, required: ['username', 'message'],
+        // motive/sourceType are required in the OUTPUT schema so the model must name why a message
+        // exists — the structural nudge that needs no prompt prose — while the zod parser above
+        // keeps them optional so a provider quirk can never invalidate a paid decision.
+        type: 'object', additionalProperties: false, required: ['username', 'message', 'motive', 'sourceType'],
         properties: {
-          username: { type: 'string' }, message: { type: 'string' },
+          username: { type: 'string' },
+          message: { type: 'string' },
+          motive: {
+            type: 'string',
+            enum: ['ask', 'tease', 'disagree', 'agree', 'correct', 'recall', 'share_experience', 'react', 'joke', 'answer', 'support', 'warn', 'advise', 'continue_thread', 'other'],
+            description: 'The social act this message performs.',
+          },
+          sourceType: {
+            type: 'string',
+            enum: ['knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life', 'expertise', 'event_emotion', 'chat', 'none'],
+            description: 'Where in this viewer\'s own life the message came from. none only when no personal origin exists.',
+          },
+          sourceRef: { type: 'string', description: 'Short pointer at the specific source: a topic, a person, a remembered line.' },
         },
       },
     },

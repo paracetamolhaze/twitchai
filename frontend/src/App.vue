@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { io, Socket } from 'socket.io-client'
 
-type Page = 'overview' | 'bots' | 'brain' | 'memories' | 'chat' | 'rules' | 'settings'
+type Page = 'overview' | 'bots' | 'brain' | 'memories' | 'chat' | 'rules' | 'minds' | 'settings'
 type PersonaTab = 'main' | 'character' | 'family' | 'biography' | 'interests' | 'opinions' | 'speech' | 'twitch' | 'memory' | 'quality'
 type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'DISABLED'
 type BrainState = 'STOPPED' | 'OFFLINE' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | 'FATAL_CONFIG_ERROR' | 'DISABLED'
@@ -494,6 +494,7 @@ const pages: Array<{ id: Page; label: string; glyph: string }> = [
   { id: 'memories', label: 'Память стримера', glyph: '◌' },
   { id: 'chat', label: 'Чат', glyph: '≡' },
   { id: 'rules', label: 'Обученные правила', glyph: '✦' },
+  { id: 'minds', label: 'Люди', glyph: '☰' },
   { id: 'settings', label: 'Настройки', glyph: '⚙' },
 ]
 
@@ -640,6 +641,7 @@ async function loadDashboard(): Promise<void> {
     void refreshVerdicts()
     // Reading the rules is a plain select; only the training button ever costs a model call.
     void loadLearnedRules()
+    void loadPersonaMinds()
     Object.assign(overview, overviewData)
     Object.assign(usage, usageData)
     bots.value = botData
@@ -822,6 +824,48 @@ interface TeacherStatus {
   model: string
   lastRun?: { at: number; result: 'success' | 'failed'; category?: string; casesConsidered: number }
 }
+interface MindOverviewEntry {
+  username: string
+  moment: { mood: string; energy: number; attention: string; cause?: string; updatedAt: number }
+  life: Array<{ id: string; concern: string; kind: string; stage: string; salience: number }>
+  curiosities: Array<{ id: string; topic: string; question: string; status: string; strength: number; answer?: string }>
+  openLoops: Array<{ id: string; kind: string; text: string; status: string }>
+  knowledge: Array<{ topic: string; state: string; note?: string }>
+  people: Array<{ name: string; role: string; impression: string; runningJoke?: string }>
+  lastMotives: Array<{ at: number; motive: string; sourceType: string; sourceRef?: string; message: string }>
+  seedVersion: number
+  updatedAt: number
+}
+const personaMinds = ref<MindOverviewEntry[]>([])
+const expandedMind = ref('')
+const mindsBusy = ref(false)
+
+async function loadPersonaMinds(): Promise<void> {
+  try {
+    personaMinds.value = await api<MindOverviewEntry[]>('/api/persona-minds')
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  }
+}
+
+async function reseedMind(entry: MindOverviewEntry): Promise<void> {
+  if (!window.confirm(`Пересобрать внутреннее состояние ${entry.username} из его же канона? Текущая жизнь, любопытства и услышанные факты будут заменены свежими.`)) return
+  mindsBusy.value = true
+  try {
+    await api(`/api/persona-minds/${entry.username}/reseed`, { method: 'POST' })
+    await loadPersonaMinds()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    mindsBusy.value = false
+  }
+}
+
+const MIND_STATE_RU: Record<string, string> = {
+  knows_well: 'разбирается', knows_somewhat: 'что-то знает', heard_of: 'слышал',
+  uncertain: 'не уверен', unknown: 'не знает', outdated: 'устаревшие знания',
+}
+
 const learnedRules = ref<LearnedRule[]>([])
 const teacherStatus = ref<TeacherStatus | undefined>()
 const rulesBusy = ref(false)
@@ -2019,6 +2063,40 @@ onBeforeUnmount(() => {
               </div>
             </article>
             <div v-if="!learnedRules.length" class="empty-state">Правил пока нет. Оцените несколько сообщений в чате, и обучение выведет из них общие принципы.</div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage === 'minds'">
+          <div class="page-heading">
+            <div><p class="eyebrow">ЖИВЫЕ ПЕРСОНЫ</p><h1>Люди</h1></div>
+            <p class="muted">Внутреннее состояние каждого аккаунта: что он знает и чего не знает, что ему любопытно, чем занята его неделя, что он запомнил со стрима и почему написал последние сообщения. Это причина мысли, а не текст сообщений.</p>
+          </div>
+          <section class="panel rules-list">
+            <article v-for="entry in personaMinds" :key="entry.username" class="rule-line">
+              <div class="rule-head">
+                <strong>{{ entry.username }}</strong>
+                <span class="kind-chip">{{ entry.moment.mood }}</span>
+                <span v-if="entry.moment.attention !== 'watching'" class="kind-chip">вполглаза</span>
+                <span class="muted">энергия {{ Math.round(entry.moment.energy * 100) }}% · обновлено {{ formatTime(entry.updatedAt) }}</span>
+                <button type="button" class="text-button" @click="expandedMind = expandedMind === entry.username ? '' : entry.username">{{ expandedMind === entry.username ? 'свернуть' : 'подробнее' }}</button>
+                <button type="button" class="text-button danger" :disabled="mindsBusy" @click="reseedMind(entry)">пересобрать</button>
+              </div>
+              <p class="muted">
+                <template v-if="entry.life.length">Сейчас в жизни: {{ entry.life.filter(l => l.stage !== 'done').map(l => l.concern).join('; ') || '—' }}.</template>
+                <template v-if="entry.curiosities.filter(c => c.status === 'open').length"> Любопытно: {{ entry.curiosities.filter(c => c.status === 'open').map(c => c.topic).join(', ') }}.</template>
+              </p>
+              <div v-if="expandedMind === entry.username" class="mind-details">
+                <p v-if="entry.knowledge.length"><strong>Знания:</strong> <span class="muted">{{ entry.knowledge.map(k => `${k.topic} — ${MIND_STATE_RU[k.state] ?? k.state}${k.note ? ` (${k.note})` : ''}`).join('; ') }}</span></p>
+                <p v-if="entry.openLoops.filter(l => l.status === 'open').length"><strong>Помнит со стрима:</strong> <span class="muted">{{ entry.openLoops.filter(l => l.status === 'open').map(l => l.text).join('; ') }}</span></p>
+                <p v-if="entry.people.length"><strong>Отношения:</strong> <span class="muted">{{ entry.people.map(pp => `${pp.name}: ${pp.impression}${pp.runningJoke ? ` (шутка: ${pp.runningJoke})` : ''}`).join('; ') }}</span></p>
+                <p v-if="entry.lastMotives.length"><strong>Последние мотивы:</strong></p>
+                <p v-for="motive in entry.lastMotives" :key="motive.at + motive.message" class="muted mind-motive">
+                  {{ formatTime(motive.at) }} · {{ motive.motive }} / {{ motive.sourceType }}{{ motive.sourceRef ? ` (${motive.sourceRef})` : '' }} → «{{ motive.message }}»
+                </p>
+                <p v-if="!entry.lastMotives.length" class="muted">Сообщений с зафиксированным мотивом пока нет.</p>
+              </div>
+            </article>
+            <div v-if="!personaMinds.length" class="empty-state">Состояния появятся после первого запуска с этой версией: каждый аккаунт получит внутреннюю жизнь, собранную из его же канона.</div>
           </section>
         </template>
 

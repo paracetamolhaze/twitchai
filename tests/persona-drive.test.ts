@@ -14,6 +14,8 @@ import { ChatMessage } from '../src/stream-brain/types';
 import { ColdStartStatus } from '../src/stream-brain/stream-session';
 import { ContextStore } from '../src/stream-brain/context-store';
 import { UsageTracker } from '../src/usage/usage-tracker';
+import { LearnedPolicyStore } from '../src/learning/learned-policy-store';
+import { PersonaMindRecord, PersonaMindStore } from '../src/personas/persona-mind';
 
 afterEach(() => vi.useRealTimers());
 
@@ -574,6 +576,101 @@ describe('PersonaDriveService', () => {
       await vi.advanceTimersByTimeAsync(1_000);
       expect(extreme.prepareCandidates.mock.calls[0]![0]).toEqual(['darwinboo2']);
       extreme.service.stop();
+    });
+  });
+
+  describe('fixture L — Persona Drive no longer bypasses the operator', () => {
+    const NOW = 1_700_000_000_000;
+
+    function mindFor(username: string, carrying: boolean): PersonaMindRecord {
+      return {
+        personaId: `account-${username}`, username, seedVersion: 1,
+        knowledge: [], openLoops: [], people: [], life: [],
+        curiosities: carrying
+          ? [{ id: 'c1', topic: 'аренда жилья', question: 'сколько стоит аренда в Шанхае', status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW }]
+          : [],
+        moment: { mood: 'спокойное настроение', energy: 0.7, attention: 'watching', updatedAt: NOW },
+        createdAt: NOW, updatedAt: NOW,
+      };
+    }
+
+    async function learnedPolicyWith(rule: string): Promise<LearnedPolicyStore> {
+      const repository = new MemoryRepository();
+      await repository.initialize();
+      await repository.applyLearnedPolicyBatch({
+        upserts: [{
+          id: 'rule-laughter', scopeType: 'global', scopeKey: '', rule, rationale: 'operator feedback',
+          confidence: 0.9, supportCount: 3, positiveEvidence: 0, negativeEvidence: 3, status: 'active',
+          teacherModel: 'test', evidenceIds: [], createdAt: NOW, updatedAt: NOW, version: 1,
+        }],
+        processedVerdictIds: [], processedAt: NOW,
+      });
+      const store = new LearnedPolicyStore(repository, new Logger('TEST', 'error'));
+      await store.load();
+      return store;
+    }
+
+    async function mindStoreWith(minds: PersonaMindRecord[]): Promise<PersonaMindStore> {
+      const repository = new MemoryRepository();
+      await repository.initialize();
+      for (const record of minds) await repository.savePersonaMind(record);
+      const store = new PersonaMindStore(repository, new Logger('TEST', 'error'), () => NOW);
+      await store.load();
+      return store;
+    }
+
+    it('supplies active learned rules to a drive decision — the confirmed production bypass', async () => {
+      vi.useFakeTimers();
+      const learnedPolicy = await learnedPolicyWith('Do not open commentary with formulaic laughter.');
+      const mind = await mindStoreWith([mindFor('karlbekner', true), mindFor('gigantiuz', true)]);
+      const { service, evaluateOpportunity } = await harness({ learnedPolicy, mind });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      const input = evaluateOpportunity.mock.calls[0]?.[0];
+      expect(input?.learnedPolicy?.global).toEqual(['Do not open commentary with formulaic laughter.']);
+      expect(input?.mindContext?.byPersona).toBeDefined();
+      service.stop();
+    });
+
+    it('skips the model call entirely when no candidate carries any thought of their own', async () => {
+      vi.useFakeTimers();
+      const mind = await mindStoreWith([mindFor('karlbekner', false), mindFor('gigantiuz', false)]);
+      const { service, usage, evaluateOpportunity } = await harness({ mind });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(evaluateOpportunity).not.toHaveBeenCalled();
+      expect(usage.snapshot().drive.localSkips).toBe(1);
+      service.stop();
+    });
+
+    it('keeps the old behavior when no mind store is wired at all', async () => {
+      vi.useFakeTimers();
+      const { service, evaluateOpportunity } = await harness();
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(evaluateOpportunity).toHaveBeenCalledTimes(1);
+      service.stop();
+    });
+
+    it('passes the drive reaction motive through to the coordinator batch', async () => {
+      vi.useFakeTimers();
+      const mind = await mindStoreWith([mindFor('karlbekner', true), mindFor('gigantiuz', true)]);
+      const { service, submitReaction } = await harness({
+        mind,
+        evaluateOpportunity: vi.fn(async () => ({
+          reactions: [{
+            username: 'karlbekner', message: 'кстати а сколько там аренда выходит',
+            motive: 'ask', sourceType: 'curiosity', sourceRef: 'аренда жилья',
+          }],
+          memoryUpdates: [],
+        })),
+      });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(submitReaction).toHaveBeenCalledWith(expect.any(String), [expect.objectContaining({
+        username: 'karlbekner', motive: 'ask', sourceType: 'curiosity', sourceRef: 'аренда жилья',
+      })]);
+      service.stop();
     });
   });
 
