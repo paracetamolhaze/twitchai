@@ -1,5 +1,7 @@
 import { Logger } from '../logger';
 import { BrainDecision, BrainDriveCandidate, BrainDriveOpportunityInput, FIRST_MESSAGE_GATE } from '../brain/types';
+import { ProvenancePools } from '../reaction/motive-provenance';
+import { NaturalnessInput } from '../reaction/naturalness-guard';
 import { ReactionBatchResult, ReactionBotCandidate } from '../reaction/types';
 import { normalizeForLookup } from '../shared/similarity';
 import { ContextStore } from '../stream-brain/context-store';
@@ -7,7 +9,7 @@ import { ColdStartStatus } from '../stream-brain/stream-session';
 import { UsageTracker } from '../usage/usage-tracker';
 import { LearnedPolicyStore } from '../learning/learned-policy-store';
 import { BotHistory } from './bot-history';
-import { PersonaMindStore } from './persona-mind';
+import { emptySuppliedSources, PersonaMindStore } from './persona-mind';
 import { CHAT_FREQUENCY_WEIGHT } from './chat-frequency-weight';
 import { arbitrateDriveReaction } from './persona-drive-arbitration';
 import { PersonaMemory } from './persona-memory';
@@ -56,9 +58,12 @@ export interface PersonaDriveServiceOptions {
    * strict bar was in force travels with it too, so the coordinator's own record of the decision
    * matches what was actually put in front of the model.
    */
-  prepareCandidates: (usernames: string[], observed?: {
-    type: string; summary: string; speech?: string;
-  }, coldStartActive?: boolean) => string;
+  prepareCandidates: (
+    usernames: string[],
+    observed?: NaturalnessInput['event'],
+    coldStartActive?: boolean,
+    provenancePools?: Map<string, ProvenancePools>,
+  ) => string;
   /** ReactionCoordinator.submitBatch, wrapped as (requestId, reactions) => ... */
   submitReaction: (requestId: string, reactions: Array<{
     username: string; message: string; motive?: string; sourceType?: string; sourceRef?: string;
@@ -215,7 +220,17 @@ export class PersonaDriveService {
     const mindContext = o.mind?.forDrive(candidateUsernames);
     if (o.mind && !mindContext) {
       o.usage.recordDriveLocalSkip();
-      this.logger.info('PERSONA_DRIVE_SKIPPED', { reason: 'no_internal_motive' });
+      o.usage.recordDriveNoInternalMotive();
+      // The strongest motive that still was not enough, in the skip line itself. A healthy quiet
+      // hold and motive starvation look identical from the counter alone: only the best strength
+      // and salience at the moment of the skip say whether the thresholds are near or far.
+      const starvation = o.mind.driveMotiveStats(candidateUsernames);
+      this.logger.info('PERSONA_DRIVE_SKIPPED', {
+        reason: 'no_internal_motive',
+        bestCuriosityStrength: starvation.bestCuriosityStrength,
+        bestConcernSalience: starvation.bestConcernSalience,
+        openLoops: starvation.openLoops,
+      });
       return;
     }
     const learnedPolicy = o.learnedPolicy?.forDecision(undefined, candidateUsernames);
@@ -285,7 +300,9 @@ export class PersonaDriveService {
           },
         }
         : {}),
-      ...(mindContext ? { mindContext } : {}),
+      // Only the written guidance travels to the model. The supplied pools are the backend's
+      // validation evidence — the answer key for provenance checking — and stay out of the payload.
+      ...(mindContext ? { mindContext: { guidance: mindContext.guidance, byPersona: mindContext.byPersona } } : {}),
       deltas: [],
     };
 
@@ -293,10 +310,29 @@ export class PersonaDriveService {
     this.brainCallTimestamps.push(driveStartedAt);
     o.usage.recordDriveBrainCall();
     const newest = snapshot.recentEvents.at(-1);
+    // Freeze what each drive candidate was actually given to ground a message in, mirroring what
+    // prepareBrainEvent does for stream events — a spontaneous message's source claims are held to
+    // exactly the same evidence standard as a reaction's.
+    const provenancePools = new Map<string, ProvenancePools>();
+    const allCandidates = o.candidates();
+    for (const username of candidateUsernames) {
+      const candidate = allCandidates.find((item) => item.username === username);
+      const driveInput = driveCandidates.find((item) => item.username === username);
+      provenancePools.set(username.toLowerCase(), {
+        mind: mindContext?.supplied[username] ?? emptySuppliedSources(),
+        memories: (driveInput?.recalledMemories ?? []).map((memory) => memory.summary),
+        expertise: candidate?.persona.knowledge.expertise ?? [],
+        opinions: (candidate?.persona.opinions ?? []).map((opinion) => `${opinion.topic}: ${opinion.stance}`),
+        hadRecentChat: recentChatForDrive.length > 0,
+      });
+    }
     const requestId = o.prepareCandidates(
       candidateUsernames,
-      newest ? { type: newest.type, summary: newest.summary, ...(newest.speech ? { speech: newest.speech } : {}) } : undefined,
+      // The full StreamEvent, not a hand-copied subset: the naturalness guard also reads audience
+      // and direct mentions when deciding what a spontaneous message may echo.
+      newest,
       coldStartActive,
+      provenancePools,
     );
     this.logger.info('PERSONA_DRIVE_BRAIN_CALL', {
       requestId,

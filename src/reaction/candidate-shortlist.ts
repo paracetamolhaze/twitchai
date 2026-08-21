@@ -1,5 +1,5 @@
 import { CHAT_FREQUENCY_WEIGHT } from '../personas/chat-frequency-weight';
-import { relevanceScore, semanticTokens } from '../personas/persona-memory';
+import { topicRelevance, topicTokens } from '../shared/topics';
 import { StreamEvent } from '../stream-brain/types';
 import { ReactionBotCandidate } from './types';
 
@@ -23,15 +23,17 @@ export function attentionFor(persona: ReactionBotCandidate['persona'], event: St
   const activity = persona.behavior.activity;
   if (activity.ignoredEventTypes.includes(event.type)) return 'passes over';
   if (activity.preferredEventTypes.includes(event.type)) return 'notices';
-  const moment = semanticTokens([event.summary, event.speech, event.visualContext, event.gameContext]
-    .filter(Boolean).join(' '));
-  if (moment.size === 0) return 'no strong pattern';
+  const momentText = [event.summary, event.speech, event.visualContext, event.gameContext]
+    .filter(Boolean).join(' ');
+  if (topicTokens(momentText).size === 0) return 'no strong pattern';
   const subjects = [
     ...persona.interests.games, ...persona.interests.music,
     ...persona.interests.food, ...persona.interests.other,
     ...persona.knowledge.expertise, ...persona.knowledge.familiarTopics,
   ];
-  return subjects.some((subject) => relevanceScore(moment, subject) > 0)
+  // The shared topic yardstick, not raw token overlap: an interest written "Dota 2" must notice a
+  // stream that says «доту», or the channel's main subject never counts as anyone's.
+  return subjects.some((subject) => topicRelevance(momentText, subject) > 0)
     ? 'notices'
     : 'no strong pattern';
 }

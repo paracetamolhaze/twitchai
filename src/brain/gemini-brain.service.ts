@@ -140,7 +140,7 @@ export const BRAIN_DECISION_RESPONSE_SCHEMA = {
           },
           sourceType: {
             type: 'string',
-            enum: ['knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life', 'expertise', 'event_emotion', 'chat', 'none'],
+            enum: ['knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life', 'open_loop', 'expertise', 'event_emotion', 'chat', 'none'],
             description: 'Where in this viewer\'s own life the message came from. none only when no personal origin exists.',
           },
           sourceRef: { type: 'string', description: 'Short pointer at the specific source: a topic, a person, a remembered line.' },

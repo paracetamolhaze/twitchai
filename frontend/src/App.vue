@@ -832,7 +832,7 @@ interface MindOverviewEntry {
   openLoops: Array<{ id: string; kind: string; text: string; status: string }>
   knowledge: Array<{ topic: string; state: string; note?: string }>
   people: Array<{ name: string; role: string; impression: string; runningJoke?: string }>
-  lastMotives: Array<{ at: number; motive: string; sourceType: string; sourceRef?: string; message: string }>
+  lastMotives: Array<{ at: number; motive: string; sourceType: string; sourceRef?: string; message: string; sourceValidated?: boolean; validatedSourceType?: string; validationReason?: string }>
   seedVersion: number
   updatedAt: number
 }
@@ -898,6 +898,70 @@ const teacherStatusLine = computed(() => {
 
 const pendingVerdictCount = computed(() => messageVerdicts.value.filter((item) => !item.processedAt).length)
 
+interface MotiveAnalytics {
+  totalSent: number
+  totalJudged: number
+  bySourceType: Array<{ sourceType: string; sent: number; judged: number; approved: number; approvalRate: number | null }>
+  personalSourceApprovalRate: number | null
+  genericEventOnlyApprovalRate: number | null
+}
+interface RejectedReaction {
+  id: string
+  at: number
+  eventId: string
+  username: string
+  message: string
+  reason: string
+  eventSummary?: string
+  falsePositive?: boolean
+}
+const motiveAnalytics = ref<MotiveAnalytics | undefined>()
+const rejectedReactions = ref<RejectedReaction[]>([])
+const rejectedBusy = ref(false)
+
+const SOURCE_TYPE_RU: Record<string, string> = {
+  knowledge_gap: 'пробел в знаниях', curiosity: 'любопытство', belief: 'убеждение', memory: 'воспоминание',
+  relationship: 'отношение к человеку', current_life: 'своя жизнь', open_loop: 'незакрытая мысль',
+  expertise: 'экспертиза', event_emotion: 'эмоция момента', chat: 'ответ в чате', none: 'без личного повода',
+  unreported: 'не указан',
+}
+const REJECTION_REASON_RU: Record<string, string> = {
+  semantic_echo: 'пересказ момента', borrowed_opinion: 'чужое мнение', generic_evaluator: 'пустая оценка',
+  majority_echo: 'повтор большинства слов', transcript_echo: 'повтор реплики стрима',
+  disliked_near_duplicate: 'похоже на оценённое 👎', invalid_motive_source: 'выдуманный источник',
+}
+
+function approvalPercent(rate: number | null): string {
+  return rate === null ? '—' : `${Math.round(rate * 100)}%`
+}
+
+async function loadMotiveAnalytics(): Promise<void> {
+  try {
+    motiveAnalytics.value = await api<MotiveAnalytics>('/api/motive-analytics')
+  } catch { /* аналитика необязательна для страницы */ }
+}
+
+async function loadRejectedReactions(): Promise<void> {
+  try {
+    rejectedReactions.value = await api<RejectedReaction[]>('/api/rejected-reactions')
+  } catch { /* журнал живёт только в памяти сессии; его отсутствие не ошибка страницы */ }
+}
+
+/** The operator read the filtered text and disagreed with the filter — recorded, changes nothing tonight. */
+async function markRejectionFalsePositive(item: RejectedReaction): Promise<void> {
+  rejectedBusy.value = true
+  try {
+    await api(`/api/rejected-reactions/${item.id}/false-positive`, {
+      method: 'POST', body: JSON.stringify({ falsePositive: !item.falsePositive }),
+    })
+    await loadRejectedReactions()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    rejectedBusy.value = false
+  }
+}
+
 function scopeLabel(rule: LearnedRule): string {
   if (rule.scopeType === 'global') return 'все аккаунты'
   return rule.scopeType === 'persona' ? `аккаунт ${rule.scopeKey}` : `тема «${rule.scopeKey}»`
@@ -916,6 +980,8 @@ async function loadLearnedRules(): Promise<void> {
     ])
     learnedRules.value = rules
     teacherStatus.value = status
+    void loadMotiveAnalytics()
+    void loadRejectedReactions()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   }
@@ -2064,6 +2130,38 @@ onBeforeUnmount(() => {
             </article>
             <div v-if="!learnedRules.length" class="empty-state">Правил пока нет. Оцените несколько сообщений в чате, и обучение выведет из них общие принципы.</div>
           </section>
+          <section v-if="motiveAnalytics" class="panel">
+            <div class="section-heading"><div><p class="eyebrow">ОЦЕНКИ × МОТИВЫ</p><h2>Откуда берутся удачные сообщения</h2></div></div>
+            <p class="muted">Каждое отправленное сообщение записано вместе с проверенным источником. Здесь ваши оценки соединяются с этими записями: подтверждают ли цифры, что сообщения из собственной жизни персонажа нравятся чаще, чем комментарии «по поводу момента».</p>
+            <p>
+              <strong>Из личного источника: {{ approvalPercent(motiveAnalytics.personalSourceApprovalRate) }} одобрения</strong>
+              <span class="muted"> · без личного повода: {{ approvalPercent(motiveAnalytics.genericEventOnlyApprovalRate) }} одобрения · оценено {{ motiveAnalytics.totalJudged }} из {{ motiveAnalytics.totalSent }} записанных сообщений</span>
+            </p>
+            <p v-for="row in motiveAnalytics.bySourceType" :key="row.sourceType" class="muted mind-motive">
+              {{ SOURCE_TYPE_RU[row.sourceType] ?? row.sourceType }}: отправлено {{ row.sent }}<template v-if="row.judged"> · оценено {{ row.judged }} · одобрено {{ approvalPercent(row.approvalRate) }}</template>
+            </p>
+            <p v-if="!motiveAnalytics.totalSent" class="muted">Записей пока нет — они появятся с первыми отправленными сообщениями этой версии.</p>
+          </section>
+          <section class="panel">
+            <div class="section-heading"><div><p class="eyebrow">ЧТО НЕ ДОШЛО ДО ЧАТА</p><h2>Отфильтрованные реакции</h2></div></div>
+            <p class="muted">Сообщения, которые модель написала, а фильтры качества отклонили — за пересказ, повтор или выдуманный источник. Если фильтр ошибся, отметьте это: отметка остаётся в записи и показывает, какой класс фильтра слишком широк. На поведение фильтра сегодня она не влияет.</p>
+            <article v-for="item in rejectedReactions" :key="item.id" class="rule-line">
+              <div class="rule-head">
+                <strong>{{ item.username }}</strong>
+                <span class="kind-chip">{{ REJECTION_REASON_RU[item.reason] ?? item.reason }}</span>
+                <span v-if="item.falsePositive" class="kind-chip">операторская пометка: фильтр ошибся</span>
+                <span class="muted">{{ formatTime(item.at) }}</span>
+              </div>
+              <p class="rule-text">«{{ item.message }}»</p>
+              <p v-if="item.eventSummary" class="muted">Момент: {{ item.eventSummary }}</p>
+              <div class="rule-actions">
+                <button type="button" class="text-button" :disabled="rejectedBusy" @click="markRejectionFalsePositive(item)">
+                  {{ item.falsePositive ? 'снять пометку' : 'фильтр ошибся' }}
+                </button>
+              </div>
+            </article>
+            <div v-if="!rejectedReactions.length" class="empty-state">За эту сессию фильтры ничего не отклонили — либо стрим ещё не шёл.</div>
+          </section>
         </template>
 
         <template v-else-if="activePage === 'minds'">
@@ -2091,6 +2189,9 @@ onBeforeUnmount(() => {
                 <p v-if="entry.people.length"><strong>Отношения:</strong> <span class="muted">{{ entry.people.map(pp => `${pp.name}: ${pp.impression}${pp.runningJoke ? ` (шутка: ${pp.runningJoke})` : ''}`).join('; ') }}</span></p>
                 <p v-if="entry.lastMotives.length"><strong>Последние мотивы:</strong></p>
                 <p v-for="motive in entry.lastMotives" :key="motive.at + motive.message" class="muted mind-motive">
+                  <template v-if="motive.sourceValidated !== undefined">
+                    <span :title="motive.sourceValidated ? (motive.validatedSourceType && motive.validatedSourceType !== motive.sourceType ? `источник настоящий, но категория исправлена: ${motive.validatedSourceType}` : 'источник подтверждён бэкендом') : 'заявленный источник не найден среди переданного персонажу'">{{ motive.sourceValidated ? '✅' : '⚠' }}</span>
+                  </template>
                   {{ formatTime(motive.at) }} · {{ motive.motive }} / {{ motive.sourceType }}{{ motive.sourceRef ? ` (${motive.sourceRef})` : '' }} → «{{ motive.message }}»
                 </p>
                 <p v-if="!entry.lastMotives.length" class="muted">Сообщений с зафиксированным мотивом пока нет.</p>

@@ -509,3 +509,45 @@ describe('FeedbackTeacher batch learning', () => {
     expect(payload.feedbackCases[0]?.event).toBeUndefined();
   });
 });
+
+describe('fixture I — a case carries what the model was already told', () => {
+  it('attaches the motive record and the rules supplied at generation to the case the Teacher reads', async () => {
+    const { teacher, repository, policyStore, requests } = await harness([
+      verdict({ id: 'v1', message: 'ахаха ну и заруба пошла', note: 'опять смех в начале' }),
+    ]);
+    // The rule was in the payload when the message was generated — and the message broke it anyway.
+    await repository.applyLearnedPolicyBatch({
+      upserts: [{
+        id: 'rule-laughter', scopeType: 'global', scopeKey: '',
+        rule: 'Do not open commentary with formulaic laughter.', rationale: 'operator feedback',
+        confidence: 0.9, supportCount: 3, positiveEvidence: 0, negativeEvidence: 3, status: 'active',
+        teacherModel: 'test', evidenceIds: [], createdAt: 1_700_000_000_000, updatedAt: 1_700_000_000_000, version: 1,
+      }],
+      processedVerdictIds: [], processedAt: 1_700_000_000_000,
+    });
+    await policyStore.load();
+    await repository.saveSentMessageMotive({
+      id: 'm1', createdAt: 1_699_999_999_000, username: 'griffin0502',
+      message: 'ахаха ну и заруба пошла', eventId: 'event-1', triggerKind: 'stream_event',
+      motive: 'react', sourceType: 'event_emotion', sourceValidated: true,
+      validatedSourceType: 'event_emotion', learnedRuleIds: ['rule-laughter'],
+    });
+    await teacher.runManually();
+    const input = JSON.parse(requests[0]!.input) as { feedbackCases: Array<Record<string, unknown>> };
+    const sent = input.feedbackCases[0]!;
+    expect(sent.motive).toMatchObject({ motive: 'react', sourceType: 'event_emotion', sourceValidated: true });
+    expect(sent.rulesSuppliedAtGeneration).toEqual([
+      { id: 'rule-laughter', rule: 'Do not open commentary with formulaic laughter.' },
+    ]);
+    // And the instruction tells the Teacher what those fields mean.
+    expect(requests[0]!.systemInstruction).toContain('rulesSuppliedAtGeneration');
+  });
+
+  it('a case with no matching motive record travels without the fields, as every case did before', async () => {
+    const { teacher, requests } = await harness([verdict({ id: 'v1', message: 'обычное сообщение' })]);
+    await teacher.runManually();
+    const input = JSON.parse(requests[0]!.input) as { feedbackCases: Array<Record<string, unknown>> };
+    expect(input.feedbackCases[0]).not.toHaveProperty('motive');
+    expect(input.feedbackCases[0]).not.toHaveProperty('rulesSuppliedAtGeneration');
+  });
+});

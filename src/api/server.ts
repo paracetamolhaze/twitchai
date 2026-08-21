@@ -23,6 +23,8 @@ import { ReactionDecisionRecord, ReactionTraceRecord } from '../reaction/types';
 import { ChatMessage, StreamBrainStatus, StreamEvent } from '../stream-brain/types';
 import { MessageVerdictRecord } from '../personas/types';
 import { LearnedPolicyRule, TeacherRunOutcome } from '../learning/learned-policy.types';
+import { MotiveAnalytics } from '../learning/motive-analytics';
+import { RejectedReactionRecord } from '../reaction/reaction-coordinator';
 import { TeacherStatus } from '../learning/feedback-teacher';
 import { PersonaMindStore } from '../personas/persona-mind';
 import { DeliveryRecordSnapshot } from '../twitch/delivery-record';
@@ -82,6 +84,11 @@ export interface ApiServerDependencies {
     | { ran: false; reason: 'teacher_unavailable' | 'nothing_to_learn' | 'already_running' | 'failed'; category?: string }
   >;
   teacherStatus?: () => Promise<TeacherStatus | undefined>;
+  /** Operator verdicts joined against the durable motive log — approval rates by message origin. */
+  motiveAnalytics?: () => Promise<MotiveAnalytics>;
+  /** What the quality filters threw away this session, newest first, with false-positive marking. */
+  rejectedReactions?: () => RejectedReactionRecord[];
+  markRejectedReactionFalsePositive?: (id: string, falsePositive: boolean) => boolean;
   decisions?: () => ReactionDecisionRecord[];
   reactionTraces?: () => ReactionTraceRecord[];
   settings: () => Promise<Record<string, unknown>>;
@@ -389,6 +396,31 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     try {
       const status = await dependencies.teacherStatus();
       return status ? response.json(status) : response.status(503).json({ error: 'Обучение недоступно' });
+    } catch (error) { return next(error); }
+  });
+  // Verdicts x motives: does a message grounded in a real personal source get approved more often
+  // than generic event commentary? Read-only; computed on request from two bounded selects.
+  app.get('/api/motive-analytics', async (_request, response, next) => {
+    if (!dependencies.motiveAnalytics) return response.status(503).json({ error: 'Аналитика мотивов недоступна' });
+    try {
+      return response.json(await dependencies.motiveAnalytics());
+    } catch (error) { return next(error); }
+  });
+  // What the quality filters threw away, for the operator to audit. The one mutation is the
+  // operator's own judgement that a filter fired wrongly — kept on the record, changing nothing
+  // about how the filter behaves tonight.
+  app.get('/api/rejected-reactions', (_request, response) => {
+    if (!dependencies.rejectedReactions) return response.status(503).json({ error: 'Журнал отклонённых недоступен' });
+    return response.json(dependencies.rejectedReactions());
+  });
+  app.post('/api/rejected-reactions/:id/false-positive', (request, response, next) => {
+    if (!dependencies.markRejectedReactionFalsePositive) {
+      return response.status(503).json({ error: 'Журнал отклонённых недоступен' });
+    }
+    try {
+      const { falsePositive } = z.object({ falsePositive: z.boolean().default(true) }).parse(request.body ?? {});
+      const marked = dependencies.markRejectedReactionFalsePositive(request.params.id, falsePositive);
+      return marked ? response.status(204).end() : response.status(404).json({ error: 'Запись не найдена' });
     } catch (error) { return next(error); }
   });
   app.get('/api/overview', (_request, response) => response.json(dependencies.overview()));

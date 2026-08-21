@@ -157,7 +157,7 @@ describe('fixture B — a knowledge gap becomes knowledge when the stream answer
       curiosities: [{ id: 'c1', topic: 'цены в компьютерном клубе в Китае', question: 'сколько стоит час в компьютерном клубе', status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW }],
     });
     const { store, repository } = await storeWith([curious]);
-    await store.ingestFromEvent(streamEvent({
+    await store.observeEvent(streamEvent({
       summary: 'S: час в компьютерном клубе стоит 30 юаней',
       speech: 'S: час в компьютерном клубе стоит 30 юаней',
     }), ['pc_guy']);
@@ -185,7 +185,7 @@ describe('fixture B — a knowledge gap becomes knowledge when the stream answer
       curiosities: [{ id: 'c1', topic: 'цены в компьютерном клубе', question: 'сколько стоит час в клубе', status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW }],
     });
     const { store } = await storeWith([curious]);
-    await store.ingestFromEvent(streamEvent({
+    await store.observeEvent(streamEvent({
       summary: 'стример зашёл в компьютерный клуб посмотреть цены',
       speech: 'стример зашёл в компьютерный клуб посмотреть цены',
     }), ['pc_guy']);
@@ -200,8 +200,9 @@ describe('fixture B — a knowledge gap becomes knowledge when the stream answer
       curiosities: [{ id: 'c1', topic: 'цены в компьютерном клубе', question: 'сколько стоит час', status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW }],
     });
     const { store } = await storeWith([curious, bystander]);
-    // Only pc_guy was offered this event — other_guy was not looking.
-    await store.ingestFromEvent(streamEvent({ speech: 'час стоит 30 юаней', summary: 'час стоит 30 юаней' }), ['pc_guy']);
+    // Only pc_guy was connected when this was said. Presence, not the reaction shortlist, decides
+    // who can learn — but someone who was not in the room learns nothing either way.
+    await store.observeEvent(streamEvent({ speech: 'час стоит 30 юаней', summary: 'час стоит 30 юаней' }), ['pc_guy']);
     expect(store.byUsername('pc_guy')?.curiosities[0]?.status).toBe('answered');
     expect(store.byUsername('other_guy')?.curiosities[0]?.status).toBe('open');
   });
@@ -249,16 +250,37 @@ describe('fixture E and F — life goes on between sessions, causally', () => {
     expect(done === undefined || done.stage === 'done').toBe(true);
   });
 
-  it('life never leaves a person with nothing: an emptied week picks up a new mundane concern', async () => {
-    const empty = mind('worker', {
+  // Fixture I: renewal is a possibility, never an appointment. The old rule guaranteed a fresh
+  // concern the moment the week emptied, which made every persona's life a treadmill with no quiet
+  // days — the least human-like schedule there is.
+  it('an emptied stretch eventually picks up a new mundane concern, but not on a guaranteed schedule', async () => {
+    const empty = mind('office_guy', {
       life: [{ id: 'l1', concern: 'сдаёт отчёт', kind: 'errand', stage: 'active', salience: 0.6, startedAt: NOW, updatedAt: NOW }],
     });
     let clock = NOW;
     const { store } = await storeWith([empty], () => clock);
-    clock = NOW + 30 * DAY;
-    await store.lifeTick(clock);
-    const life = store.byUsername('worker')!.life;
-    expect(life.some((item) => item.stage === 'active')).toBe(true);
+    let renewalDay: number | undefined;
+    for (let day = 1; day <= 20 && renewalDay === undefined; day += 1) {
+      clock = NOW + (30 + day) * DAY;
+      await store.lifeTick(clock);
+      const life = store.byUsername('office_guy')!.life;
+      if (life.some((item) => item.stage === 'active')) renewalDay = day;
+    }
+    // Life goes on — within a few weeks something new comes up...
+    expect(renewalDay).toBeDefined();
+    // ...but not necessarily the same day the last concern ended: "ничего не произошло" is a
+    // valid day, so a person may sit with an empty week for a while.
+    expect(renewalDay!).toBeGreaterThan(1);
+  });
+
+  it('the same empty day renews some people and not others — deterministic per person, never universal', async () => {
+    const names = ['renew_a', 'renew_i', 'renew_j', 'quiet_one', 'busy_one', 'worker_a'];
+    const day = NOW + 40 * DAY;
+    const { store } = await storeWith(names.map((name) => mind(name, { life: [] })), () => day);
+    await store.lifeTick(day);
+    const renewed = names.filter((name) => store.byUsername(name)!.life.some((item) => item.stage === 'active'));
+    expect(renewed.length).toBeGreaterThan(0);
+    expect(renewed.length).toBeLessThan(names.length);
   });
 
   it('the same person on different days differs in disposition, not in who they are', async () => {
@@ -333,8 +355,108 @@ describe('drive slices and payload discipline', () => {
 
   it('records motives per account without leaking them anywhere near a payload', async () => {
     const { store } = await storeWith([mind('speaker')]);
-    store.recordMotive('speaker', 'ask', 'knowledge_gap', 'china_rent', 'а сколько там хата в месяц?');
-    expect(store.lastMotives('speaker')[0]).toMatchObject({ motive: 'ask', sourceType: 'knowledge_gap' });
+    store.recordMotive('speaker', {
+      motive: 'ask', sourceType: 'knowledge_gap', sourceRef: 'china_rent',
+      message: 'а сколько там хата в месяц?', sourceValidated: true, validatedSourceType: 'knowledge_gap',
+    });
+    expect(store.lastMotives('speaker')[0]).toMatchObject({
+      motive: 'ask', sourceType: 'knowledge_gap', sourceValidated: true,
+    });
     expect(store.lastMotives('someone_else')).toEqual([]);
+  });
+});
+
+describe('fixture A and G — observation is presence, not the reaction shortlist', () => {
+  const priceEvent = () => streamEvent({
+    summary: 'S: час в компьютерном клубе стоит 30 юаней',
+    speech: 'S: час в компьютерном клубе стоит 30 юаней',
+  });
+  const clubCuriosity = () => ({
+    id: 'c1', topic: 'цены в компьютерном клубе', question: 'сколько стоит час в клубе',
+    status: 'open' as const, strength: 0.9, createdAt: NOW, updatedAt: NOW,
+  });
+
+  it('a persona nobody offered the floor to still learns from what was said', async () => {
+    const silent = mind('silent_guy', { curiosities: [clubCuriosity()] });
+    const { store } = await storeWith([silent]);
+    // Present in the room; never shortlisted, never offered, never speaking.
+    const stats = await store.observeEvent(priceEvent(), ['silent_guy']);
+    expect(stats.considered).toBe(1);
+    expect(stats.knowledgeUpdates).toBe(1);
+    expect(store.byUsername('silent_guy')?.curiosities[0]?.status).toBe('answered');
+  });
+
+  it('background attention misses an ordinary moment entirely — no writes, not even noticing', async () => {
+    const distracted = mind('afk_guy', {
+      curiosities: [clubCuriosity()],
+      moment: { mood: 'спокойное настроение', energy: 0.4, attention: 'background', updatedAt: NOW },
+    });
+    const { store } = await storeWith([distracted]);
+    const stats = await store.observeEvent(priceEvent(), ['afk_guy']);
+    expect(stats.observed).toBe(0);
+    expect(stats.memoryWrites).toBe(0);
+    expect(store.byUsername('afk_guy')?.curiosities[0]?.status).toBe('open');
+  });
+
+  it('hearing your own name pulls even a background watcher back', async () => {
+    const distracted = mind('afk_guy', {
+      curiosities: [clubCuriosity()],
+      moment: { mood: 'спокойное настроение', energy: 0.4, attention: 'background', updatedAt: NOW },
+    });
+    const { store } = await storeWith([distracted]);
+    const stats = await store.observeEvent(priceEvent(), ['afk_guy']);
+    expect(stats.observed).toBe(0);
+    const mentioned = await store.observeEvent(
+      streamEvent({ ...priceEvent(), directMentions: ['afk_guy'] }), ['afk_guy'],
+    );
+    expect(mentioned.observed).toBe(1);
+    expect(store.byUsername('afk_guy')?.curiosities[0]?.status).toBe('answered');
+  });
+
+  it('half-watching still catches a moment squarely about its own curiosity', async () => {
+    const half = mind('half_guy', {
+      curiosities: [clubCuriosity()],
+      moment: { mood: 'спокойное настроение', energy: 0.5, attention: 'half_watching', updatedAt: NOW },
+    });
+    const { store } = await storeWith([half]);
+    const stats = await store.observeEvent(priceEvent(), ['half_guy']);
+    expect(stats.observed).toBe(1);
+    expect(store.byUsername('half_guy')?.curiosities[0]?.status).toBe('answered');
+  });
+
+  it('noticing without storing is the common case: topical interest leaves no memory write', async () => {
+    const fan = mind('dota_fan', { knowledge: [{ topic: 'Dota 2', state: 'knows_well', updatedAt: NOW }] });
+    const { store } = await storeWith([fan]);
+    // Registry bridge: canon says "Dota 2", the stream says «доту». No digits — nothing to store.
+    const stats = await store.observeEvent(streamEvent({
+      summary: 'стример решил зайти в доту на вечер', speech: 'стример решил зайти в доту на вечер',
+    }), ['dota_fan']);
+    expect(stats.observed).toBe(1);
+    expect(stats.memoryWrites).toBe(0);
+    expect(stats.observedUsernames).toEqual(['dota_fan']);
+  });
+
+  it('a pending question of their own resolves when anyone gets the concrete answer', async () => {
+    const asker = mind('asker', {
+      openLoops: [{ id: 'q1', kind: 'question_pending', text: 'сколько стоит час в компьютерном клубе', status: 'open', createdAt: NOW, updatedAt: NOW }],
+    });
+    const { store } = await storeWith([asker]);
+    const stats = await store.observeEvent(priceEvent(), ['asker']);
+    expect(stats.loopsResolved).toBe(1);
+    expect(store.byUsername('asker')?.openLoops[0]?.status).toBe('resolved');
+  });
+
+  it('observation is deterministic: the same room and the same moment produce the same stats twice', async () => {
+    const build = () => [
+      mind('one', { curiosities: [clubCuriosity()] }),
+      mind('two', { knowledge: [{ topic: 'Dota 2', state: 'knows_well', updatedAt: NOW }] }),
+      mind('three'),
+    ];
+    const first = await storeWith(build());
+    const second = await storeWith(build());
+    const statsA = await first.store.observeEvent(priceEvent(), ['one', 'two', 'three']);
+    const statsB = await second.store.observeEvent(priceEvent(), ['one', 'two', 'three']);
+    expect(statsB).toEqual(statsA);
+    expect(second.store.byUsername('one')).toEqual(first.store.byUsername('one'));
   });
 });

@@ -640,6 +640,49 @@ describe('PersonaDriveService', () => {
       await vi.advanceTimersByTimeAsync(1_000);
       expect(evaluateOpportunity).not.toHaveBeenCalled();
       expect(usage.snapshot().drive.localSkips).toBe(1);
+      // Starvation observability: the skip is counted apart from ordinary local skips, so a
+      // session where the drive never once found a motive is readable as its own number.
+      expect(usage.snapshot().drive.noInternalMotive).toBe(1);
+      service.stop();
+    });
+
+    it('a motive-carrying tick does not touch the starvation counter', async () => {
+      vi.useFakeTimers();
+      const mind = await mindStoreWith([mindFor('karlbekner', true), mindFor('gigantiuz', true)]);
+      const { service, usage, evaluateOpportunity } = await harness({ mind });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(evaluateOpportunity).toHaveBeenCalledTimes(1);
+      expect(usage.snapshot().drive.noInternalMotive).toBe(0);
+      service.stop();
+    });
+
+    it('never leaks the supplied provenance pools into the model payload', async () => {
+      vi.useFakeTimers();
+      const mind = await mindStoreWith([mindFor('karlbekner', true), mindFor('gigantiuz', true)]);
+      const { service, evaluateOpportunity } = await harness({ mind });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      const input = evaluateOpportunity.mock.calls[0]?.[0];
+      expect(input?.mindContext).toBeDefined();
+      // The pools are the validation answer key; the model must ground in the written guidance.
+      expect(input?.mindContext).not.toHaveProperty('supplied');
+      service.stop();
+    });
+
+    it('freezes per-candidate provenance pools into the pending context it registers', async () => {
+      vi.useFakeTimers();
+      const mind = await mindStoreWith([mindFor('karlbekner', true), mindFor('gigantiuz', false)]);
+      const { service, prepareCandidates } = await harness({ mind });
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      const call = (prepareCandidates as ReturnType<typeof vi.fn>).mock.calls[0];
+      const pools = call?.[3] as Map<string, { mind: { curiosity: string[] } }> | undefined;
+      expect(pools).toBeInstanceOf(Map);
+      // The carrying candidate's pool holds its supplied curiosity; the blank one's pool is empty —
+      // which is exactly what makes a fabricated claim from it rejectable later.
+      expect(pools?.get('karlbekner')?.mind.curiosity.join(' ')).toContain('аренда');
+      expect(pools?.get('gigantiuz')?.mind.curiosity ?? []).toEqual([]);
       service.stop();
     });
 

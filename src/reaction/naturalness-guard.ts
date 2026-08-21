@@ -1,3 +1,4 @@
+import { translitKey } from '../shared/translit';
 import { StreamEvent } from '../stream-brain/types';
 
 /**
@@ -306,26 +307,6 @@ function alreadyJudged(event: NaturalnessInput['event']): boolean {
     return true;
   }
   return (text.match(/[\p{L}]+/gu) ?? []).some((word) => GENERIC_VERDICT.has(word));
-}
-
-/**
- * A comparison key that survives crossing the alphabet.
- *
- * This stream is two people speaking English and Russian at each other, and the failures reflected
- * it: the event said "Yandex" and the message said "Яндекс"; the event said "No[o]ne" and the
- * message said "нунун". Token equality sees nothing in common there. Transliterating both to Latin
- * and allowing a small edit distance sees what a reader sees, and costs no dependency.
- */
-function translitKey(word: string): string {
-  const map: Record<string, string> = {
-    а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i', й: 'y',
-    к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f',
-    х: 'h', ц: 'c', ч: 'ch', ш: 'sh', щ: 'sh', ъ: '', ы: 'i', ь: '', э: 'e', ю: 'yu', я: 'ya',
-  };
-  let key = '';
-  for (const letter of word) key += map[letter] ?? letter;
-  // Doubled letters survive no transliteration intact ("No[o]ne" spoken back as "нунун").
-  return key.replace(/(.)\1+/gu, '$1');
 }
 
 function matchesLoosely(key: string, heard: Set<string>): boolean {

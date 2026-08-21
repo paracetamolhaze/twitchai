@@ -103,6 +103,20 @@ describe('learned policy retrieval for one decision', () => {
     expect(store.forDecision(unrelated, ['griffin0502'])?.topic ?? []).toHaveLength(0);
   });
 
+  it('a topic rule scoped in Latin fires on the Russian alias of the same subject', async () => {
+    // Same fixture-C bridge the attention pass uses: a rule the Teacher scoped "dota2" must apply
+    // when the stream says «доту», or corrections about the channel's main subject never land.
+    const { store } = await storeWith([rule({
+      id: 'r1', scopeType: 'topic', scopeKey: 'dota2',
+      rule: 'Do not celebrate a kill the streamer already celebrated.',
+    })]);
+    const dotaMoment = streamEvent({
+      id: 'event-dota', summary: 'стример разносит в доте и радуется киллу',
+      speech: 'стример разносит в доте и радуется киллу',
+    });
+    expect(store.forDecision(dotaMoment, ['griffin0502'])?.topic).toHaveLength(1);
+  });
+
   it('caps how much policy one decision may carry, highest confidence first', async () => {
     const many = Array.from({ length: 8 }, (_, index) => rule({
       id: `r${index}`, rule: `Global rule number ${index}.`, confidence: 0.5 + index / 100,

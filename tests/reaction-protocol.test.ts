@@ -1028,6 +1028,9 @@ describe('single-session reaction protocol', () => {
       const prepared = await coordinator.prepareBrainEvent(event, 0);
       expect(prepared.mindContext?.byPersona['bot-one']?.join(' ')).toContain('ультимейт');
       expect(prepared.mindContext?.byPersona['bot-two']).toBeUndefined();
+      // The supplied pools are validation evidence, not payload: showing the model the answer key
+      // would let it cite sources it never used.
+      expect(prepared.mindContext).not.toHaveProperty('supplied');
       const keys = Object.keys(prepared);
       for (const later of ['reactionExamples', 'targetedPersonaContext', 'candidateStates']) {
         expect(keys.indexOf('mindContext')).toBeLessThan(keys.indexOf(later));
@@ -1043,8 +1046,13 @@ describe('single-session reaction protocol', () => {
       await coordinator.stop();
     });
 
-    it('counts and records the motive behind every sent message, and logs it as its structured origin', async () => {
-      const mindStore = await mindStoreWith([mindFor('bot-one')]);
+    it('counts and records the motive behind every sent message, validated against what was supplied', async () => {
+      const mindStore = await mindStoreWith([mindFor('bot-one', {
+        curiosities: [{
+          id: 'c1', topic: 'ультимейты и решающие моменты', question: 'почему решающий ультимейт так часто мажут',
+          status: 'open', strength: 0.9, createdAt: event.timestamp, updatedAt: event.timestamp,
+        }],
+      })]);
       const { coordinator, logged } = await setup(true, () => event.timestamp, true, undefined, undefined, mindStore);
       await coordinator.prepareBrainEvent(event, 0);
       await coordinator.submitBatch({
@@ -1057,10 +1065,60 @@ describe('single-session reaction protocol', () => {
       const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated');
       expect(decision?.motives).toEqual([{
         username: 'bot-one', motive: 'ask', sourceType: 'knowledge_gap', sourceRef: 'решающие ультимейты',
+        sourceValidated: true, validatedSourceType: 'knowledge_gap', validationReason: 'confirmed',
       }]);
-      expect(mindStore.lastMotives('bot-one')[0]).toMatchObject({ motive: 'ask', sourceType: 'knowledge_gap' });
+      expect(mindStore.lastMotives('bot-one')[0]).toMatchObject({
+        motive: 'ask', sourceType: 'knowledge_gap', sourceValidated: true,
+      });
       await coordinator.stop();
       vi.restoreAllMocks();
+    });
+
+    it('rejects a reaction whose claimed persistent source was never supplied to anyone', async () => {
+      // bot-one's mind is empty: no curiosity, no life, nothing. A knowledge_gap claim with a ref
+      // that matches nothing in the payload is a life story invented for the message.
+      const mindStore = await mindStoreWith([mindFor('bot-one')]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, undefined, mindStore);
+      await coordinator.prepareBrainEvent(event, 0);
+      const result = await coordinator.submitBatch({
+        eventId: event.id,
+        reactions: [{
+          username: 'bot-one', message: 'а сколько там аренда выходит в месяц?',
+          motive: 'ask', sourceType: 'knowledge_gap', sourceRef: 'аренда жилья в шанхае',
+        }],
+      });
+      expect(result.accepted).toEqual([]);
+      expect(result.rejected).toEqual(expect.arrayContaining([
+        expect.objectContaining({ username: 'bot-one', reason: 'invalid_motive_source' }),
+      ]));
+      // ...and the operator can read exactly what was thrown away.
+      expect(coordinator.listRejectedReactions()[0]).toMatchObject({
+        username: 'bot-one', reason: 'invalid_motive_source', message: 'а сколько там аренда выходит в месяц?',
+      });
+      await coordinator.stop();
+    });
+
+    it('observation is decoupled from the offer: a direct mention to one account still teaches the other', async () => {
+      // The event is addressed to bot-one, so ONLY bot-one is offered the floor. bot-two is merely
+      // in the room — and carries an open curiosity this very speech answers with a number.
+      const mindStore = await mindStoreWith([mindFor('bot-one'), mindFor('bot-two', {
+        curiosities: [{
+          id: 'c1', topic: 'цены в компьютерном клубе', question: 'сколько стоит час в клубе',
+          status: 'open', strength: 0.9, createdAt: event.timestamp, updatedAt: event.timestamp,
+        }],
+      })]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, undefined, mindStore);
+      const prepared = await coordinator.prepareBrainEvent({
+        ...event,
+        directMentions: ['bot-one'],
+        summary: 'bot-one, час в компьютерном клубе стоит 30 юаней',
+        speech: 'bot-one, час в компьютерном клубе стоит 30 юаней',
+      }, 0);
+      expect(prepared.availableBots).toEqual(['bot-one']);
+      // Observation runs fire-and-forget after the payload; give the microtask queue one turn.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mindStore.byUsername('bot-two')?.curiosities[0]?.status).toBe('answered');
+      await coordinator.stop();
     });
 
     it('a reaction without motive fields still parses, counted as unreported rather than rejected', async () => {

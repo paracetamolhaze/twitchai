@@ -30,7 +30,7 @@ function server(twitchOAuth?: {
   launchAuthorization: (ticket: string) => Promise<{ authorizationUrl: string; browserState: string }>;
   abandonAuthorization: (state: string, browserState: string) => Promise<void>;
   completeAuthorization: (code: string, state: string, browserState: string) => Promise<{ username: string }>;
-}): ApiServer {
+}, extraDependencies: Partial<Parameters<typeof createApiServer>[0]> = {}): ApiServer {
   let streamerMemories = [structuredClone(streamerMemory)];
   const api = createApiServer({
     port: 0, frontendUrls: ['http://localhost:5173'], dashboardToken: token, logger: new Logger('TEST', 'error'),
@@ -107,6 +107,7 @@ function server(twitchOAuth?: {
     },
     previewStreamerMemoryContext: async () => streamerMemories,
     twitchOAuth,
+    ...extraDependencies,
   });
   servers.push(api);
   return api;
@@ -269,5 +270,49 @@ describe('dashboard API', () => {
       reason: 'access_denied',
     });
     expect(abandoned).toEqual([{ state: 'browser-bound-state', browserState: 'browser-bound-state' }]);
+  });
+});
+
+describe('motive analytics and rejected reactions', () => {
+  it('answers 503 when neither dependency is wired, instead of pretending an empty result', async () => {
+    const app = server().app;
+    await request(app).get('/api/motive-analytics').set('Authorization', `Bearer ${token}`).expect(503);
+    await request(app).get('/api/rejected-reactions').set('Authorization', `Bearer ${token}`).expect(503);
+  });
+
+  it('serves the verdict x motive join when wired', async () => {
+    const app = server(undefined, {
+      motiveAnalytics: async () => ({
+        totalSent: 3, totalJudged: 2,
+        bySourceType: [{ sourceType: 'curiosity', sent: 2, judged: 2, approved: 2, approvalRate: 1 }],
+        personalSourceApprovalRate: 1, genericEventOnlyApprovalRate: null,
+      }),
+    }).app;
+    const response = await request(app).get('/api/motive-analytics').set('Authorization', `Bearer ${token}`).expect(200);
+    expect(response.body.personalSourceApprovalRate).toBe(1);
+    expect(response.body.bySourceType).toHaveLength(1);
+  });
+
+  it('lists rejected reactions and lets the operator mark a false positive', async () => {
+    const records = [{
+      id: 'rej-1', at: 1_000, eventId: 'event-1', username: 'bot',
+      message: 'ну и моменты пошли', reason: 'generic_evaluator',
+    }];
+    let marked: { id: string; falsePositive: boolean } | undefined;
+    const app = server(undefined, {
+      rejectedReactions: () => records,
+      markRejectedReactionFalsePositive: (id: string, falsePositive: boolean) => {
+        if (id !== 'rej-1') return false;
+        marked = { id, falsePositive };
+        return true;
+      },
+    }).app;
+    const list = await request(app).get('/api/rejected-reactions').set('Authorization', `Bearer ${token}`).expect(200);
+    expect(list.body).toEqual(records);
+    await request(app).post('/api/rejected-reactions/rej-1/false-positive')
+      .set('Authorization', `Bearer ${token}`).send({ falsePositive: true }).expect(204);
+    expect(marked).toEqual({ id: 'rej-1', falsePositive: true });
+    await request(app).post('/api/rejected-reactions/rej-missing/false-positive')
+      .set('Authorization', `Bearer ${token}`).send({}).expect(404);
   });
 });

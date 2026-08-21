@@ -12,6 +12,7 @@ import { StreamerMemory } from './global-memory/types';
 import { ReactionMemory } from './learning/reaction-memory';
 import { FeedbackTeacher } from './learning/feedback-teacher';
 import { LearnedPolicyStore } from './learning/learned-policy-store';
+import { computeMotiveAnalytics } from './learning/motive-analytics';
 import { LearnedRuleStatus } from './learning/learned-policy.types';
 import { Logger } from './logger';
 import { BotHistory } from './personas/bot-history';
@@ -219,6 +220,12 @@ export class Application {
       feedbackStore: this.feedbackStore,
       learnedPolicy: this.learnedPolicy,
       mind: this.mindStore,
+      // Fire-and-forget by design: the motive log is analytics, and a database hiccup here must
+      // never delay or fail the message it describes.
+      motiveLog: (record) => {
+        void this.repository.saveSentMessageMotive(record)
+          .catch((cause) => this.logger.warn('Sent-message motive not persisted', { username: record.username, cause }));
+      },
       coldStart: () => this.streamSession.coldStartStatus(),
       onMessageSent: () => this.streamSession.markMessageSent(),
       policy: this.policy,
@@ -372,7 +379,11 @@ export class Application {
         personaRuntime: this.personaRuntime,
         history: this.history,
         evaluateOpportunity: (input) => this.geminiBrain!.evaluateDriveOpportunity(input),
-        prepareCandidates: (usernames) => this.coordinator.prepareAutonomousCandidates(usernames),
+        // All four arguments pass through. This lambda used to forward only usernames, which
+        // silently dropped the observed moment (so drive messages skipped the naturalness
+        // guard's event comparison) and the cold-start flag the drive had carefully computed.
+        prepareCandidates: (usernames, observed, coldStartActive, provenancePools) =>
+          this.coordinator.prepareAutonomousCandidates(usernames, observed, coldStartActive, provenancePools),
         submitReaction: (requestId, reactions) => this.coordinator.submitBatch({ eventId: requestId, reactions }),
         applyMemoryUpdates: (decision, requestId) => this.persistBrainMemoryUpdates(decision, {
           eventId: requestId, occurredAt: Date.now(), tag: 'persona_drive',
@@ -568,6 +579,13 @@ export class Application {
         };
       },
       teacherStatus: () => this.teacher?.status() ?? Promise.resolve(undefined),
+      motiveAnalytics: async () => computeMotiveAnalytics(
+        await this.repository.listSentMessageMotives(1_000),
+        await this.repository.listMessageVerdicts(1_000),
+      ),
+      rejectedReactions: () => this.coordinator.listRejectedReactions(),
+      markRejectedReactionFalsePositive: (id, falsePositive) =>
+        this.coordinator.markRejectedReactionFalsePositive(id, falsePositive),
       decisions: () => [...this.decisions].reverse(),
       reactionTraces: () => [...this.reactionTraces].reverse(),
       settings: () => this.getSettings(),

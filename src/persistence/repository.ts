@@ -10,6 +10,7 @@ import {
   PersonaRelationship,
 } from '../personas/types';
 import { PersonaMindRecord } from '../personas/persona-mind';
+import { SentMessageMotiveRecord } from '../reaction/types';
 import { StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
 
@@ -123,6 +124,9 @@ export interface AppRepository {
   listStreamEvents(limit: number): Promise<StreamEvent[]>;
   /** One event by id, for rebuilding the moment a rated message answered. */
   getStreamEvent(id: string): Promise<StreamEvent | undefined>;
+  /** Why each sent message existed — joined against verdicts to score motive quality over time. */
+  saveSentMessageMotive(record: SentMessageMotiveRecord): Promise<void>;
+  listSentMessageMotives(limit: number): Promise<SentMessageMotiveRecord[]>;
   /** The dynamic half of each persona — see src/personas/persona-mind.ts for what a mind holds. */
   listPersonaMinds(): Promise<PersonaMindRecord[]>;
   savePersonaMind(record: PersonaMindRecord): Promise<void>;

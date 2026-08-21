@@ -1,4 +1,5 @@
 import { Logger } from '../logger';
+import { topicRelevance } from '../shared/topics';
 import { relevanceScore, semanticTokens } from './persona-memory';
 import { StreamEvent } from '../stream-brain/types';
 import { BotPersona } from './types';
@@ -96,10 +97,37 @@ export interface PersonaMindRecord {
   updatedAt: number;
 }
 
+/** The raw entries actually shown to the Brain for one candidate, categorized by source type —
+ *  the ground truth motive provenance is validated against. Never sent to the model itself. */
+export interface SuppliedSources {
+  knowledge_gap: string[];
+  curiosity: string[];
+  open_loop: string[];
+  current_life: string[];
+  relationship: string[];
+  expertise: string[];
+}
+
+export function emptySuppliedSources(): SuppliedSources {
+  return { knowledge_gap: [], curiosity: [], open_loop: [], current_life: [], relationship: [], expertise: [] };
+}
+
 /** What one decision receives: per-candidate lines, only for candidates with something relevant. */
 export interface MindContext {
   guidance: string;
   byPersona: Record<string, string[]>;
+  /** Backend-only provenance record of what was really supplied. Excluded from the payload. */
+  supplied: Record<string, SuppliedSources>;
+}
+
+/** What one event's observation pass did across the present population. */
+export interface ObservationStats {
+  considered: number;
+  observed: number;
+  memoryWrites: number;
+  knowledgeUpdates: number;
+  loopsResolved: number;
+  observedUsernames: string[];
 }
 
 export interface MotiveRecord {
@@ -108,6 +136,12 @@ export interface MotiveRecord {
   sourceType: string;
   sourceRef?: string;
   message: string;
+  /** Whether the backend confirmed the claimed source actually existed in what was supplied.
+   *  The model's own claim is never taken as fact — a dashboard showing an unvalidated source as
+   *  truth would let the model invent a life story for a message it wrote first. */
+  sourceValidated: boolean;
+  validatedSourceType?: string;
+  validationReason?: string;
 }
 
 /**
@@ -142,6 +176,10 @@ const MIN_RELEVANCE = 0.1;
 const MAX_LINES_PER_CANDIDATE = 4;
 
 const DAY_MS = 24 * 60 * 60_000;
+
+/** Chance per life tick that an empty week picks up a new mundane concern. Under half on purpose:
+ *  "ничего не произошло" is what most real days look like. */
+const RENEWAL_PROBABILITY = 0.4;
 
 /** How long each kind of mundane concern tends to live, in days, before winding down. */
 const CONCERN_LIFETIME_DAYS: Record<MindLifeConcern['kind'], number> = {
@@ -400,48 +438,63 @@ export class PersonaMindStore {
   forEvent(event: StreamEvent, usernames: string[]): MindContext | undefined {
     const eventText = [event.summary, event.speech, event.visualContext, event.gameContext]
       .filter(Boolean).join(' ');
-    const eventTokens = semanticTokens(eventText);
     const lowerText = eventText.toLowerCase();
     const byPersona: Record<string, string[]> = {};
+    const supplied: Record<string, SuppliedSources> = {};
 
     for (const username of usernames) {
       const mind = this.byUsername(username);
       if (!mind) continue;
       const lines: string[] = [];
+      const sources = emptySuppliedSources();
 
       const relevantKnowledge = mind.knowledge
-        .map((item) => ({ item, score: relevanceScore(eventTokens, `${item.topic} ${item.note ?? ''}`) }))
+        .map((item) => ({ item, score: topicRelevance(eventText, `${item.topic} ${item.note ?? ''}`) }))
         .filter(({ score }) => score >= MIN_RELEVANCE)
         .sort((left, right) => right.score - left.score)
         .slice(0, 2);
       for (const { item } of relevantKnowledge) {
         lines.push(`знания: ${item.topic} — ${KNOWLEDGE_STATE_RU[item.state]}${item.note ? ` (${item.note})` : ''}`);
+        // The same entry grounds different claims depending on its state: knowing a topic well is
+        // expertise; not knowing it is exactly what a knowledge_gap message would cite.
+        if (item.state === 'knows_well' || item.state === 'knows_somewhat') sources.expertise.push(item.topic);
+        else sources.knowledge_gap.push(`${item.topic} ${item.note ?? ''}`);
       }
 
       const curiosity = mind.curiosities
         .filter((item) => item.status === 'open' && item.strength >= MIN_STRENGTH_FOR_PAYLOAD)
-        .map((item) => ({ item, score: relevanceScore(eventTokens, `${item.topic} ${item.question}`) }))
+        .map((item) => ({ item, score: topicRelevance(eventText, `${item.topic} ${item.question}`) }))
         .filter(({ score }) => score >= MIN_RELEVANCE)
         .sort((left, right) => right.score - left.score)[0];
-      if (curiosity) lines.push(`своё любопытство: ${curiosity.item.question}`);
+      if (curiosity) {
+        lines.push(`своё любопытство: ${curiosity.item.question}`);
+        sources.curiosity.push(`${curiosity.item.topic} ${curiosity.item.question}`);
+      }
 
       const loop = mind.openLoops
         .filter((item) => item.status === 'open')
-        .map((item) => ({ item, score: relevanceScore(eventTokens, item.text) }))
+        .map((item) => ({ item, score: topicRelevance(eventText, item.text) }))
         .filter(({ score }) => score >= MIN_RELEVANCE)
         .sort((left, right) => right.score - left.score)[0];
-      if (loop) lines.push(`помнит с этого канала: ${loop.item.text}`);
+      if (loop) {
+        lines.push(`помнит с этого канала: ${loop.item.text}`);
+        sources.open_loop.push(loop.item.text);
+      }
 
       const concern = mind.life
         .filter((item) => item.stage === 'active' && item.salience >= MIN_STRENGTH_FOR_PAYLOAD)
-        .map((item) => ({ item, score: relevanceScore(eventTokens, item.concern) }))
+        .map((item) => ({ item, score: topicRelevance(eventText, item.concern) }))
         .filter(({ score }) => score >= MIN_RELEVANCE)
         .sort((left, right) => right.score - left.score)[0];
-      if (concern) lines.push(`в его жизни сейчас: ${concern.item.concern}`);
+      if (concern) {
+        lines.push(`в его жизни сейчас: ${concern.item.concern}`);
+        sources.current_life.push(concern.item.concern);
+      }
 
       const person = mind.people.find((item) => item.name !== 'стример' && lowerText.includes(item.name));
       if (person) {
         lines.push(`к ${person.name}: ${person.impression}${person.runningJoke ? `; своя шутка: ${person.runningJoke}` : ''}`);
+        sources.relationship.push(`${person.name} ${person.impression} ${person.runningJoke ?? ''}`);
       }
 
       if (lines.length === 0) continue;
@@ -449,10 +502,11 @@ export class PersonaMindStore {
       // matters to how they would say something, not to whether anything concerns them.
       lines.unshift(`сейчас: ${mind.moment.mood}${mind.moment.attention !== 'watching' ? ', смотрит вполглаза' : ''}`);
       byPersona[username] = lines.slice(0, MAX_LINES_PER_CANDIDATE);
+      supplied[username] = sources;
     }
 
     if (Object.keys(byPersona).length === 0) return undefined;
-    return { guidance: MIND_GUIDANCE, byPersona };
+    return { guidance: MIND_GUIDANCE, byPersona, supplied };
   }
 
   /**
@@ -462,51 +516,112 @@ export class PersonaMindStore {
    */
   forDrive(usernames: string[]): MindContext | undefined {
     const byPersona: Record<string, string[]> = {};
+    const supplied: Record<string, SuppliedSources> = {};
     for (const username of usernames) {
       const mind = this.byUsername(username);
       if (!mind) continue;
       const lines: string[] = [];
+      const sources = emptySuppliedSources();
       for (const loop of mind.openLoops.filter((item) => item.status === 'open').slice(0, 1)) {
         lines.push(`помнит с этого канала: ${loop.text}`);
+        sources.open_loop.push(loop.text);
       }
       for (const curiosity of mind.curiosities
         .filter((item) => item.status === 'open' && item.strength >= 0.6)
         .slice(0, 2)) {
         lines.push(`своё любопытство: ${curiosity.question}`);
+        sources.curiosity.push(`${curiosity.topic} ${curiosity.question}`);
       }
       const concern = mind.life.find((item) => item.stage === 'active' && item.salience >= 0.6);
-      if (concern) lines.push(`в его жизни сейчас: ${concern.concern}`);
+      if (concern) {
+        lines.push(`в его жизни сейчас: ${concern.concern}`);
+        sources.current_life.push(concern.concern);
+      }
       if (lines.length === 0) continue;
       lines.unshift(`сейчас: ${mind.moment.mood}`);
       byPersona[username] = lines.slice(0, MAX_LINES_PER_CANDIDATE);
+      supplied[username] = sources;
     }
     if (Object.keys(byPersona).length === 0) return undefined;
-    return { guidance: MIND_GUIDANCE, byPersona };
+    return { guidance: MIND_GUIDANCE, byPersona, supplied };
   }
 
   /**
-   * Deterministic factual ingestion: when a moment lands on an open curiosity and carries a
-   * concrete fact (a number is the honest cheap proxy), the curiosity closes, the knowledge map
-   * gains a sourced entry, and a callback loop is opened so the person can genuinely refer back to
-   * it later. "час в клубе — 30 юаней" becomes something this one viewer heard, not something the
-   * global context happens to contain. No model call: noticing a fact you were curious about is
-   * mechanical; deciding what it means stays with the Brain at generation time.
+   * Why a drive tick found nobody worth calling the model for — the number that separates "these
+   * people genuinely have no open thoughts" from "the drive thresholds are set above where their
+   * thoughts actually live". Read at skip time and logged, never used to force a message.
    */
-  async ingestFromEvent(event: StreamEvent, usernames: string[]): Promise<void> {
-    const speechText = [event.speech, event.summary].filter(Boolean).join(' ');
-    if (!speechText) return;
-    const eventTokens = semanticTokens(speechText);
-    const hasConcreteFact = /\d/.test(speechText);
-    const now = this.now();
-
+  driveMotiveStats(usernames: string[]): {
+    bestCuriosityStrength: number; bestConcernSalience: number; openLoops: number;
+  } {
+    let bestCuriosityStrength = 0;
+    let bestConcernSalience = 0;
+    let openLoops = 0;
     for (const username of usernames) {
       const mind = this.byUsername(username);
       if (!mind) continue;
+      for (const curiosity of mind.curiosities) {
+        if (curiosity.status === 'open') bestCuriosityStrength = Math.max(bestCuriosityStrength, curiosity.strength);
+      }
+      for (const concern of mind.life) {
+        if (concern.stage === 'active') bestConcernSalience = Math.max(bestConcernSalience, concern.salience);
+      }
+      openLoops += mind.openLoops.filter((item) => item.status === 'open').length;
+    }
+    return {
+      bestCuriosityStrength: Number(bestCuriosityStrength.toFixed(2)),
+      bestConcernSalience: Number(bestConcernSalience.toFixed(2)),
+      openLoops,
+    };
+  }
+
+  /**
+   * A person watching a stream, not a candidate answering one.
+   *
+   * V1 ingested facts only for the reaction shortlist, which quietly made the shortlist define who
+   * EXISTED at a moment: a persona could not remember anything it was not offered to answer. That
+   * breaks the life model — a real viewer hears "час стоит 30 юаней", stores it, and says nothing;
+   * a week later it surfaces as their own callback. Observation is therefore decoupled: every
+   * present persona is considered, and a deterministic, causal attention pass decides who noticed —
+   * their curiosities, gaps, loops, concerns, people and direct mentions, scaled by how attentively
+   * they are watching tonight. Never fairness, never rotation, never a model call: the whole pass
+   * is capped token matching over capped arrays, microseconds for thirty minds.
+   */
+  async observeEvent(event: StreamEvent, presentUsernames: string[]): Promise<ObservationStats> {
+    const stats: ObservationStats = {
+      considered: 0, observed: 0, memoryWrites: 0, knowledgeUpdates: 0, loopsResolved: 0,
+      observedUsernames: [],
+    };
+    const speechText = [event.speech, event.summary].filter(Boolean).join(' ');
+    if (!speechText) return stats;
+    const fullText = [speechText, event.visualContext, event.gameContext].filter(Boolean).join(' ');
+    const lowerText = fullText.toLowerCase();
+    const hasConcreteFact = /\d/.test(speechText);
+    const mentioned = new Set(event.directMentions.map((name) => name.toLowerCase()));
+    const now = this.now();
+
+    for (const username of presentUsernames) {
+      const mind = this.byUsername(username);
+      if (!mind) continue;
+      stats.considered += 1;
+      const isMentioned = mentioned.has(username.toLowerCase());
+      // Attention is causal, and tonight's attention was set by tonight's life: someone with the
+      // stream in the background misses ordinary moments entirely — being named is the exception,
+      // because hearing your own name is what pulls anyone back to a screen.
+      if (mind.moment.attention === 'background' && !isMentioned) continue;
+      // Half-watching does not miss things, it misses SUBTLE things: the relevance bar rises.
+      const relevanceFloor = mind.moment.attention === 'half_watching' && !isMentioned
+        ? MIN_RELEVANCE * 1.5
+        : MIN_RELEVANCE;
+
+      let noticed = isMentioned;
       let changed = false;
+
       for (const curiosity of mind.curiosities) {
         if (curiosity.status !== 'open') continue;
-        const score = relevanceScore(eventTokens, `${curiosity.topic} ${curiosity.question}`);
-        if (score < MIN_RELEVANCE) continue;
+        const score = topicRelevance(speechText, `${curiosity.topic} ${curiosity.question}`);
+        if (score < relevanceFloor) continue;
+        noticed = true;
         if (!hasConcreteFact) {
           // The topic came up but nothing concrete was said: the curiosity stays open and fresher.
           curiosity.updatedAt = now;
@@ -532,14 +647,44 @@ export class PersonaMindStore {
         });
         mind.openLoops = mind.openLoops.slice(0, MAX_OPEN_LOOPS);
         this.ingestedFacts += 1;
+        stats.knowledgeUpdates += 1;
+        stats.memoryWrites += 1;
         this.logger.info('MIND_FACT_INGESTED', { username, topic: curiosity.topic, eventId: event.id });
         changed = true;
+      }
+
+      // A pending question of their own that this moment concretely answers closes, whoever asked
+      // it aloud — the viewer who wondered about the price resolves the loop when anyone answers.
+      for (const loop of mind.openLoops) {
+        if (loop.status !== 'open' || loop.kind !== 'question_pending') continue;
+        if (!hasConcreteFact) continue;
+        if (topicRelevance(speechText, loop.text) < relevanceFloor) continue;
+        loop.status = 'resolved';
+        loop.updatedAt = now;
+        stats.loopsResolved += 1;
+        noticed = true;
+        changed = true;
+      }
+
+      // Noticing without storing is the common case and is deliberately mutation-free: interest in
+      // a topic makes a person look up; it does not make everything said about it a memory.
+      if (!noticed) {
+        noticed = mind.people.some((person) => person.name !== 'стример' && lowerText.includes(person.name))
+          || mind.knowledge.some((item) => topicRelevance(fullText, item.topic) >= relevanceFloor)
+          || mind.life.some((item) => item.stage === 'active'
+            && topicRelevance(fullText, item.concern) >= relevanceFloor);
+      }
+
+      if (noticed) {
+        stats.observed += 1;
+        stats.observedUsernames.push(username);
       }
       if (changed) {
         mind.updatedAt = now;
         await this.repository.savePersonaMind(mind);
       }
     }
+    return stats;
   }
 
   /**
@@ -592,9 +737,11 @@ export class PersonaMindStore {
       }
 
       const activeCount = mind.life.filter((concern) => concern.stage === 'active').length;
-      if (activeCount === 0 && mind.life.length < MAX_LIFE) {
-        // Life goes on: an empty week picks up an ordinary new concern. Only the mind changes —
-        // the canon never moves because a Tuesday happened.
+      if (activeCount === 0 && mind.life.length < MAX_LIFE && random() < RENEWAL_PROBABILITY) {
+        // Life goes on, but not on a schedule: an empty stretch EVENTUALLY picks up an ordinary
+        // new concern, and a day where nothing happened is a valid day — the V1 version spawned
+        // one the moment the list emptied, which made every quiet week instantly busy again.
+        // Seeded by (username, day), so the same restart replays the same quiet days.
         mind.life.push(renewalConcern(random, now));
         changed = true;
       }
@@ -612,10 +759,10 @@ export class PersonaMindStore {
   }
 
   /** In-memory audit trail of why messages happened, per account. Never sent to any model. */
-  recordMotive(username: string, motive: string, sourceType: string, sourceRef: string | undefined, message: string): void {
+  recordMotive(username: string, record: Omit<MotiveRecord, 'at'>): void {
     const key = username.toLowerCase();
     const list = this.motives.get(key) ?? [];
-    list.unshift({ at: this.now(), motive, sourceType, ...(sourceRef ? { sourceRef } : {}), message });
+    list.unshift({ at: this.now(), ...record });
     this.motives.set(key, list.slice(0, MAX_MOTIVES_KEPT));
   }
 

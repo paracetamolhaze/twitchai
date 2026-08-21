@@ -83,6 +83,10 @@ export type ReactionRejectionReason =
   // NaturalnessGuard — it knows nothing about past operator judgement — and not a blacklist of
   // phrases: a per-persona comparison against messages that account was actually marked down for.
   | 'disliked_near_duplicate'
+  // The Brain claimed a persistent personal source (a memory, a curiosity, a relationship...) that
+  // was never actually supplied to it. A fabricated life story behind a message is worse than no
+  // message: it would make every provenance display a lie.
+  | 'invalid_motive_source'
   | 'invalid_item';
 
 export interface ReactionRejection {
@@ -104,6 +108,27 @@ export interface ReactionDecisionRecord {
   rejected: ReactionRejection[];
   candidateCount: number;
   silentCandidateCount: number;
+}
+
+/**
+ * The durable record of why one sent message existed — motive, claimed and validated source, the
+ * learned rules it was generated under. Written for every sent message so operator verdicts can be
+ * joined against it after any restart: verdict x motive is the first objective answer to whether
+ * Living Persona makes messages better or merely explains them beautifully.
+ */
+export interface SentMessageMotiveRecord {
+  id: string;
+  createdAt: number;
+  username: string;
+  message: string;
+  eventId: string;
+  triggerKind: 'stream_event' | 'persona_drive';
+  motive: string;
+  sourceType: string;
+  sourceRef?: string;
+  sourceValidated: boolean;
+  validatedSourceType?: string;
+  learnedRuleIds: string[];
 }
 
 export type ReactionSendFailureReason = 'account_unavailable' | 'local_rate_limit' | 'twitch_send_failed';

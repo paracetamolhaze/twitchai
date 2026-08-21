@@ -1,5 +1,5 @@
 import { Logger } from '../logger';
-import { relevanceScore, semanticTokens } from '../personas/persona-memory';
+import { topicRelevance } from '../shared/topics';
 import { AppRepository } from '../persistence/repository';
 import { StreamEvent } from '../stream-brain/types';
 import { LearnedPolicyForDecision, LearnedPolicyRule, LearnedRuleStatus } from './learned-policy.types';
@@ -123,13 +123,15 @@ export class LearnedPolicyStore {
       .sort(byConfidenceThenRecency)
       .slice(0, MAX_GLOBAL_RULES);
 
-    const moment = event
-      ? semanticTokens([event.summary, event.speech, event.visualContext, event.gameContext].filter(Boolean).join(' '))
-      : new Set<string>();
+    const momentText = event
+      ? [event.summary, event.speech, event.visualContext, event.gameContext].filter(Boolean).join(' ')
+      : '';
     const topic = event
       ? usable
         .filter((rule) => rule.scopeType === 'topic')
-        .map((rule) => ({ rule, score: relevanceScore(moment, `${rule.scopeKey} ${rule.rule}`) }))
+        // The shared topic yardstick, so a rule scoped "dota2" fires when the stream says «доту» —
+        // the same alias bridge attention and mind retrieval use, or the layers quietly disagree.
+        .map((rule) => ({ rule, score: topicRelevance(momentText, `${rule.scopeKey} ${rule.rule}`) }))
         .filter(({ score }) => score >= MIN_TOPIC_RELEVANCE)
         .sort((left, right) => right.score - left.score)
         .slice(0, MAX_TOPIC_RULES)

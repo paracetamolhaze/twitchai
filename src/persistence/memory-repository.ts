@@ -10,6 +10,7 @@ import {
   PersonaMemoryItem,
   PersonaRelationship,
 } from '../personas/types';
+import { SentMessageMotiveRecord } from '../reaction/types';
 import { StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import {
@@ -35,6 +36,7 @@ export class MemoryRepository implements AppRepository {
   private messages: BotMessageRecord[] = [];
   private examples: ReactionExample[] = [];
   private readonly verdicts: MessageVerdictRecord[] = [];
+  private readonly sentMotives: SentMessageMotiveRecord[] = [];
   private readonly processedVerdicts = new Set<string>();
   private readonly learnedRules = new Map<string, LearnedPolicyRule>();
   private readonly minds = new Map<string, PersonaMindRecord>();
@@ -215,6 +217,10 @@ export class MemoryRepository implements AppRepository {
     return this.verdicts.filter((item) => !this.processedVerdicts.has(item.id)).slice(0, limit).map(clone);
   }
 
+  async saveSentMessageMotive(record: SentMessageMotiveRecord): Promise<void> { this.sentMotives.push(clone(record)); }
+  async listSentMessageMotives(limit: number): Promise<SentMessageMotiveRecord[]> {
+    return [...this.sentMotives].sort((a, b) => b.createdAt - a.createdAt).slice(0, limit).map(clone);
+  }
   async listPersonaMinds(): Promise<PersonaMindRecord[]> { return [...this.minds.values()].map(clone); }
   async savePersonaMind(record: PersonaMindRecord): Promise<void> { this.minds.set(record.personaId, clone(record)); }
   async deletePersonaMind(personaId: string): Promise<boolean> { return this.minds.delete(personaId); }

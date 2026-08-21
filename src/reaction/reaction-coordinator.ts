@@ -7,7 +7,7 @@ import { LearnedPolicyStore } from '../learning/learned-policy-store';
 import { GlobalStreamerMemory } from '../global-memory/global-streamer-memory';
 import { BotHistory } from '../personas/bot-history';
 import { PersonaFeedbackStore } from '../personas/feedback-store';
-import { PersonaMindStore } from '../personas/persona-mind';
+import { emptySuppliedSources, ObservationStats, PersonaMindStore } from '../personas/persona-mind';
 import { PersonaContextBuilder } from '../personas/persona-context-builder';
 import { PersonaMemory } from '../personas/persona-memory';
 import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
@@ -17,6 +17,7 @@ import { ColdStartStatus } from '../stream-brain/stream-session';
 import { BrainEventInput, FIRST_MESSAGE_GATE, PERSONAL_SOURCE_TYPES } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
 import { shortlistCandidates } from './candidate-shortlist';
+import { emptyProvenancePools, ProvenancePools, ProvenanceVerdict, validateMotiveProvenance } from './motive-provenance';
 import { NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
 import { ReactionPolicyGuard } from './reaction-policy-guard';
 import {
@@ -29,6 +30,7 @@ import {
   ReactionSendResult,
   ReactionTraceRecord,
   ReactionTrigger,
+  SentMessageMotiveRecord,
   REACTION_BATCH_PROTOCOL_MAX_ITEMS,
   REACTION_MESSAGE_PROTOCOL_MAX_CHARACTERS,
   SubmittedReaction,
@@ -58,6 +60,10 @@ export interface ReactionCoordinatorOptions {
   /** Optional: each persona's living state. Absent means no decision carries mind slices and no
    *  motive is recorded against a mind — the pre-existing behavior. */
   mind?: PersonaMindStore;
+  /** Optional durable sink for per-sent-message motive records — wired to the repository in
+   *  production so verdicts can be joined against motives after a restart. Failures are the
+   *  caller's to swallow; a full analytics table must never cost a sent message. */
+  motiveLog?: (record: SentMessageMotiveRecord) => void;
   sender: ReactionSender;
   history: BotHistory;
   memory: ReactionMemory;
@@ -127,8 +133,25 @@ interface PendingContext {
    *  payload time for the same reason coldStartActive is: what was in the prompt, not what is true
    *  now. Ids and scopes only — the rule text is already in the payload and the store. */
   learnedRulesSupplied: Array<{ id: string; scope: string; scopeKey: string }>;
+  /**
+   * Everything the payload actually gave each offered persona to ground a message in, keyed by
+   * lowercase username and frozen at payload time. This is what a claimed motive source is checked
+   * against when the batch comes back: the Brain's self-report is never trusted on its own.
+   */
+  provenancePools: Map<string, ProvenancePools>;
   expiresAt: number;
   timer: NodeJS.Timeout;
+}
+
+/** One sent message's motive as it appears in the decision log: claim and validation side by side. */
+interface SentMotiveEntry {
+  username: string;
+  motive: string;
+  sourceType: string;
+  sourceRef?: string;
+  sourceValidated: boolean;
+  validatedSourceType?: string;
+  validationReason?: string;
 }
 
 /**
@@ -197,6 +220,24 @@ interface SessionDecisionStats {
     callbacksFromMemory: number;
     relationshipMotives: number;
     lifeStateMotives: number;
+    /** Sent messages whose claimed source survived provenance validation. */
+    sourcesValidated: number;
+    /** Reactions rejected outright because a persistent source claim matched nothing supplied. */
+    invalidSourceRejected: number;
+  };
+  /**
+   * What the whole room learned, not just who was offered the floor. Before V1.1 ingestion ran on
+   * the reaction shortlist, so "who existed" was defined by "who was about to speak" — a persona
+   * that stayed silent all evening learned nothing. observedButNotOffered is the number that proves
+   * the decoupling works: memory writes landing on personas the Brain never saw.
+   */
+  observation: {
+    considered: number;
+    observed: number;
+    memoryWrites: number;
+    knowledgeUpdates: number;
+    loopsResolved: number;
+    observedButNotOffered: number;
   };
   /**
    * Per-account breakdown of the same three numbers the aggregates above already total, so a run
@@ -227,6 +268,11 @@ function emptySessionStats(): SessionDecisionStats {
     motives: {
       personalSource: 0, eventEmotion: 0, noSource: 0, unreported: 0,
       questionsFromKnowledgeGap: 0, callbacksFromMemory: 0, relationshipMotives: 0, lifeStateMotives: 0,
+      sourcesValidated: 0, invalidSourceRejected: 0,
+    },
+    observation: {
+      considered: 0, observed: 0, memoryWrites: 0, knowledgeUpdates: 0, loopsResolved: 0,
+      observedButNotOffered: 0,
     },
     personaStats: {},
   };
@@ -237,6 +283,32 @@ function personaStatsFor(
 ): { shortlisted: number; notices: number; selected: number } {
   return stats.personaStats[username] ??= { shortlisted: 0, notices: 0, selected: 0 };
 }
+
+/**
+ * One filtered-out reaction, kept for the operator to inspect. Every entry is a message that cost a
+ * Brain call and was then thrown away by a quality filter — which is either the filter doing its job
+ * or the filter being too wide, and only a human reading the actual text can tell the two apart.
+ * falsePositive is that human's verdict, markable from the dashboard.
+ */
+export interface RejectedReactionRecord {
+  id: string;
+  at: number;
+  eventId: string;
+  username: string;
+  message: string;
+  reason: string;
+  eventSummary?: string;
+  falsePositive?: boolean;
+}
+
+/** Quality filters only. Capacity rejections (cooldowns, rate limits, busy accounts) are about the
+ *  room, not the message, and would bury the reviewable entries in noise. */
+const INSPECTABLE_REJECTION_REASONS: ReadonlySet<string> = new Set([
+  'semantic_echo', 'borrowed_opinion', 'generic_evaluator', 'majority_echo', 'transcript_echo',
+  'disliked_near_duplicate', 'invalid_motive_source',
+]);
+
+const REJECTED_REACTION_LOG_LIMIT = 100;
 
 const batchEnvelopeSchema = z.object({
   eventId: z.string().trim().min(1).max(100),
@@ -262,6 +334,8 @@ export class ReactionCoordinator extends EventEmitter {
   private readonly deliveryEchoTimeoutMs: number;
   private readonly traces = new Map<string, ReactionTraceRecord>();
   private session = emptySessionStats();
+  /** Ring buffer of quality-filtered reactions, newest last. Session-scoped, capped, in-memory. */
+  private readonly rejectedLog: RejectedReactionRecord[] = [];
   private stopped = false;
 
   constructor(private readonly options: ReactionCoordinatorOptions) {
@@ -344,6 +418,7 @@ export class ReactionCoordinator extends EventEmitter {
         const username = reaction.username.trim().toLowerCase();
         naturalnessRejections.push({ username, reason: verdict.reason! });
         this.session.naturalnessRejected[verdict.reason!] += 1;
+        this.recordRejectedReaction(pending, parsed.eventId, username, reaction.message, verdict.reason!);
         this.logger.info('Reaction dropped as commentary rather than reaction', {
           eventId: parsed.eventId, bot: username, reason: verdict.reason, text: reaction.message,
         });
@@ -354,9 +429,39 @@ export class ReactionCoordinator extends EventEmitter {
     this.session.naturalnessGuardMs += this.now() - naturalnessStartedAt;
     naturalnessRejections.forEach(() => this.options.usage.recordGuardRejection());
 
+    // Provenance next, between naturalness and policy: a message may read fine and still claim a
+    // memory or a curiosity that was never in the payload. The check is per-username against the
+    // pools frozen when this opportunity was prepared. Verdicts are kept for every reaction — an
+    // accepted message's validated source is what gets recorded, never the model's raw claim.
+    const provenanceVerdicts = new Map<string, ProvenanceVerdict>();
+    const provenanceRejections: ReactionRejection[] = [];
+    const grounded = natural.filter((reaction) => {
+      const username = reaction.username.trim().toLowerCase();
+      const pools = pending.provenancePools.get(username) ?? emptyProvenancePools();
+      const verdict = validateMotiveProvenance(reaction, pools);
+      provenanceVerdicts.set(username, verdict);
+      // Only fabricated PERSISTENT claims are worth a rejection: ref_matches_nothing is a life
+      // story invented for the message, no_source_supplied is a category claimed when the payload
+      // carried none of it. chat_not_supplied and unreported stay observability-only — dropping a
+      // message because the model skipped an optional field would punish honesty about 'none'.
+      const fabricated = !verdict.sourceValidated
+        && (verdict.validationReason === 'ref_matches_nothing' || verdict.validationReason === 'no_source_supplied');
+      if (!fabricated) return true;
+      provenanceRejections.push({ username, reason: 'invalid_motive_source' });
+      this.session.motives.invalidSourceRejected += 1;
+      this.options.usage.recordGuardRejection();
+      this.recordRejectedReaction(pending, parsed.eventId, username, reaction.message, 'invalid_motive_source');
+      this.logger.warn('Reaction rejected: claimed source was never supplied', {
+        eventId: parsed.eventId, bot: username, text: reaction.message,
+        claimedSourceType: reaction.sourceType, claimedSourceRef: reaction.sourceRef,
+        validationReason: verdict.validationReason,
+      });
+      return false;
+    });
+
     const result = await this.options.policy.validateBatch({
       trigger: pending.trigger,
-      reactions: natural,
+      reactions: grounded,
       permittedUsernames: pending.permittedUsernames,
       currentCandidates: this.options.candidates(),
       isDuplicate: (username, message) => this.options.history.isDuplicate(username, message),
@@ -364,9 +469,14 @@ export class ReactionCoordinator extends EventEmitter {
         ? (username, message) => this.options.feedbackStore!.isNearDuplicateOfDisliked(username, message)
         : undefined,
     });
-    const allRejections = [...itemRejections, ...naturalnessRejections, ...result.rejected];
+    const allRejections = [...itemRejections, ...naturalnessRejections, ...provenanceRejections, ...result.rejected];
+    const submittedByUser = new Map(parsed.reactions.map((item) => [item.username.trim().toLowerCase(), item]));
     for (const rejection of result.rejected) {
       this.options.usage.recordGuardRejection();
+      const submittedText = submittedByUser.get(rejection.username)?.message;
+      if (submittedText !== undefined) {
+        this.recordRejectedReaction(pending, parsed.eventId, rejection.username, submittedText, rejection.reason);
+      }
       this.logger.warn('Gemini reaction rejected by policy', { eventId: parsed.eventId, bot: rejection.username, reason: rejection.reason });
     }
     const policyCompletedAt = result.accepted.length === 0 ? this.now() : undefined;
@@ -396,18 +506,46 @@ export class ReactionCoordinator extends EventEmitter {
       this.schedule(plan);
     }
     if (result.accepted.length === 0) this.options.usage.recordSkipped();
-    // Why each sent message exists, by the Brain's own structured account. Counted only for
-    // messages that actually survived the guards: a motive on a rejected draft is not behaviour.
-    const reactionByUser = new Map(parsed.reactions.map((item) => [item.username.trim().toLowerCase(), item]));
-    const sentMotives: Array<{ username: string; motive: string; sourceType: string; sourceRef?: string }> = [];
+    // Why each sent message exists — the Brain's structured claim next to the backend's validation
+    // of it. Counted only for messages that actually survived the guards: a motive on a rejected
+    // draft is not behaviour. What is tallied and persisted is the VALIDATED source wherever one
+    // exists; the raw claim is kept beside it so a disagreement stays visible.
+    const sentMotives: SentMotiveEntry[] = [];
     for (const plan of result.accepted) {
-      const submitted = reactionByUser.get(plan.bot.username.toLowerCase());
+      const username = plan.bot.username.toLowerCase();
+      const submitted = submittedByUser.get(username);
+      const verdict = provenanceVerdicts.get(username);
       const motive = submitted?.motive?.trim() || 'unreported';
       const sourceType = submitted?.sourceType?.trim() || 'unreported';
       const sourceRef = submitted?.sourceRef?.trim();
-      sentMotives.push({ username: plan.bot.username, motive, sourceType, ...(sourceRef ? { sourceRef } : {}) });
-      this.tallyMotive(motive, sourceType);
-      this.options.mind?.recordMotive(plan.bot.username, motive, sourceType, sourceRef, plan.message);
+      const sourceValidated = verdict?.sourceValidated ?? false;
+      const validatedSourceType = verdict?.validatedSourceType;
+      if (sourceValidated) this.session.motives.sourcesValidated += 1;
+      sentMotives.push({
+        username: plan.bot.username, motive, sourceType, sourceValidated,
+        ...(sourceRef ? { sourceRef } : {}),
+        ...(validatedSourceType ? { validatedSourceType } : {}),
+        ...(verdict ? { validationReason: verdict.validationReason } : {}),
+      });
+      this.tallyMotive(motive, sourceValidated && validatedSourceType ? validatedSourceType : sourceType);
+      this.options.mind?.recordMotive(plan.bot.username, {
+        motive, sourceType, message: plan.message, sourceValidated,
+        ...(sourceRef ? { sourceRef } : {}),
+        ...(validatedSourceType ? { validatedSourceType } : {}),
+        ...(verdict ? { validationReason: verdict.validationReason } : {}),
+      });
+      this.options.motiveLog?.({
+        id: randomUUID(),
+        createdAt: decisionAt,
+        username: plan.bot.username,
+        message: plan.message,
+        eventId: parsed.eventId,
+        triggerKind: pending.trigger.kind,
+        motive, sourceType, sourceValidated,
+        ...(sourceRef ? { sourceRef } : {}),
+        ...(validatedSourceType ? { validatedSourceType } : {}),
+        learnedRuleIds: pending.learnedRulesSupplied.map((rule) => rule.id),
+      });
     }
     const decision: ReactionDecisionRecord = {
       eventId: parsed.eventId,
@@ -447,7 +585,7 @@ export class ReactionCoordinator extends EventEmitter {
   private logDecision(
     pending: PendingContext,
     decision: ReactionDecisionRecord,
-    sentMotives: Array<{ username: string; motive: string; sourceType: string; sourceRef?: string }> = [],
+    sentMotives: SentMotiveEntry[] = [],
   ): void {
     const trigger = pending.trigger;
     const tally = this.session.byTrigger[trigger.kind];
@@ -586,6 +724,7 @@ export class ReactionCoordinator extends EventEmitter {
       driveTicks: drive.ticks,
       driveEligibleTicks: drive.eligibleTicks,
       driveLocalSkips: drive.localSkips,
+      driveNoInternalMotive: drive.noInternalMotive,
       driveBrainCalls: drive.brainCalls,
       driveSilentDecisions: drive.silentDecisions,
       driveCancelledForExternalEvent: drive.cancelledForExternalEvent,
@@ -620,6 +759,19 @@ export class ReactionCoordinator extends EventEmitter {
       callbacksFromMemory: stats.motives.callbacksFromMemory,
       relationshipMotives: stats.motives.relationshipMotives,
       lifeStateMotives: stats.motives.lifeStateMotives,
+      // The claim/validation gap in two numbers: how many sent messages had a source the backend
+      // could confirm, and how many drafts were rejected for citing a source that never existed.
+      motiveSourcesValidated: stats.motives.sourcesValidated,
+      invalidMotiveSourceRejected: stats.motives.invalidSourceRejected,
+      // What the room learned, decoupled from who spoke. observedButNotOffered above zero is the
+      // proof that silent personas are accumulating a life; memoryWrites near zero on a talkative
+      // evening means the attention gates are set too tight.
+      observationConsidered: stats.observation.considered,
+      observationObserved: stats.observation.observed,
+      observationMemoryWrites: stats.observation.memoryWrites,
+      observationKnowledgeUpdates: stats.observation.knowledgeUpdates,
+      observationLoopsResolved: stats.observation.loopsResolved,
+      observedButNotOffered: stats.observation.observedButNotOffered,
       ...(this.options.mind ? { mind: this.options.mind.snapshot() } : {}),
     });
   }
@@ -804,11 +956,18 @@ export class ReactionCoordinator extends EventEmitter {
     // slot when the account it belongs to could actually speak on this moment.
     const learnedPolicy = this.options.learnedPolicy?.forDecision(event, offered.map((candidate) => candidate.username));
     const offeredUsernames = offered.map((candidate) => candidate.username);
-    // The slice reflects the mind as it stood when the moment arrived; ingestion runs after, so a
+    // The slice reflects the mind as it stood when the moment arrived; observation runs after, so a
     // fact heard in this very event shows up in minds from the NEXT decision on, not this one.
     const mindContext = this.options.mind?.forEvent(event, offeredUsernames);
-    void this.options.mind?.ingestFromEvent(event, offeredUsernames)
-      .catch((cause: unknown) => this.logger.warn('Mind ingestion failed', { eventId: event.id, cause }));
+    // Observation is decoupled from the reaction shortlist on purpose: the shortlist decides who is
+    // offered the floor, not who was in the room. Every connected persona watches the stream, and a
+    // persona that says nothing all evening still hears the streamer say where he's moving. Whether
+    // any given persona actually takes something from this moment is the mind store's per-persona
+    // attention decision, not a fairness rotation.
+    const offeredSet = new Set(offeredUsernames.map((username) => username.toLowerCase()));
+    void this.options.mind?.observeEvent(event, eligibleCandidates.map((candidate) => candidate.username))
+      .then((stats) => this.accumulateObservation(stats, offeredSet))
+      .catch((cause: unknown) => this.logger.warn('Mind observation failed', { eventId: event.id, cause }));
     this.removePending(event.id);
     const timer = setTimeout(() => this.expirePending(event.id), this.contextTtlMs);
     this.pendingContexts.set(event.id, {
@@ -823,6 +982,9 @@ export class ReactionCoordinator extends EventEmitter {
       candidateCount: candidates.length,
       viewerByUsername,
       learnedRulesSupplied: learnedPolicy?.supplied ?? [],
+      // Filled below once the recalled memories are known — the pending object is held by
+      // reference, and the batch that reads this cannot arrive before this method returns.
+      provenancePools: new Map(),
     });
     this.options.usage.recordReactionContextPrepared();
     this.updateTrace(event.id, {
@@ -858,6 +1020,29 @@ export class ReactionCoordinator extends EventEmitter {
         .catch(() => []),
     ]);
 
+    // Freeze what each offered persona could actually ground a message in: its mind slice pools,
+    // the memories recalled for it in this very payload, its canonical expertise and opinions, and
+    // whether any chat arrived for a reply to answer. This is the evidence provenance validation
+    // will hold the Brain's source claims against when the batch comes back.
+    const pendingForPools = this.pendingContexts.get(event.id);
+    if (pendingForPools) {
+      const chatDeltaForPools = snapshot.recentChat.filter((message) => message.timestamp > chatAfter);
+      for (const candidate of offered) {
+        const recalled = recalledMemories.find((item) => item.username === candidate.username)?.memories ?? [];
+        const targeted = targetedPersonaContext.find((item) => item.username === candidate.username);
+        pendingForPools.provenancePools.set(candidate.username.toLowerCase(), {
+          mind: mindContext?.supplied[candidate.username] ?? emptySuppliedSources(),
+          memories: [
+            ...recalled.map((memory) => memory.summary),
+            ...(targeted?.relevantMemories ?? []).map((memory) => memory.summary),
+          ],
+          expertise: candidate.persona.knowledge.expertise,
+          opinions: candidate.persona.opinions.map((opinion) => `${opinion.topic}: ${opinion.stance}`),
+          hadRecentChat: chatDeltaForPools.length > 0,
+        });
+      }
+    }
+
     return {
       event,
       triggerKind: 'external_stream_event',
@@ -877,8 +1062,10 @@ export class ReactionCoordinator extends EventEmitter {
         }
         : {}),
       // Beside the learned rules and for the same reason: this is the material the style fields
-      // must not outrank — who these people are tonight, ahead of how they tend to sound.
-      ...(mindContext ? { mindContext } : {}),
+      // must not outrank — who these people are tonight, ahead of how they tend to sound. Only the
+      // written guidance travels: the supplied pools are the backend's validation evidence, and
+      // showing the model the answer key would let it cite sources it never actually used.
+      ...(mindContext ? { mindContext: { guidance: mindContext.guidance, byPersona: mindContext.byPersona } } : {}),
       availableBots: offered.map((candidate) => candidate.username),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
@@ -931,6 +1118,7 @@ export class ReactionCoordinator extends EventEmitter {
     usernames: string[],
     observed?: NaturalnessInput['event'],
     coldStartActive = false,
+    provenancePools?: Map<string, ProvenancePools>,
   ): string {
     const id = `persona-drive:${randomUUID()}`;
     const expiresAt = this.now() + this.contextTtlMs;
@@ -948,6 +1136,10 @@ export class ReactionCoordinator extends EventEmitter {
       // prepareBrainEvent, so nothing was attached here; recorded as empty rather than left
       // undefined so the decision log reads the same for both mechanisms.
       learnedRulesSupplied: [],
+      // The drive freezes its own pools because it builds its own payload; an absent map means
+      // every claim validates against nothing supplied, which is exactly right for a caller that
+      // supplied nothing.
+      provenancePools: provenancePools ?? new Map(),
     });
     return id;
   }
@@ -963,6 +1155,49 @@ export class ReactionCoordinator extends EventEmitter {
       this.recordSendFailure(triggerId(plan.trigger), plan.bot.username, 'coordinator_stopped');
     }
     this.timers.clear();
+  }
+
+  private accumulateObservation(stats: ObservationStats, offeredUsernames: ReadonlySet<string>): void {
+    const observation = this.session.observation;
+    observation.considered += stats.considered;
+    observation.observed += stats.observed;
+    observation.memoryWrites += stats.memoryWrites;
+    observation.knowledgeUpdates += stats.knowledgeUpdates;
+    observation.loopsResolved += stats.loopsResolved;
+    observation.observedButNotOffered += stats.observedUsernames
+      .filter((username) => !offeredUsernames.has(username.toLowerCase())).length;
+  }
+
+  private recordRejectedReaction(
+    pending: PendingContext, eventId: string, username: string, message: string, reason: string,
+  ): void {
+    if (!INSPECTABLE_REJECTION_REASONS.has(reason)) return;
+    this.rejectedLog.push({
+      id: randomUUID(),
+      at: this.now(),
+      eventId,
+      username,
+      message,
+      reason,
+      ...(pending.naturalnessEvent?.summary ? { eventSummary: pending.naturalnessEvent.summary } : {}),
+    });
+    if (this.rejectedLog.length > REJECTED_REACTION_LOG_LIMIT) {
+      this.rejectedLog.splice(0, this.rejectedLog.length - REJECTED_REACTION_LOG_LIMIT);
+    }
+  }
+
+  /** Newest first, for the dashboard: what the quality filters actually threw away. */
+  listRejectedReactions(): RejectedReactionRecord[] {
+    return [...this.rejectedLog].reverse().map((record) => ({ ...record }));
+  }
+
+  /** The operator read the text and disagreed with the filter. Kept on the record so a class that
+   *  keeps collecting these is visibly too wide. Returns false for an id that has scrolled away. */
+  markRejectedReactionFalsePositive(id: string, falsePositive = true): boolean {
+    const record = this.rejectedLog.find((item) => item.id === id);
+    if (!record) return false;
+    record.falsePositive = falsePositive;
+    return true;
   }
 
   private schedule(plan: PlannedReaction): void {

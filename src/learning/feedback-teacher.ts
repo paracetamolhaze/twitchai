@@ -4,6 +4,7 @@ import { BrainInteractionClient, BrainInteractionResponse } from '../brain/gemin
 import { Logger } from '../logger';
 import { MessageVerdictRecord } from '../personas/types';
 import { AppRepository } from '../persistence/repository';
+import { SentMessageMotiveRecord } from '../reaction/types';
 import { StreamEvent } from '../stream-brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
 import { LearnedPolicyStore } from './learned-policy-store';
@@ -108,6 +109,8 @@ Evidence can also go the other way. If cases contradict an existing rule — the
 
 Positive verdicts are evidence too, but liking one message is not a rule. Draw a positive principle only when several likes agree on something a naive reading would get wrong, or when they contradict a rule that is too broad.
 
+Some cases carry two extra fields. motive is the structured origin the message claimed when it was sent — what social act it performed and what in the account's own life it says it came from — with sourceValidated saying whether the backend confirmed that origin actually existed; a disliked message whose claimed source failed validation is usually a grounding problem, not a phrasing one. rulesSuppliedAtGeneration lists rules that were already in the model's prompt when the message was written: a bad verdict on such a case means the rule as worded did not prevent the mistake, so prefer sharpening or narrowing THAT rule over creating a parallel one that would sit beside it unread.
+
 When a case is ambiguous, the note is vague, or nothing repeats, answer NO_CHANGE. Creating a rule from noise costs more than missing one, because every rule you keep takes a slot in a real decision. Reference only the case ids you were given, never invent one, and never include private reasoning in a rule or rationale.`;
 
 /** Why a run did not finish, in terms an operator can act on. Never a stack trace. */
@@ -155,7 +158,7 @@ function topLevelKeys(text: string): string[] {
 export interface FeedbackTeacherOptions {
   client: BrainInteractionClient;
   model: string;
-  repository: Pick<AppRepository, 'listUnprocessedMessageVerdicts' | 'getStreamEvent' | 'listBotMessages'>;
+  repository: Pick<AppRepository, 'listUnprocessedMessageVerdicts' | 'getStreamEvent' | 'listBotMessages' | 'listSentMessageMotives'>;
   policyStore: LearnedPolicyStore;
   /** Interests/expertise/weakTopics for an account, from the live persona catalog. */
   personaProfile: (username: string) => { interests: string[]; expertise: string[]; weakTopics: string[] } | undefined;
@@ -518,6 +521,13 @@ export class FeedbackTeacher {
       .filter((message) => message.timestamp <= verdict.createdAt)
       .slice(-CHAT_CONTEXT_PER_CASE)
       .map(({ username, message, kind }) => ({ username, message, kind }));
+    const motiveRecord = await this.findMotiveRecord(verdict);
+    const suppliedRules = (motiveRecord?.learnedRuleIds ?? [])
+      .map((id) => {
+        const rule = this.options.policyStore.byId(id);
+        return rule ? { id, rule: rule.rule } : undefined;
+      })
+      .filter((entry): entry is { id: string; rule: string } => entry !== undefined);
     return {
       id: verdict.id,
       createdAt: verdict.createdAt,
@@ -529,7 +539,34 @@ export class FeedbackTeacher {
       ...(event ? { event: describeEvent(event) } : {}),
       ...(profile ? { persona: profile } : {}),
       recentChat: chat,
+      ...(motiveRecord
+        ? {
+          motive: {
+            motive: motiveRecord.motive,
+            sourceType: motiveRecord.sourceType,
+            sourceValidated: motiveRecord.sourceValidated,
+            ...(motiveRecord.sourceRef ? { sourceRef: motiveRecord.sourceRef } : {}),
+            ...(motiveRecord.validatedSourceType ? { validatedSourceType: motiveRecord.validatedSourceType } : {}),
+          },
+        }
+        : {}),
+      ...(suppliedRules.length > 0 ? { rulesSuppliedAtGeneration: suppliedRules } : {}),
     };
+  }
+
+  /**
+   * The motive log entry for exactly this sent message, matched by account and normalized text.
+   * The verdict stores no motive id — it is created from the dashboard against a chat line — so
+   * the join lives here, and an absent record simply means the case travels without a motive, as
+   * every case did before the log existed.
+   */
+  private async findMotiveRecord(verdict: MessageVerdictRecord): Promise<SentMessageMotiveRecord | undefined> {
+    const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
+    const records = await this.options.repository.listSentMessageMotives(500).catch(() => []);
+    return records.find((record) =>
+      record.username.toLowerCase() === verdict.username.toLowerCase()
+      && normalize(record.message) === normalize(verdict.message)
+      && record.createdAt <= verdict.createdAt);
   }
 }
 

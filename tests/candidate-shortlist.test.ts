@@ -57,6 +57,20 @@ describe('attentionFor', () => {
     const c = candidate('a');
     expect(attentionFor(c.persona, streamEvent({ summary: 'стример катает доту весь вечер' }))).toBe('no strong pattern');
   });
+
+  // Fixture C wiring: the canon writes "Dota 2", the stream says «доту», and before the shared
+  // topic registry this pair scored zero — on a Dota channel the channel's main subject counted as
+  // nobody's interest.
+  it('an interest written "Dota 2" notices a stream that says «доту»', () => {
+    const c = candidate('a', (p) => { p.interests.games = ['Dota 2']; });
+    expect(attentionFor(c.persona, streamEvent({ summary: 'стример решил катать доту весь вечер' }))).toBe('notices');
+  });
+
+  it('expertise written in Latin notices the Russian alias, and unrelated words stay unmatched', () => {
+    const c = candidate('a', (p) => { p.knowledge.expertise = ['dota']; });
+    expect(attentionFor(c.persona, streamEvent({ summary: 'в дотке сегодня жарко' }))).toBe('notices');
+    expect(attentionFor(c.persona, streamEvent({ summary: 'еле дотянул до конца недели' }))).toBe('no strong pattern');
+  });
 });
 
 describe('shortlistCandidates', () => {

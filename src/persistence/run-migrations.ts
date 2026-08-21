@@ -14,6 +14,7 @@ const MIGRATIONS = [
   '009_message_verdicts_event_id.sql',
   '010_learned_policy_rules.sql',
   '011_persona_minds.sql',
+  '012_sent_message_motives.sql',
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

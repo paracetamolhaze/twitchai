@@ -64,6 +64,18 @@ export interface FeedbackCase {
   };
   /** What chat looked like around the message, so "it repeated what was already said" is checkable. */
   recentChat: Array<{ username: string; message: string; kind: string }>;
+  /** The structured origin the message claimed when it was sent, and whether the backend could
+   *  confirm it — from the durable motive log, when a record for this exact message exists. */
+  motive?: {
+    motive: string;
+    sourceType: string;
+    sourceRef?: string;
+    sourceValidated: boolean;
+    validatedSourceType?: string;
+  };
+  /** Rules that were in the model's prompt when this message was generated — supplied, not obeyed.
+   *  A bad verdict here is evidence about the rule's wording, not about a missing rule. */
+  rulesSuppliedAtGeneration?: Array<{ id: string; rule: string }>;
 }
 
 /** One structured thing a Teacher run wants done. Never SQL, never free-form. */

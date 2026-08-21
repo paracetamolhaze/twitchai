@@ -11,6 +11,7 @@ import {
   PersonaMemoryItem,
   PersonaRelationship,
 } from '../personas/types';
+import { SentMessageMotiveRecord } from '../reaction/types';
 import { StreamEvent } from '../stream-brain/types';
 import { UsageSnapshot } from '../usage/usage-tracker';
 import {
@@ -421,6 +422,38 @@ export class PostgresRepository implements AppRepository {
       [limit],
     );
     return result.rows.map(toMessageVerdict);
+  }
+
+  async saveSentMessageMotive(record: SentMessageMotiveRecord): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO sent_message_motives (id, created_at, username, message, event_id, trigger_kind,
+         motive, source_type, source_ref, source_validated, validated_source_type, learned_rule_ids)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [record.id, new Date(record.createdAt), record.username, record.message, record.eventId,
+        record.triggerKind, record.motive, record.sourceType, record.sourceRef ?? null,
+        record.sourceValidated, record.validatedSourceType ?? null, JSON.stringify(record.learnedRuleIds)],
+    );
+  }
+
+  async listSentMessageMotives(limit: number): Promise<SentMessageMotiveRecord[]> {
+    const result = await this.pool.query<{
+      id: string; created_at: Date; username: string; message: string; event_id: string;
+      trigger_kind: SentMessageMotiveRecord['triggerKind']; motive: string; source_type: string;
+      source_ref: string | null; source_validated: boolean; validated_source_type: string | null;
+      learned_rule_ids: string[];
+    }>(
+      `SELECT id, created_at, username, message, event_id, trigger_kind, motive, source_type,
+              source_ref, source_validated, validated_source_type, learned_rule_ids
+       FROM sent_message_motives ORDER BY created_at DESC LIMIT $1`,
+      [limit],
+    );
+    return result.rows.map((row) => ({
+      id: row.id, createdAt: row.created_at.getTime(), username: row.username, message: row.message,
+      eventId: row.event_id, triggerKind: row.trigger_kind, motive: row.motive, sourceType: row.source_type,
+      sourceValidated: row.source_validated, learnedRuleIds: row.learned_rule_ids,
+      ...(row.source_ref ? { sourceRef: row.source_ref } : {}),
+      ...(row.validated_source_type ? { validatedSourceType: row.validated_source_type } : {}),
+    }));
   }
 
   async getStreamEvent(id: string): Promise<StreamEvent | undefined> {

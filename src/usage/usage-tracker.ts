@@ -134,6 +134,14 @@ export interface DriveUsageCounters {
   survivedNewerEvent: number;
   cancelledForCooldown: number;
   cancelledForNoCandidates: number;
+  /**
+   * Ticks skipped because no candidate carried an open curiosity, callback, or live concern —
+   * counted apart from localSkips so motive starvation is readable as its own number. High is not
+   * automatically wrong: "nobody has anything to say" is a valid state of a room. What it flags is
+   * a session where the drive never once found a motive, which points at the mind seeding or the
+   * retrieval thresholds rather than at the room.
+   */
+  noInternalMotive: number;
 }
 
 export interface CurrentStreamUsageSnapshot {
@@ -399,6 +407,7 @@ export class UsageTracker {
   recordDriveTick(): void { this.incrementDrive('ticks'); }
   recordDriveEligibleTick(): void { this.incrementDrive('eligibleTicks'); }
   recordDriveLocalSkip(): void { this.incrementDrive('localSkips'); }
+  recordDriveNoInternalMotive(): void { this.incrementDrive('noInternalMotive'); }
   recordDriveBrainCall(): void { this.incrementDrive('brainCalls'); }
   recordDriveBrainCallsBlockedByHourlyLimit(): void { this.incrementDrive('brainCallsBlockedByHourlyLimit'); }
   recordDriveSilentDecision(): void { this.incrementDrive('silentDecisions'); }
@@ -549,7 +558,7 @@ function emptyDriveCounters(): DriveUsageCounters {
     ticks: 0, eligibleTicks: 0, localSkips: 0, brainCalls: 0, brainCallsBlockedByHourlyLimit: 0,
     silentDecisions: 0, messages: 0, messagesBlockedByHourlyLimit: 0,
     cancelledForExternalEvent: 0, droppedExpired: 0, droppedDuplicate: 0, droppedSuperseded: 0,
-    survivedNewerEvent: 0, cancelledForCooldown: 0, cancelledForNoCandidates: 0,
+    survivedNewerEvent: 0, cancelledForCooldown: 0, cancelledForNoCandidates: 0, noInternalMotive: 0,
   };
 }
 

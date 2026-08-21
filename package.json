@@ -22,7 +22,8 @@
     "personas:audit": "tsx src/personas/audit-cli.ts",
     "db:import:legacy": "tsx src/persistence/import-legacy-config.ts",
     "railway:import:twitch-accounts": "node scripts/import-twitch-accounts.mjs",
-    "railway:migrate:variables": "node scripts/migrate-railway-variables.mjs"
+    "railway:migrate:variables": "node scripts/migrate-railway-variables.mjs",
+    "replay": "tsx src/tools/replay-cli.ts"
   },
   "dependencies": {
     "@google/genai": "^2.17.1",

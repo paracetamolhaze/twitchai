@@ -329,12 +329,12 @@ export const REACTION_MOTIVES = [
 
 export const REACTION_SOURCE_TYPES = [
   'knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life',
-  'expertise', 'event_emotion', 'chat', 'none',
+  'open_loop', 'expertise', 'event_emotion', 'chat', 'none',
 ] as const;
 
 /** Source types that mean the message came from somewhere inside this particular person. */
 export const PERSONAL_SOURCE_TYPES: ReadonlySet<string> = new Set([
-  'knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life', 'expertise', 'chat',
+  'knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life', 'open_loop', 'expertise', 'chat',
 ]);
 
 export interface BrainReaction {
