@@ -334,6 +334,9 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
         verdict: z.enum(['good', 'bad']),
         note: z.string().trim().max(400).optional(),
         eventSummary: z.string().trim().max(600).optional(),
+        // The canonical id of the sending being judged, read off the chat line. Optional in the
+        // schema only so a client that predates it still parses; the server records its absence.
+        reactionId: z.string().trim().min(1).max(100).optional(),
       }).strict().parse(request.body);
       await dependencies.rateMessage(body);
       return response.status(204).end();

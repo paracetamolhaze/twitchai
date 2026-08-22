@@ -551,3 +551,48 @@ describe('fixture I — a case carries what the model was already told', () => {
     expect(input.feedbackCases[0]).not.toHaveProperty('rulesSuppliedAtGeneration');
   });
 });
+
+describe('reaction id — the Teacher reads the motive of the sending that was judged', () => {
+  const T0 = 1_700_000_000_000;
+
+  it('same account, same text, two sendings: the verdict resolves through its reaction id, not the text', async () => {
+    const { teacher, repository, policyStore, requests } = await harness([
+      verdict({ id: 'v1', message: 'ахахах', createdAt: T0 + 20 * 60_000, reactionId: 'B', linkKind: 'exact' }),
+    ]);
+    await repository.applyLearnedPolicyBatch({
+      upserts: [{
+        id: 'rule-b', scopeType: 'global', scopeKey: '', rule: 'Rule that was in the prompt for B.',
+        rationale: 'operator feedback', confidence: 0.9, supportCount: 1, positiveEvidence: 0, negativeEvidence: 1,
+        status: 'active', teacherModel: 'test', evidenceIds: [], createdAt: T0, updatedAt: T0, version: 1,
+      }],
+      processedVerdictIds: [], processedAt: T0,
+    });
+    await policyStore.load();
+    // A, the newer text-identical sending, would win a text join. It must not.
+    await repository.saveSentMessageMotive({
+      id: 'B', createdAt: T0, username: 'griffin0502', message: 'ахахах', eventId: 'event-b', triggerKind: 'stream_event',
+      motive: 'tease', sourceType: 'relationship', sourceValidated: true, validatedSourceType: 'relationship', learnedRuleIds: ['rule-b'],
+    });
+    await repository.saveSentMessageMotive({
+      id: 'A', createdAt: T0 + 10 * 60_000, username: 'griffin0502', message: 'ахахах', eventId: 'event-a', triggerKind: 'stream_event',
+      motive: 'react', sourceType: 'event_emotion', sourceValidated: true, validatedSourceType: 'event_emotion', learnedRuleIds: [],
+    });
+    await teacher.runManually();
+    const input = JSON.parse(requests[0]!.input) as { feedbackCases: Array<Record<string, unknown>> };
+    expect(input.feedbackCases[0]!.motive).toMatchObject({ motive: 'tease', sourceType: 'relationship' });
+    expect(input.feedbackCases[0]!.rulesSuppliedAtGeneration).toEqual([{ id: 'rule-b', rule: 'Rule that was in the prompt for B.' }]);
+  });
+
+  it('a lost-id verdict travels without a motive even when the text would match', async () => {
+    const { teacher, repository, requests } = await harness([
+      verdict({ id: 'v1', message: 'ахахах', createdAt: T0 + 60_000, linkKind: 'lost' }),
+    ]);
+    await repository.saveSentMessageMotive({
+      id: 'A', createdAt: T0, username: 'griffin0502', message: 'ахахах', eventId: 'event-a', triggerKind: 'stream_event',
+      motive: 'react', sourceType: 'event_emotion', sourceValidated: true, validatedSourceType: 'event_emotion', learnedRuleIds: [],
+    });
+    await teacher.runManually();
+    const input = JSON.parse(requests[0]!.input) as { feedbackCases: Array<Record<string, unknown>> };
+    expect(input.feedbackCases[0]).not.toHaveProperty('motive');
+  });
+});

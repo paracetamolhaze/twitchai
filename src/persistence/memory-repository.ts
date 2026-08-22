@@ -221,6 +221,10 @@ export class MemoryRepository implements AppRepository {
   async listSentMessageMotives(limit: number): Promise<SentMessageMotiveRecord[]> {
     return [...this.sentMotives].sort((a, b) => b.createdAt - a.createdAt).slice(0, limit).map(clone);
   }
+  async getSentMessageMotive(reactionId: string): Promise<SentMessageMotiveRecord | undefined> {
+    const record = this.sentMotives.find((item) => item.id === reactionId);
+    return record ? clone(record) : undefined;
+  }
   async listPersonaMinds(): Promise<PersonaMindRecord[]> { return [...this.minds.values()].map(clone); }
   async savePersonaMind(record: PersonaMindRecord): Promise<void> { this.minds.set(record.personaId, clone(record)); }
   async deletePersonaMind(personaId: string): Promise<boolean> { return this.minds.delete(personaId); }

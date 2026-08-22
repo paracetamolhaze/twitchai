@@ -399,16 +399,19 @@ export class PostgresRepository implements AppRepository {
 
   async saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void> {
     await this.pool.query(
-      `INSERT INTO message_verdicts (id, created_at, username, message, verdict, note, event_summary, event_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      `INSERT INTO message_verdicts (id, created_at, username, message, verdict, note, event_summary, event_id,
+         reaction_id, link_kind)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [verdict.id, new Date(verdict.createdAt), verdict.username, verdict.message, verdict.verdict,
-        verdict.note ?? null, verdict.eventSummary ?? null, verdict.eventId ?? null],
+        verdict.note ?? null, verdict.eventSummary ?? null, verdict.eventId ?? null,
+        verdict.reactionId ?? null, verdict.linkKind ?? 'legacy'],
     );
   }
 
   async listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
     const result = await this.pool.query<MessageVerdictRow>(
-      `SELECT id, created_at, username, message, verdict, note, event_summary, event_id, processed_at
+      `SELECT id, created_at, username, message, verdict, note, event_summary, event_id, processed_at,
+              reaction_id, link_kind
        FROM message_verdicts ORDER BY created_at DESC LIMIT $1`,
       [limit],
     );
@@ -417,7 +420,8 @@ export class PostgresRepository implements AppRepository {
 
   async listUnprocessedMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
     const result = await this.pool.query<MessageVerdictRow>(
-      `SELECT id, created_at, username, message, verdict, note, event_summary, event_id, processed_at
+      `SELECT id, created_at, username, message, verdict, note, event_summary, event_id, processed_at,
+              reaction_id, link_kind
        FROM message_verdicts WHERE processed_at IS NULL ORDER BY created_at ASC LIMIT $1`,
       [limit],
     );
@@ -436,24 +440,24 @@ export class PostgresRepository implements AppRepository {
   }
 
   async listSentMessageMotives(limit: number): Promise<SentMessageMotiveRecord[]> {
-    const result = await this.pool.query<{
-      id: string; created_at: Date; username: string; message: string; event_id: string;
-      trigger_kind: SentMessageMotiveRecord['triggerKind']; motive: string; source_type: string;
-      source_ref: string | null; source_validated: boolean; validated_source_type: string | null;
-      learned_rule_ids: string[];
-    }>(
+    const result = await this.pool.query<SentMessageMotiveRow>(
       `SELECT id, created_at, username, message, event_id, trigger_kind, motive, source_type,
               source_ref, source_validated, validated_source_type, learned_rule_ids
        FROM sent_message_motives ORDER BY created_at DESC LIMIT $1`,
       [limit],
     );
-    return result.rows.map((row) => ({
-      id: row.id, createdAt: row.created_at.getTime(), username: row.username, message: row.message,
-      eventId: row.event_id, triggerKind: row.trigger_kind, motive: row.motive, sourceType: row.source_type,
-      sourceValidated: row.source_validated, learnedRuleIds: row.learned_rule_ids,
-      ...(row.source_ref ? { sourceRef: row.source_ref } : {}),
-      ...(row.validated_source_type ? { validatedSourceType: row.validated_source_type } : {}),
-    }));
+    return result.rows.map(toSentMessageMotive);
+  }
+
+  async getSentMessageMotive(reactionId: string): Promise<SentMessageMotiveRecord | undefined> {
+    const result = await this.pool.query<SentMessageMotiveRow>(
+      `SELECT id, created_at, username, message, event_id, trigger_kind, motive, source_type,
+              source_ref, source_validated, validated_source_type, learned_rule_ids
+       FROM sent_message_motives WHERE id=$1`,
+      [reactionId],
+    );
+    const row = result.rows[0];
+    return row ? toSentMessageMotive(row) : undefined;
   }
 
   async getStreamEvent(id: string): Promise<StreamEvent | undefined> {
@@ -876,9 +880,27 @@ function mapStreamerMemory(row: StreamerMemoryRow): StreamerMemory {
   };
 }
 
+interface SentMessageMotiveRow {
+  id: string; created_at: Date; username: string; message: string; event_id: string;
+  trigger_kind: SentMessageMotiveRecord['triggerKind']; motive: string; source_type: string;
+  source_ref: string | null; source_validated: boolean; validated_source_type: string | null;
+  learned_rule_ids: string[];
+}
+
+function toSentMessageMotive(row: SentMessageMotiveRow): SentMessageMotiveRecord {
+  return {
+    id: row.id, createdAt: row.created_at.getTime(), username: row.username, message: row.message,
+    eventId: row.event_id, triggerKind: row.trigger_kind, motive: row.motive, sourceType: row.source_type,
+    sourceValidated: row.source_validated, learnedRuleIds: row.learned_rule_ids,
+    ...(row.source_ref ? { sourceRef: row.source_ref } : {}),
+    ...(row.validated_source_type ? { validatedSourceType: row.validated_source_type } : {}),
+  };
+}
+
 interface MessageVerdictRow {
   id: string; created_at: Date; username: string; message: string; verdict: string;
   note: string | null; event_summary: string | null; event_id: string | null; processed_at: Date | null;
+  reaction_id: string | null; link_kind: string | null;
 }
 
 function toMessageVerdict(row: MessageVerdictRow): MessageVerdictRecord {
@@ -892,6 +914,8 @@ function toMessageVerdict(row: MessageVerdictRow): MessageVerdictRecord {
     ...(row.event_summary ? { eventSummary: row.event_summary } : {}),
     ...(row.event_id ? { eventId: row.event_id } : {}),
     ...(row.processed_at ? { processedAt: row.processed_at.getTime() } : {}),
+    ...(row.reaction_id ? { reactionId: row.reaction_id } : {}),
+    linkKind: row.link_kind === 'exact' || row.link_kind === 'lost' ? row.link_kind : 'legacy',
   };
 }
 

@@ -127,6 +127,8 @@ export interface AppRepository {
   /** Why each sent message existed — joined against verdicts to score motive quality over time. */
   saveSentMessageMotive(record: SentMessageMotiveRecord): Promise<void>;
   listSentMessageMotives(limit: number): Promise<SentMessageMotiveRecord[]>;
+  /** One motive record by its canonical reaction id — the exact join a verdict resolves through. */
+  getSentMessageMotive(reactionId: string): Promise<SentMessageMotiveRecord | undefined>;
   /** The dynamic half of each persona — see src/personas/persona-mind.ts for what a mind holds. */
   listPersonaMinds(): Promise<PersonaMindRecord[]>;
   savePersonaMind(record: PersonaMindRecord): Promise<void>;

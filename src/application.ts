@@ -529,8 +529,15 @@ export class Application {
       usage: () => this.usage.snapshot(),
       deliveryRecord: () => this.deliveryRecord.snapshot(),
       rateMessage: async (verdict) => {
-        const eventId = await this.resolveVerdictEventId(verdict.username, verdict.message);
-        await this.feedbackStore.record({ ...verdict, ...(eventId ? { eventId } : {}) });
+        // Exact by reaction id, which every bot line in the live feed carries since the id existed.
+        // A verdict without one is a `lost` link: written down as such and logged as the bug it is,
+        // never quietly repaired by matching text — that is what made the old analytics fiction.
+        const linkKind = verdict.reactionId ? 'exact' as const : 'lost' as const;
+        if (!verdict.reactionId) {
+          this.logger.warn('VERDICT_WITHOUT_REACTION_ID', { username: verdict.username, message: verdict.message });
+        }
+        const eventId = await this.resolveVerdictEventId(verdict.username, verdict.message, verdict.reactionId);
+        await this.feedbackStore.record({ ...verdict, linkKind, ...(eventId ? { eventId } : {}) });
         // The click is the only thing that ever produces new evidence, so it is also the only thing
         // worth checking on — a background timer would wake up every minute to find nothing changed.
         // Deliberately not awaited: a Teacher run takes seconds and the operator's button should not
@@ -1051,9 +1058,18 @@ export class Application {
    * when the message was autonomous (Persona Drive) or has already rotated out of BotHistory's own
    * bounded window.
    */
-  private async resolveVerdictEventId(username: string, message: string): Promise<string | undefined> {
-    const normalized = normalizeForLookup(message);
+  private async resolveVerdictEventId(username: string, message: string, reactionId?: string): Promise<string | undefined> {
     const history = await this.history.recent(username);
+    if (reactionId) {
+      // The bot_messages row carries the reaction id as its own id; the motive row is the durable
+      // copy for when the history window has already rotated.
+      const byId = history.find((record) => record.id === reactionId)?.eventId;
+      if (byId) return byId;
+      return (await this.repository.getSentMessageMotive(reactionId).catch(() => undefined))?.eventId;
+    }
+    // Legacy resolution for the event behind a message, kept for the Teacher's moment
+    // reconstruction only. Analytics never goes through here.
+    const normalized = normalizeForLookup(message);
     return history.find((record) => normalizeForLookup(record.message) === normalized)?.eventId;
   }
 
@@ -1156,12 +1172,17 @@ export class Application {
     this.transcriptAccumulator = '';
   }
 
-  private async handleChat(message: ChatMessage): Promise<void> {
+  private async handleChat(incoming: ChatMessage): Promise<void> {
+    // Twitch acknowledges nothing when a message is sent, so a message coming back through the
+    // reader account is the only evidence the channel actually showed it — and the moment the
+    // backend knows WHICH sending this line is. The id rides on the chat line from here to the
+    // dashboard and back in the operator's verdict.
+    const reactionId = incoming.kind === 'bot'
+      ? this.coordinator.confirmDelivery(incoming.username, incoming.message)
+      : undefined;
+    const message: ChatMessage = reactionId ? { ...incoming, reactionId } : incoming;
     this.contextStore.addChat(message);
     this.api.emitChat(message);
-    // Twitch acknowledges nothing when a message is sent, so a message coming back through the
-    // reader account is the only evidence the channel actually showed it.
-    if (message.kind === 'bot') this.coordinator.confirmDelivery(message.username, message.message);
     if (message.kind !== 'viewer') {
       this.memory.recordChat(message);
       return;

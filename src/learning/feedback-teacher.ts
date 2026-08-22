@@ -8,6 +8,7 @@ import { SentMessageMotiveRecord } from '../reaction/types';
 import { StreamEvent } from '../stream-brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
 import { LearnedPolicyStore } from './learned-policy-store';
+import { resolveVerdictLink } from './motive-analytics';
 import {
   FeedbackCase,
   LearnedPolicyRule,
@@ -158,7 +159,7 @@ function topLevelKeys(text: string): string[] {
 export interface FeedbackTeacherOptions {
   client: BrainInteractionClient;
   model: string;
-  repository: Pick<AppRepository, 'listUnprocessedMessageVerdicts' | 'getStreamEvent' | 'listBotMessages' | 'listSentMessageMotives'>;
+  repository: Pick<AppRepository, 'listUnprocessedMessageVerdicts' | 'getStreamEvent' | 'listBotMessages' | 'listSentMessageMotives' | 'getSentMessageMotive'>;
   policyStore: LearnedPolicyStore;
   /** Interests/expertise/weakTopics for an account, from the live persona catalog. */
   personaProfile: (username: string) => { interests: string[]; expertise: string[]; weakTopics: string[] } | undefined;
@@ -555,18 +556,18 @@ export class FeedbackTeacher {
   }
 
   /**
-   * The motive log entry for exactly this sent message, matched by account and normalized text.
-   * The verdict stores no motive id — it is created from the dashboard against a chat line — so
-   * the join lives here, and an absent record simply means the case travels without a motive, as
-   * every case did before the log existed.
+   * The motive log entry for exactly the sending this verdict judges: by reaction id when the
+   * verdict carries one (every verdict written since ids existed), and for pre-id verdicts only
+   * through the same bounded, unambiguous text+time rule the analytics use. A verdict that should
+   * have had an id and does not travels without a motive rather than with a guessed one.
    */
   private async findMotiveRecord(verdict: MessageVerdictRecord): Promise<SentMessageMotiveRecord | undefined> {
-    const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (verdict.reactionId) {
+      return this.options.repository.getSentMessageMotive(verdict.reactionId).catch(() => undefined);
+    }
+    if (verdict.linkKind === 'lost') return undefined;
     const records = await this.options.repository.listSentMessageMotives(500).catch(() => []);
-    return records.find((record) =>
-      record.username.toLowerCase() === verdict.username.toLowerCase()
-      && normalize(record.message) === normalize(verdict.message)
-      && record.createdAt <= verdict.createdAt);
+    return resolveVerdictLink(verdict, records).motive;
   }
 }
 

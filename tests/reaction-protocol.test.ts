@@ -89,6 +89,7 @@ async function setup(
   });
   let messageSentCalls = 0;
   const sent: Array<{ username: string; message: string }> = [];
+  const motives: SentMessageMotiveRecord[] = [];
   const usage = new UsageTracker();
   const globalMemory = new GlobalStreamerMemory({ repository, usage, now });
   await globalMemory.startOrResumeSession({ channel: 'streamer', initialCategory: 'Dota 2' });
@@ -108,6 +109,8 @@ async function setup(
     ...(mind ? { mind } : {}),
     coldStart,
     onMessageSent: () => { messageSentCalls += 1; },
+    // Wired the way the application wires it: the durable motive row, written fire-and-forget.
+    motiveLog: (record) => { motives.push(record); void repository.saveSentMessageMotive(record); },
     sender: {
       send: async (username, message) => {
         sent.push({ username, message });
@@ -134,7 +137,7 @@ async function setup(
     now,
   });
   return {
-    coordinator, globalMemory, history, policy, sent, usage, personaMemory,
+    coordinator, globalMemory, history, policy, sent, usage, personaMemory, repository, motives,
     logged: () => written,
     setColdStart: (value: boolean) => { coldStartActive = value; },
     messageSentCalls: () => messageSentCalls,
@@ -1570,6 +1573,111 @@ describe('cold-start bookkeeping against a real StreamSession clock', () => {
     expect(sent).toEqual([]);
     expect(streamSession.snapshot()?.hasSentAiMessage).toBe(false);
     expect(streamSession.isStrictColdStart()).toBe(true);
+    await coordinator.stop();
+  });
+});
+
+describe('durable reaction id — one generated reaction, one stable id, end to end', () => {
+  it('mints the id on intake and carries it to the history row, the motive row, the echo and the batch result', async () => {
+    vi.useFakeTimers();
+    const { coordinator, history, repository, motives, setObservesChat } = await setup();
+    setObservesChat(true);
+    const traces: Array<{ reactions: Array<{ reactionId?: string }> }> = [];
+    coordinator.on('trace', (record: { reactions: Array<{ reactionId?: string }> }) => traces.push(record));
+    await coordinator.prepareBrainEvent(event, 0);
+    const result = await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }],
+    });
+    const reactionId = result.accepted[0]?.reactionId;
+    expect(reactionId).toMatch(/^[0-9a-f-]{36}$/);
+    await vi.runOnlyPendingTimersAsync();
+
+    // The bot_messages row IS the reaction — same id, not a second identity.
+    const historyRecord = (await history.recent('bot-three')).find((record) => record.message === 'это был ульт в параллельную вселенную');
+    expect(historyRecord?.id).toBe(reactionId);
+    // The motive row too, durably.
+    expect(motives[0]?.id).toBe(reactionId);
+    expect((await repository.getSentMessageMotive(reactionId!))?.eventId).toBe(event.id);
+    // The echo from the reader account hands the id back, so the chat line can carry it.
+    expect(coordinator.confirmDelivery('bot-three', '  это был ульт  в параллельную вселенную ')).toBe(reactionId);
+    // And the trace for the dashboard history names the same sending.
+    expect(traces.at(-1)?.reactions[0]?.reactionId).toBe(reactionId);
+    await coordinator.stop();
+  });
+
+  it('two reactions with different texts from one account get two different ids', async () => {
+    vi.useFakeTimers();
+    const { coordinator } = await setup();
+    await coordinator.prepareBrainEvent(event, 0);
+    const result = await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [
+        { username: 'bot-one', message: 'ну и момент' },
+        { username: 'bot-two', message: 'ахахах' },
+      ],
+    });
+    const ids = result.accepted.map((item) => item.reactionId);
+    expect(new Set(ids).size).toBe(2);
+    await coordinator.stop();
+  });
+
+  it('survives a restart: a fresh history over the same repository yields the same id', async () => {
+    vi.useFakeTimers();
+    const { coordinator, repository } = await setup();
+    await coordinator.prepareBrainEvent(event, 0);
+    const result = await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+    });
+    await vi.runOnlyPendingTimersAsync();
+    const reactionId = result.accepted[0]!.reactionId;
+    const reloaded = new BotHistory(repository);
+    expect((await reloaded.recent('bot-three')).map((record) => record.id)).toContain(reactionId);
+    // A verdict written against that id round-trips through storage with its link kind intact.
+    await repository.saveMessageVerdict({
+      id: 'v1', createdAt: event.timestamp + 1_000, username: 'bot-three',
+      message: 'это был ульт в параллельную вселенную', verdict: 'good', reactionId, linkKind: 'exact',
+    });
+    expect((await repository.listMessageVerdicts(10))[0]).toMatchObject({ reactionId, linkKind: 'exact' });
+    await coordinator.stop();
+  });
+
+  it('attributes an echo that arrives after the delivery window, once, through the bounded recent-sends memory', async () => {
+    vi.useFakeTimers();
+    const { coordinator, setObservesChat } = await setup();
+    setObservesChat(true);
+    await coordinator.prepareBrainEvent(event, 0);
+    const result = await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+    });
+    await vi.runOnlyPendingTimersAsync();
+    // Past the 10s echo window: the delivery is already marked undelivered...
+    await vi.advanceTimersByTimeAsync(15_000);
+    // ...yet the late echo still names the sending it was — exactly once.
+    expect(coordinator.confirmDelivery('bot-three', 'это был ульт в параллельную вселенную')).toBe(result.accepted[0]!.reactionId);
+    expect(coordinator.confirmDelivery('bot-three', 'это был ульт в параллельную вселенную')).toBeUndefined();
+    await coordinator.stop();
+  });
+
+  it('a rejected reaction keeps the id it was minted with in the operator\'s inspection log', async () => {
+    const mindStore = await (async () => {
+      const repository = new MemoryRepository();
+      await repository.initialize();
+      const store = new PersonaMindStore(repository, new Logger('TEST', 'error'), () => event.timestamp);
+      await store.load();
+      return store;
+    })();
+    const { coordinator } = await setup(true, () => event.timestamp, false, undefined, undefined, mindStore);
+    await coordinator.prepareBrainEvent(event, 0);
+    await coordinator.submitBatch({
+      eventId: event.id,
+      reactions: [{ username: 'bot-one', message: 'а сколько там аренда?', motive: 'ask', sourceType: 'memory', sourceRef: 'аренда' }],
+    });
+    const rejected = coordinator.listRejectedReactions()[0];
+    expect(rejected?.reason).toBe('invalid_motive_source');
+    expect(rejected?.id).toMatch(/^[0-9a-f-]{36}$/);
     await coordinator.stop();
   });
 });

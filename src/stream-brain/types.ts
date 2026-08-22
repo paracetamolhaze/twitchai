@@ -74,12 +74,19 @@ export interface StreamEvent {
 }
 
 export interface ChatMessage {
+  /** Twitch's own message id from the IRC tags — not ours, and not stable across what we sent. */
   id: string;
   timestamp: number;
   username: string;
   displayName: string;
   message: string;
   kind: 'viewer' | 'bot' | 'system';
+  /**
+   * For a bot line: the canonical id of the generated reaction this echo confirmed, attached when
+   * the reader account saw it come back. It is what the dashboard's like/dislike sends, so a verdict
+   * names one specific sending rather than "some message with this text".
+   */
+  reactionId?: string;
 }
 
 /** One transcribed utterance, as words rather than as perception's description of them. */

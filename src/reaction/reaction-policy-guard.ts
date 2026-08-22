@@ -147,6 +147,9 @@ export class ReactionPolicyGuard {
       const delayMs = accepted.length * this.batchStaggerMs;
       this.reservations.set(reservationId, { username, scheduledAt: now + delayMs });
       accepted.push({
+        // Passed through, never minted here: the coordinator assigns the id on intake so the same
+        // value reaches every layer. The fallback exists only for direct callers in tests.
+        reactionId: submitted.reactionId ?? randomUUID(),
         reservationId,
         trigger: input.trigger,
         bot: candidate,

@@ -33,6 +33,13 @@ export function triggerDirectMentions(trigger: ReactionTrigger): string[] {
 }
 
 export interface PlannedReaction {
+  /**
+   * The canonical identity of this generated reaction, minted once in ReactionCoordinator.submitBatch
+   * and carried unchanged to the bot_messages row, the sent_message_motives row, the chat echo, the
+   * dashboard and the operator's verdict. ONE GENERATED REACTION = ONE STABLE ID; no layer below
+   * this mints its own.
+   */
+  reactionId: string;
   reservationId: string;
   trigger: ReactionTrigger;
   bot: ReactionBotCandidate;
@@ -43,6 +50,8 @@ export interface PlannedReaction {
 }
 
 export interface SubmittedReaction {
+  /** Assigned by the coordinator on intake; callers (Brain path, Persona Drive) never supply it. */
+  reactionId?: string;
   username: string;
   message: string;
   /** Why the message exists, as the Brain reported it — carried through for the audit trail only. */
@@ -96,7 +105,7 @@ export interface ReactionRejection {
 
 export interface ReactionBatchResult {
   eventId: string;
-  accepted: Array<{ username: string; delayMs: number }>;
+  accepted: Array<{ username: string; delayMs: number; reactionId: string }>;
   rejected: ReactionRejection[];
   stale?: boolean;
 }
@@ -104,7 +113,7 @@ export interface ReactionBatchResult {
 export interface ReactionDecisionRecord {
   eventId: string;
   timestamp: number;
-  selected: Array<{ username: string; message: string; delayMs: number }>;
+  selected: Array<{ username: string; message: string; delayMs: number; reactionId: string }>;
   rejected: ReactionRejection[];
   candidateCount: number;
   silentCandidateCount: number;
@@ -172,6 +181,8 @@ export interface ReactionTraceTiming {
 export interface ReactionTraceReaction {
   username: string;
   message: string;
+  /** Optional only for traces recorded before the id existed; every new trace carries it. */
+  reactionId?: string;
   artificialDelayMs: number;
   /**
    * UNDELIVERED means Twitch accepted the write but the message never came back through the reader

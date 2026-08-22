@@ -316,3 +316,31 @@ describe('motive analytics and rejected reactions', () => {
       .set('Authorization', `Bearer ${token}`).send({}).expect(404);
   });
 });
+
+describe('message verdicts carry the reaction id', () => {
+  it('passes reactionId through to the verdict sink, and still accepts a client that sends none', async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const app = server(undefined, { rateMessage: async (verdict) => { received.push({ ...verdict }); } }).app;
+    await request(app).post('/api/message-verdicts').set('Authorization', `Bearer ${token}`)
+      .send({ username: 'bot', message: 'ахахах', verdict: 'good', reactionId: 'reaction-1' }).expect(204);
+    await request(app).post('/api/message-verdicts').set('Authorization', `Bearer ${token}`)
+      .send({ username: 'bot', message: 'ахахах', verdict: 'bad' }).expect(204);
+    expect(received[0]).toMatchObject({ username: 'bot', verdict: 'good', reactionId: 'reaction-1' });
+    expect(received[1]).not.toHaveProperty('reactionId');
+  });
+
+  it('exposes the link-quality fields the dashboard reads', async () => {
+    const app = server(undefined, {
+      motiveAnalytics: async () => ({
+        totalSent: 2, totalJudged: 1,
+        bySourceType: [],
+        personalSourceApprovalRate: 1, genericEventOnlyApprovalRate: null,
+        includingLegacy: { personalSourceApprovalRate: 1, genericEventOnlyApprovalRate: 0, totalJudged: 2 },
+        linkQuality: { exactIdMatches: 1, legacyFallbackMatches: 1, legacyAmbiguous: 0, unmatchedVerdicts: 0, lostIdVerdicts: 0 },
+      }),
+    }).app;
+    const response = await request(app).get('/api/motive-analytics').set('Authorization', `Bearer ${token}`).expect(200);
+    expect(response.body.linkQuality.exactIdMatches).toBe(1);
+    expect(response.body.includingLegacy.totalJudged).toBe(2);
+  });
+});

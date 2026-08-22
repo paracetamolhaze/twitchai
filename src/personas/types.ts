@@ -365,6 +365,20 @@ export interface MessageVerdictRecord {
    */
   eventId?: string;
   /**
+   * The canonical id of the generated reaction this verdict judges — the same value as the
+   * bot_messages row and the sent_message_motives row. This, not the text, is what analytics and
+   * the Teacher join on. Absent on rows written before the id existed, and on the (logged) bug
+   * case where a new bot line reached the dashboard without one.
+   */
+  reactionId?: string;
+  /**
+   * How this verdict can be tied to a sent message. `exact`: by reactionId. `legacy`: written
+   * before reaction ids existed — may be recovered by a bounded text+time fallback, or not at all.
+   * `lost`: written after ids existed but without one, which is a bug and is never text-matched.
+   * Absent in memory means legacy (rows predating this field).
+   */
+  linkKind?: 'exact' | 'legacy' | 'lost';
+  /**
    * When a Teacher run last read this verdict as new evidence. Absent means it is still pending,
    * which is what the dashboard shows the operator: a click that has been stored is a different
    * thing from a click that has been generalized into a rule, and only the second one can change

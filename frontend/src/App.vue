@@ -132,6 +132,8 @@ interface ChatMessage {
   displayName: string
   message: string
   kind: 'viewer' | 'bot' | 'system'
+  /** The canonical id of the sending behind a bot line; what a verdict names. */
+  reactionId?: string
 }
 interface Usage {
   uptimeSeconds: number
@@ -777,12 +779,19 @@ const deliveryRecord = ref<DeliveryRecordSnapshot | undefined>()
 interface MessageVerdict {
   id: string; createdAt: number; username: string; message: string
   verdict: 'good' | 'bad'; note?: string; eventSummary?: string; processedAt?: number
+  reactionId?: string; linkKind?: 'exact' | 'legacy' | 'lost'
 }
 const messageVerdicts = ref<MessageVerdict[]>([])
 const verdictBusy = ref(false)
 
 function verdictRecordFor(message: ChatMessage): MessageVerdict | undefined {
-  return messageVerdicts.value.find((item) => item.message === message.message
+  // By the sending's own id wherever both sides have one; the text comparison remains only so
+  // verdicts written before ids existed still show their state next to the line.
+  if (message.reactionId) {
+    const exact = messageVerdicts.value.find((item) => item.reactionId === message.reactionId)
+    if (exact) return exact
+  }
+  return messageVerdicts.value.find((item) => !item.reactionId && item.message === message.message
     && item.username.toLowerCase() === message.username.toLowerCase())
 }
 
@@ -904,6 +913,8 @@ interface MotiveAnalytics {
   bySourceType: Array<{ sourceType: string; sent: number; judged: number; approved: number; approvalRate: number | null }>
   personalSourceApprovalRate: number | null
   genericEventOnlyApprovalRate: number | null
+  includingLegacy: { personalSourceApprovalRate: number | null; genericEventOnlyApprovalRate: number | null; totalJudged: number }
+  linkQuality: { exactIdMatches: number; legacyFallbackMatches: number; legacyAmbiguous: number; unmatchedVerdicts: number; lostIdVerdicts: number }
 }
 interface RejectedReaction {
   id: string
@@ -1065,6 +1076,7 @@ async function rateMessage(message: ChatMessage, verdict: 'good' | 'bad'): Promi
         message: message.message,
         verdict,
         ...(note ? { note } : {}),
+        ...(message.reactionId ? { reactionId: message.reactionId } : {}),
       }),
     })
     await refreshVerdicts()
@@ -2136,6 +2148,10 @@ onBeforeUnmount(() => {
             <p>
               <strong>Из личного источника: {{ approvalPercent(motiveAnalytics.personalSourceApprovalRate) }} одобрения</strong>
               <span class="muted"> · без личного повода: {{ approvalPercent(motiveAnalytics.genericEventOnlyApprovalRate) }} одобрения · оценено {{ motiveAnalytics.totalJudged }} из {{ motiveAnalytics.totalSent }} записанных сообщений</span>
+            </p>
+            <p class="muted">
+              Точные связи: {{ motiveAnalytics.linkQuality.exactIdMatches }} · Старые восстановленные: {{ motiveAnalytics.linkQuality.legacyFallbackMatches }} · Неоднозначные: {{ motiveAnalytics.linkQuality.legacyAmbiguous }} · Без связи: {{ motiveAnalytics.linkQuality.unmatchedVerdicts }}<template v-if="motiveAnalytics.linkQuality.lostIdVerdicts"> · Без id (ошибка): {{ motiveAnalytics.linkQuality.lostIdVerdicts }}</template>
+              <template v-if="motiveAnalytics.includingLegacy.totalJudged !== motiveAnalytics.totalJudged"> · со старыми: личный {{ approvalPercent(motiveAnalytics.includingLegacy.personalSourceApprovalRate) }} / без повода {{ approvalPercent(motiveAnalytics.includingLegacy.genericEventOnlyApprovalRate) }}</template>
             </p>
             <p v-for="row in motiveAnalytics.bySourceType" :key="row.sourceType" class="muted mind-motive">
               {{ SOURCE_TYPE_RU[row.sourceType] ?? row.sourceType }}: отправлено {{ row.sent }}<template v-if="row.judged"> · оценено {{ row.judged }} · одобрено {{ approvalPercent(row.approvalRate) }}</template>

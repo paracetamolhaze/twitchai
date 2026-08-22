@@ -103,9 +103,25 @@ export interface ReactionCoordinatorOptions {
 interface PendingDelivery {
   eventId: string;
   username: string;
+  reactionId: string;
   sentAt: number;
   timer: NodeJS.Timeout;
 }
+
+/**
+ * A sent reaction remembered past its echo window, so an echo that arrives late — Twitch under
+ * load, a reconnecting reader — can still be attributed to the one sending it belongs to. Bounded
+ * by time and by count, consumed on attribution, and refused when two unconsumed sends share the
+ * same text: attributing the wrong one would be worse than attributing none.
+ */
+interface RecentSend {
+  reactionId: string;
+  key: string;
+  sentAt: number;
+  attributed: boolean;
+}
+const RECENT_SEND_WINDOW_MS = 5 * 60_000;
+const RECENT_SEND_LIMIT = 200;
 
 /** Normalized so an echo differing only in whitespace still counts as the same message. */
 function deliveryKey(username: string, message: string): string {
@@ -336,6 +352,7 @@ export class ReactionCoordinator extends EventEmitter {
   private session = emptySessionStats();
   /** Ring buffer of quality-filtered reactions, newest last. Session-scoped, capped, in-memory. */
   private readonly rejectedLog: RejectedReactionRecord[] = [];
+  private readonly recentSends: RecentSend[] = [];
   private stopped = false;
 
   constructor(private readonly options: ReactionCoordinatorOptions) {
@@ -352,7 +369,10 @@ export class ReactionCoordinator extends EventEmitter {
     const reactions: SubmittedReaction[] = [];
     for (const [index, raw] of envelope.reactions.entries()) {
       const parsedItem = reactionItemSchema.safeParse(raw);
-      if (parsedItem.success) reactions.push(parsedItem.data);
+      // The one place a reaction id is minted. Everything downstream — the rejected-reactions log,
+      // the plan, the bot_messages row, the motive row, the chat echo, the operator's verdict —
+      // carries this value rather than an identity of its own.
+      if (parsedItem.success) reactions.push({ ...parsedItem.data, reactionId: randomUUID() });
       else itemRejections.push({ username: rawUsername(raw, index), reason: 'invalid_item' });
     }
     const parsed: ReactionBatch = { eventId: envelope.eventId, reactions };
@@ -418,7 +438,7 @@ export class ReactionCoordinator extends EventEmitter {
         const username = reaction.username.trim().toLowerCase();
         naturalnessRejections.push({ username, reason: verdict.reason! });
         this.session.naturalnessRejected[verdict.reason!] += 1;
-        this.recordRejectedReaction(pending, parsed.eventId, username, reaction.message, verdict.reason!);
+        this.recordRejectedReaction(pending, parsed.eventId, reaction, verdict.reason!);
         this.logger.info('Reaction dropped as commentary rather than reaction', {
           eventId: parsed.eventId, bot: username, reason: verdict.reason, text: reaction.message,
         });
@@ -450,7 +470,7 @@ export class ReactionCoordinator extends EventEmitter {
       provenanceRejections.push({ username, reason: 'invalid_motive_source' });
       this.session.motives.invalidSourceRejected += 1;
       this.options.usage.recordGuardRejection();
-      this.recordRejectedReaction(pending, parsed.eventId, username, reaction.message, 'invalid_motive_source');
+      this.recordRejectedReaction(pending, parsed.eventId, reaction, 'invalid_motive_source');
       this.logger.warn('Reaction rejected: claimed source was never supplied', {
         eventId: parsed.eventId, bot: username, text: reaction.message,
         claimedSourceType: reaction.sourceType, claimedSourceRef: reaction.sourceRef,
@@ -473,10 +493,8 @@ export class ReactionCoordinator extends EventEmitter {
     const submittedByUser = new Map(parsed.reactions.map((item) => [item.username.trim().toLowerCase(), item]));
     for (const rejection of result.rejected) {
       this.options.usage.recordGuardRejection();
-      const submittedText = submittedByUser.get(rejection.username)?.message;
-      if (submittedText !== undefined) {
-        this.recordRejectedReaction(pending, parsed.eventId, rejection.username, submittedText, rejection.reason);
-      }
+      const submitted = submittedByUser.get(rejection.username);
+      if (submitted) this.recordRejectedReaction(pending, parsed.eventId, submitted, rejection.reason);
       this.logger.warn('Gemini reaction rejected by policy', { eventId: parsed.eventId, bot: rejection.username, reason: rejection.reason });
     }
     const policyCompletedAt = result.accepted.length === 0 ? this.now() : undefined;
@@ -487,6 +505,7 @@ export class ReactionCoordinator extends EventEmitter {
       reactions: result.accepted.map((plan) => ({
         username: plan.bot.username,
         message: plan.message,
+        reactionId: plan.reactionId,
         artificialDelayMs: plan.delayMs,
         status: 'ACCEPTED' as const,
         selectedAt: decisionAt,
@@ -535,7 +554,8 @@ export class ReactionCoordinator extends EventEmitter {
         ...(verdict ? { validationReason: verdict.validationReason } : {}),
       });
       this.options.motiveLog?.({
-        id: randomUUID(),
+        // The motive row's id IS the reaction id: one identity, not a second one to join back.
+        id: plan.reactionId,
         createdAt: decisionAt,
         username: plan.bot.username,
         message: plan.message,
@@ -550,7 +570,9 @@ export class ReactionCoordinator extends EventEmitter {
     const decision: ReactionDecisionRecord = {
       eventId: parsed.eventId,
       timestamp: decisionAt,
-      selected: result.accepted.map((plan) => ({ username: plan.bot.username, message: plan.message, delayMs: plan.delayMs })),
+      selected: result.accepted.map((plan) => ({
+        username: plan.bot.username, message: plan.message, delayMs: plan.delayMs, reactionId: plan.reactionId,
+      })),
       rejected: allRejections,
       candidateCount: pending.candidateCount,
       silentCandidateCount: Math.max(0, pending.candidateCount - parsed.reactions.length),
@@ -559,7 +581,7 @@ export class ReactionCoordinator extends EventEmitter {
     this.logDecision(pending, decision, sentMotives);
     return {
       eventId: parsed.eventId,
-      accepted: result.accepted.map((plan) => ({ username: plan.bot.username, delayMs: plan.delayMs })),
+      accepted: result.accepted.map((plan) => ({ username: plan.bot.username, delayMs: plan.delayMs, reactionId: plan.reactionId })),
       rejected: allRejections,
     };
   }
@@ -1169,15 +1191,17 @@ export class ReactionCoordinator extends EventEmitter {
   }
 
   private recordRejectedReaction(
-    pending: PendingContext, eventId: string, username: string, message: string, reason: string,
+    pending: PendingContext, eventId: string, reaction: SubmittedReaction, reason: string,
   ): void {
     if (!INSPECTABLE_REJECTION_REASONS.has(reason)) return;
     this.rejectedLog.push({
-      id: randomUUID(),
+      // A rejected reaction keeps the id it was minted with — the same value a log line about its
+      // rejection already carries — rather than a new one for the operator's list.
+      id: reaction.reactionId ?? randomUUID(),
       at: this.now(),
       eventId,
-      username,
-      message,
+      username: reaction.username.trim().toLowerCase(),
+      message: reaction.message,
       reason,
       ...(pending.naturalnessEvent?.summary ? { eventSummary: pending.naturalnessEvent.summary } : {}),
     });
@@ -1268,13 +1292,16 @@ export class ReactionCoordinator extends EventEmitter {
         this.session.coldStart.firstAiMessageAgeMs = coldStartBeforeSend.ageMs;
       }
       this.recordSendSuccess(eventId, current.username, sentAt);
-      this.awaitDeliveryEcho(eventId, current.username, plan.message, sentAt);
-      this.logger.info('Bot reaction submitted to Twitch', { bot: current.username, eventId, text: plan.message });
+      this.rememberSend(plan.reactionId, current.username, plan.message, sentAt);
+      this.awaitDeliveryEcho(eventId, current.username, plan.reactionId, plan.message, sentAt);
+      this.logger.info('Bot reaction submitted to Twitch', {
+        bot: current.username, eventId, reactionId: plan.reactionId, text: plan.message,
+      });
       try {
         this.options.policy.recordSent(sentAt, plan.reservationId);
         this.options.usage.recordSentResponse();
         this.options.personaRuntime.recordSent(current.persona.id);
-        await this.options.history.add(current.username, plan.message, eventId);
+        await this.options.history.add(current.username, plan.message, eventId, sentAt, plan.reactionId);
         if (plan.viewerUsername) {
           await this.options.personaMemory.addConversation({
             personaId: current.persona.id,
@@ -1309,7 +1336,7 @@ export class ReactionCoordinator extends EventEmitter {
    * Known blind spot: for the reader account's own messages tmi.js emits the echo locally rather
    * than receiving it from Twitch, so those confirm even if Twitch dropped them.
    */
-  private awaitDeliveryEcho(eventId: string, username: string, message: string, sentAt: number): void {
+  private awaitDeliveryEcho(eventId: string, username: string, reactionId: string, message: string, sentAt: number): void {
     if (!this.options.observesChat?.()) return;
     const key = deliveryKey(username, message);
     const existing = this.pendingDeliveries.get(key);
@@ -1325,24 +1352,58 @@ export class ReactionCoordinator extends EventEmitter {
     }, this.deliveryEchoTimeoutMs);
     timer.unref?.();
     this.options.onDelivery?.({ username, result: 'sent' });
-    this.pendingDeliveries.set(key, { eventId, username, timer, sentAt });
+    this.pendingDeliveries.set(key, { eventId, username, reactionId, timer, sentAt });
+  }
+
+  private rememberSend(reactionId: string, username: string, message: string, sentAt: number): void {
+    this.recentSends.push({ reactionId, key: deliveryKey(username, message), sentAt, attributed: false });
+    if (this.recentSends.length > RECENT_SEND_LIMIT) {
+      this.recentSends.splice(0, this.recentSends.length - RECENT_SEND_LIMIT);
+    }
   }
 
   /**
    * Called for every chat message the reader account observes. A match retires the pending
    * delivery, which is what turns "we wrote it to the socket" into "the channel actually shows it".
+   *
+   * Returns the canonical id of the reaction this echo confirmed, so the chat line the dashboard
+   * shows carries the identity of the sending it is — the link that lets an operator's verdict name
+   * one specific message instead of "some message with this text". An echo that arrives after the
+   * delivery window is attributed through the bounded recent-sends memory, and only when exactly
+   * one unconsumed sending matches; undefined otherwise, never a guess.
    */
-  confirmDelivery(username: string, message: string): void {
+  confirmDelivery(username: string, message: string): string | undefined {
     const key = deliveryKey(username, message);
     const pending = this.pendingDeliveries.get(key);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    this.pendingDeliveries.delete(key);
-    this.options.usage.recordConfirmedDelivery();
-    this.options.onDelivery?.({ username, result: 'shown' });
-    this.logger.info('Reaction confirmed visible in Twitch chat', {
-      bot: username, eventId: pending.eventId, roundTripMs: this.now() - pending.sentAt,
-    });
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingDeliveries.delete(key);
+      this.options.usage.recordConfirmedDelivery();
+      this.options.onDelivery?.({ username, result: 'shown' });
+      this.logger.info('Reaction confirmed visible in Twitch chat', {
+        bot: username, eventId: pending.eventId, reactionId: pending.reactionId, roundTripMs: this.now() - pending.sentAt,
+      });
+      const remembered = this.recentSends.find((send) => send.reactionId === pending.reactionId);
+      if (remembered) remembered.attributed = true;
+      return pending.reactionId;
+    }
+    const now = this.now();
+    const candidates = this.recentSends.filter((send) =>
+      !send.attributed && send.key === key && now - send.sentAt <= RECENT_SEND_WINDOW_MS);
+    if (candidates.length === 1) {
+      const late = candidates[0]!;
+      late.attributed = true;
+      this.logger.info('Late chat echo attributed to its reaction', {
+        bot: username, reactionId: late.reactionId, lateByMs: now - late.sentAt,
+      });
+      return late.reactionId;
+    }
+    if (candidates.length > 1) {
+      this.logger.warn('Chat echo matches several recent sendings; left unattributed', {
+        bot: username, text: message, candidates: candidates.length,
+      });
+    }
+    return undefined;
   }
 
   /**

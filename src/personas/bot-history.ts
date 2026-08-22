@@ -30,9 +30,14 @@ export class BotHistory {
     });
   }
 
-  async add(username: string, message: string, eventId?: string, sentAt = Date.now()): Promise<BotMessageRecord> {
+  /**
+   * `id` is the canonical reaction id when the caller has one (the coordinator always does), so the
+   * bot_messages row IS the reaction rather than a second identity for it. Minted here only for
+   * callers that predate the id.
+   */
+  async add(username: string, message: string, eventId?: string, sentAt = Date.now(), id?: string): Promise<BotMessageRecord> {
     const record: BotMessageRecord = {
-      id: randomUUID(),
+      id: id ?? randomUUID(),
       username,
       message,
       sentAt,
