@@ -329,12 +329,26 @@ function seedConcern(persona: BotPersona, random: () => number, now: number): Mi
     ...persona.interests.food, ...persona.interests.other,
   ];
   const interest = interests.length > 0 ? pick(random, interests) : 'что-то новое';
-  const templates: Array<{ kind: MindLifeConcern['kind']; concern: string }> = [
+  const secondInterest = interests.length > 1 ? interests[Math.floor(random() * interests.length)]! : interest;
+  // Most templates are cut from this person's own biography rather than a shared pool. The
+  // dashboard showed why: thirty people drawing two concerns each from seven fixed strings meant
+  // «надо разобраться с документами» four times on one page — a population visibly stamped from
+  // one mold. Occupation and interests are already authored per persona, so a concern built from
+  // them is both varied and in character, with no model call and no random drama.
+  // Biography-derived entries appear twice, so roughly two thirds of all draws are personalized:
+  // the fixed strings stay in the pool as ordinary life, but stop stamping the population.
+  const derived: Array<{ kind: MindLifeConcern['kind']; concern: string }> = [
     { kind: 'work', concern: `на работе плотная неделя (${occupation})` },
+    { kind: 'work', concern: `${occupation}: накопились дела, которые давно откладывал` },
+    { kind: 'plan', concern: `думает про: ${interest}` },
+    { kind: 'plan', concern: `хочет наконец выделить время на: ${secondInterest}` },
+    { kind: 'social', concern: `знакомый зовёт вместе на тему: ${interest}` },
+  ];
+  const templates: Array<{ kind: MindLifeConcern['kind']; concern: string }> = [
+    ...derived, ...derived,
     { kind: 'device', concern: 'выбирает, менять ли старый телефон' },
     { kind: 'device', concern: 'приглядывает новые наушники' },
     { kind: 'home', concern: 'дома мелкий ремонт, руки не доходят' },
-    { kind: 'plan', concern: `думает про: ${interest}` },
     { kind: 'errand', concern: 'надо разобраться с документами' },
     { kind: 'social', concern: 'договаривается встретиться со старым знакомым' },
   ];
@@ -622,8 +636,14 @@ export class PersonaMindStore {
         const score = topicRelevance(speechText, `${curiosity.topic} ${curiosity.question}`);
         if (score < relevanceFloor) continue;
         noticed = true;
-        if (!hasConcreteFact) {
-          // The topic came up but nothing concrete was said: the curiosity stays open and fresher.
+        // Closing the curiosity is held to the QUESTION, not the topic. On the live test a woman
+        // saying «у меня 13к ммр» closed three personas' Dota curiosities and filed itself as a
+        // note inside their DOMAIN knowledge — the canonical topic alias plus any digit was enough.
+        // A world fact heard on stream may resolve a curiosity only when it actually bears on what
+        // the person was wondering; a topical mention with numbers in it merely keeps it fresh.
+        const answersTheQuestion = topicRelevance(speechText, curiosity.question) >= MIN_RELEVANCE;
+        if (!hasConcreteFact || !answersTheQuestion) {
+          // The topic came up but the question was not answered: the curiosity stays open, fresher.
           curiosity.updatedAt = now;
           changed = true;
           continue;
@@ -756,6 +776,32 @@ export class PersonaMindStore {
       }
     }
     this.logger.info('PERSONA_MINDS_LIFE_TICK', { minds: this.byName.size, day });
+  }
+
+  /**
+   * How strongly this moment presses on this person's OWN open material: the best topical
+   * relevance of any open curiosity, unresolved loop or active life concern against the event
+   * text. The shortlist treats a strong answer as a mandatory seat — someone whose unfinished
+   * thought this moment answers must not be trimmed for room — and a zero as nothing, never as
+   * unfairness to repair. Deterministic, capped arrays, microseconds.
+   */
+  personalRelevance(username: string, eventText: string): number {
+    const mind = this.byUsername(username);
+    if (!mind) return 0;
+    let best = 0;
+    for (const curiosity of mind.curiosities) {
+      if (curiosity.status !== 'open') continue;
+      best = Math.max(best, topicRelevance(eventText, `${curiosity.topic} ${curiosity.question}`));
+    }
+    for (const loop of mind.openLoops) {
+      if (loop.status !== 'open') continue;
+      best = Math.max(best, topicRelevance(eventText, loop.text));
+    }
+    for (const concern of mind.life) {
+      if (concern.stage !== 'active') continue;
+      best = Math.max(best, topicRelevance(eventText, concern.concern));
+    }
+    return best;
   }
 
   /** In-memory audit trail of why messages happened, per account. Never sent to any model. */

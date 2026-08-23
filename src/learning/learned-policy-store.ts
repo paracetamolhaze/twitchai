@@ -1,5 +1,6 @@
 import { Logger } from '../logger';
 import { topicRelevance } from '../shared/topics';
+import { EnforcementClass } from './learned-policy.types';
 import { AppRepository } from '../persistence/repository';
 import { StreamEvent } from '../stream-brain/types';
 import { LearnedPolicyForDecision, LearnedPolicyRule, LearnedRuleStatus } from './learned-policy.types';
@@ -160,7 +161,10 @@ export class LearnedPolicyStore {
       global: global.map((rule) => rule.rule),
       topic: topic.map((rule) => rule.rule),
       byPersona,
-      supplied: supplied.map((rule) => ({ id: rule.id, scope: rule.scopeType, scopeKey: rule.scopeKey })),
+      supplied: supplied.map((rule) => ({
+        id: rule.id, scope: rule.scopeType, scopeKey: rule.scopeKey,
+        ...(enforcementClassOf(rule.rule) ? { enforcementClass: enforcementClassOf(rule.rule) } : {}),
+      })),
     };
   }
 
@@ -176,4 +180,19 @@ export class LearnedPolicyStore {
 
 function byConfidenceThenRecency(left: LearnedPolicyRule, right: LearnedPolicyRule): number {
   return right.confidence - left.confidence || right.updatedAt - left.updatedAt;
+}
+
+/**
+ * Deterministic, closed-world classifier from a rule's English to a known enforcement class. It
+ * recognises the laughter-tag rule however the Teacher words it around the two load-bearing ideas
+ * (laughter + attaching it to commentary), and maps everything else to nothing. Never a general
+ * compiler: an unknown rule stays prompt-only, exactly as before.
+ */
+export function enforcementClassOf(ruleText: string): EnforcementClass | undefined {
+  const text = ruleText.toLowerCase();
+  // No \b anchors around the Cyrillic alternatives: the ASCII word boundary does not exist next
+  // to Cyrillic letters, so the Russian wording of the same rule silently failed to classify.
+  const laughter = /laugh|смех|хохот|ахах/.test(text);
+  const attached = /\b(tag|append|attach|add|trailing|end|formulaic|open)\b/.test(text) || /хвост|конц|добавля/.test(text);
+  return laughter && attached ? 'formulaic_laughter_tag' : undefined;
 }

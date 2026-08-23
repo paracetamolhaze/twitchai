@@ -88,6 +88,7 @@ export type ReactionRejectionReason =
   | 'generic_evaluator'
   | 'majority_echo'
   | 'transcript_echo'
+  | 'short_question_echo'
   // The operator specifically disliked a close match of this from the same account before. Not
   // NaturalnessGuard — it knows nothing about past operator judgement — and not a blacklist of
   // phrases: a per-persona comparison against messages that account was actually marked down for.
@@ -96,6 +97,18 @@ export type ReactionRejectionReason =
   // was never actually supplied to it. A fabricated life story behind a message is worse than no
   // message: it would make every provenance display a lie.
   | 'invalid_motive_source'
+  // The output schema requires motive and sourceType on every reaction; a selected item without
+  // them is an incomplete structured generation, dropped rather than silently sent as
+  // "unreported" — that silent conversion is exactly what hid a broken contract for a whole
+  // live test. Never retried: the point is to force the first call to honor its schema.
+  | 'schema_incomplete'
+  // The message introduced a number that appears nowhere in the event, the chat, the speech, the
+  // supplied personal material or the account's own recent messages — confident specificity with
+  // no ground under it, the most human-noticeable kind of hallucination.
+  | 'unsupported_specificity'
+  // Self-declared event_observation whose content is entirely the event's own words plus filler:
+  // a caption of the stream restated back at it, with no stance, question or correction in it.
+  | 'event_paraphrase_no_delta'
   | 'invalid_item';
 
 export interface ReactionRejection {

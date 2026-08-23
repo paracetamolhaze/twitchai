@@ -4,6 +4,7 @@ import { ProvenancePools } from '../reaction/motive-provenance';
 import { NaturalnessInput } from '../reaction/naturalness-guard';
 import { ReactionBatchResult, ReactionBotCandidate } from '../reaction/types';
 import { normalizeForLookup } from '../shared/similarity';
+import { computeChatRegister } from '../stream-brain/chat-register';
 import { ContextStore } from '../stream-brain/context-store';
 import { ColdStartStatus } from '../stream-brain/stream-session';
 import { UsageTracker } from '../usage/usage-tracker';
@@ -63,6 +64,10 @@ export interface PersonaDriveServiceOptions {
     observed?: NaturalnessInput['event'],
     coldStartActive?: boolean,
     provenancePools?: Map<string, ProvenancePools>,
+    extras?: {
+      learnedRulesSupplied?: Array<{ id: string; scope: string; scopeKey: string; enforcementClass?: string }>;
+      groundedNumbers?: Set<string>;
+    },
   ) => string;
   /** ReactionCoordinator.submitBatch, wrapped as (requestId, reactions) => ... */
   submitReaction: (requestId: string, reactions: Array<{
@@ -284,6 +289,14 @@ export class PersonaDriveService {
       streamContext: snapshot.streamContext,
       candidates: driveCandidates,
       recentChat: recentChatForDrive.map(({ timestamp, username, message, kind }) => ({ timestamp, username, message, kind })),
+      ...((): { chatRegister?: NonNullable<BrainDriveOpportunityInput['chatRegister']> } => {
+        const register = computeChatRegister(snapshot.recentChat, {
+          botUsernames: new Set(o.candidates().map((candidate) => candidate.username.toLowerCase())),
+          channel: snapshot.channel,
+          now,
+        });
+        return register ? { chatRegister: register } : {};
+      })(),
       ...(recentSpeech.length > 0 ? { recentSpeech } : {}),
       ...(recentEvents.length > 0 ? { recentEvents } : {}),
       ...(lastObservationAt !== undefined
@@ -326,6 +339,18 @@ export class PersonaDriveService {
         hadRecentChat: recentChatForDrive.length > 0,
       });
     }
+    const groundedNumbers = new Set<string>();
+    for (const text of [
+      ...recentSpeech.map((line) => line.text),
+      ...recentEvents.map((item) => item.summary),
+      ...recentChatForDrive.map((message) => message.message),
+      ...driveCandidates.flatMap((candidate) => [
+        ...candidate.recalledMemories.map((memory) => memory.summary),
+        ...candidate.recentOwnMessages,
+      ]),
+    ]) {
+      for (const match of text.toLowerCase().match(/\d+/g) ?? []) groundedNumbers.add(match);
+    }
     const requestId = o.prepareCandidates(
       candidateUsernames,
       // The full StreamEvent, not a hand-copied subset: the naturalness guard also reads audience
@@ -333,6 +358,12 @@ export class PersonaDriveService {
       newest,
       coldStartActive,
       provenancePools,
+      {
+        // The same rules this very payload carries, so the coordinator's decision log and the
+        // Teacher's rulesSuppliedAtGeneration stop disagreeing with PERSONA_DRIVE_BRAIN_CALL.
+        learnedRulesSupplied: learnedPolicy?.supplied ?? [],
+        groundedNumbers,
+      },
     );
     this.logger.info('PERSONA_DRIVE_BRAIN_CALL', {
       requestId,

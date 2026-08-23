@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LearnedPolicyStore } from '../src/learning/learned-policy-store';
+import { enforcementClassOf, LearnedPolicyStore } from '../src/learning/learned-policy-store';
 import { LearnedPolicyRule } from '../src/learning/learned-policy.types';
 import { Logger } from '../src/logger';
 import { MemoryRepository } from '../src/persistence/memory-repository';
@@ -169,5 +169,26 @@ describe('learned policy retrieval for one decision', () => {
     expect(store.snapshot()).toMatchObject({ activeRules: 1, rulesSupplied: 0, decisionsWithPolicy: 0 });
     store.forDecision(streamEvent(), ['griffin0502']);
     expect(store.snapshot()).toMatchObject({ rulesSupplied: 1, decisionsWithPolicy: 1 });
+  });
+});
+
+describe('typed machine enforcement stays a closed world', () => {
+  it('recognises the laughter-tag rule however the Teacher worded it around the two ideas', () => {
+    expect(enforcementClassOf('Do not append formulaic laughter tags to commentary or open messages with theatrical scoffing interjections.'))
+      .toBe('formulaic_laughter_tag');
+    expect(enforcementClassOf('Не добавляй смех в конце обычного комментария')).toBe('formulaic_laughter_tag');
+  });
+
+  it('maps every other rule to nothing — unknown English never becomes a pattern', () => {
+    expect(enforcementClassOf('Do not post generic meta-commentary that merely labels the stream.')).toBeUndefined();
+    expect(enforcementClassOf('Do not assume streamers completed an action they only mentioned.')).toBeUndefined();
+  });
+
+  it('forDecision carries the class on the supplied entry', async () => {
+    const { store } = await storeWith([rule({
+      id: 'r-laugh', rule: 'Do not append formulaic laughter tags to commentary.',
+    })]);
+    const policy = store.forDecision(streamEvent(), ['griffin0502']);
+    expect(policy?.supplied[0]).toMatchObject({ id: 'r-laugh', enforcementClass: 'formulaic_laughter_tag' });
   });
 });

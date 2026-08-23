@@ -743,3 +743,37 @@ describe('PersonaDriveService', () => {
     service.stop();
   });
 });
+
+describe('learned-rules telemetry consistency — the same fact, the same number, both logs', () => {
+  it('passes the rules it attached to its payload through to the coordinator pending context', async () => {
+    vi.useFakeTimers();
+    const learnedPolicy = await (async () => {
+      const repository = new MemoryRepository();
+      await repository.initialize();
+      await repository.applyLearnedPolicyBatch({
+        upserts: [{
+          id: 'rule-laughter', scopeType: 'global', scopeKey: '',
+          rule: 'Do not append formulaic laughter tags to commentary.', rationale: 'operator feedback',
+          confidence: 0.9, supportCount: 3, positiveEvidence: 0, negativeEvidence: 3, status: 'active',
+          teacherModel: 'test', evidenceIds: [], createdAt: 1_700_000_000_000, updatedAt: 1_700_000_000_000, version: 1,
+        }],
+        processedVerdictIds: [], processedAt: 1_700_000_000_000,
+      });
+      const store = new LearnedPolicyStore(repository, new Logger('TEST', 'error'));
+      await store.load();
+      return store;
+    })();
+    const { service, prepareCandidates } = await harness({ learnedPolicy });
+    service.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const call = (prepareCandidates as ReturnType<typeof vi.fn>).mock.calls[0];
+    const extras = call?.[4] as { learnedRulesSupplied?: Array<{ id: string; enforcementClass?: string }> } | undefined;
+    // Production logged PERSONA_DRIVE_BRAIN_CALL learnedRulesSupplied=3 and the decision line =0
+    // for the same request, because the coordinator side was a hardcoded empty list. The same
+    // semantic fact now carries the same value into the pending context — and the laughter rule
+    // arrives with its machine-enforceable class attached.
+    expect(extras?.learnedRulesSupplied?.map((rule) => rule.id)).toEqual(['rule-laughter']);
+    expect(extras?.learnedRulesSupplied?.[0]?.enforcementClass).toBe('formulaic_laughter_tag');
+    service.stop();
+  });
+});

@@ -382,8 +382,8 @@ export class Application {
         // All four arguments pass through. This lambda used to forward only usernames, which
         // silently dropped the observed moment (so drive messages skipped the naturalness
         // guard's event comparison) and the cold-start flag the drive had carefully computed.
-        prepareCandidates: (usernames, observed, coldStartActive, provenancePools) =>
-          this.coordinator.prepareAutonomousCandidates(usernames, observed, coldStartActive, provenancePools),
+        prepareCandidates: (usernames, observed, coldStartActive, provenancePools, extras) =>
+          this.coordinator.prepareAutonomousCandidates(usernames, observed, coldStartActive, provenancePools, extras),
         submitReaction: (requestId, reactions) => this.coordinator.submitBatch({ eventId: requestId, reactions }),
         applyMemoryUpdates: (decision, requestId) => this.persistBrainMemoryUpdates(decision, {
           eventId: requestId, occurredAt: Date.now(), tag: 'persona_drive',
@@ -978,7 +978,17 @@ export class Application {
     this.coordinator.recordBrainDecision(event.id, { interactionId, previousInteractionId, latencyMs, apiLatencyMs });
     await this.coordinator.submitBatch({
       eventId: event.id,
-      reactions: decision.reactions.map(({ username, message }) => ({ username, message })),
+      // The whole structured reaction, not a hand-picked pair of fields. This map used to
+      // destructure only { username, message }, which silently discarded motive/sourceType/
+      // sourceRef on every stream-event reaction — the schema required them, the model returned
+      // them, and one line of glue turned a full live test into 100% motive:"unreported".
+      reactions: decision.reactions.map(({ username, message, motive, sourceType, sourceRef }) => ({
+        username,
+        message,
+        ...(motive ? { motive } : {}),
+        ...(sourceType ? { sourceType } : {}),
+        ...(sourceRef ? { sourceRef } : {}),
+      })),
     });
     if (decision.memoryUpdates.length > 0) {
       void this.persistBrainMemoryUpdates(decision, { eventId: event.id, occurredAt: event.timestamp, tag: event.type })

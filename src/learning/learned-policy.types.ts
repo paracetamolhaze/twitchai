@@ -78,6 +78,15 @@ export interface FeedbackCase {
   rulesSuppliedAtGeneration?: Array<{ id: string; rule: string }>;
 }
 
+/**
+ * The finite set of machine-enforceable rule classes. Never compiled from Teacher English into
+ * patterns — a deterministic classifier maps a rule's text onto this enum or onto nothing, and the
+ * guard layer may act on a class only while the corresponding active rule was actually supplied to
+ * the decision. One member so far: production showed the laughter rule violated three times in one
+ * evening with the rule present in every prompt, which is the evidence bar for adding one here.
+ */
+export type EnforcementClass = 'formulaic_laughter_tag';
+
 /** One structured thing a Teacher run wants done. Never SQL, never free-form. */
 export interface TeacherAction {
   action: 'CREATE_RULE' | 'UPDATE_RULE' | 'DISABLE_RULE' | 'NO_CHANGE';

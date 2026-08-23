@@ -20,22 +20,38 @@ export type CandidateAttention = 'notices' | 'passes over' | 'no strong pattern'
  * still honoured where they happen to line up.
  */
 export function attentionFor(persona: ReactionBotCandidate['persona'], event: StreamEvent): CandidateAttention {
+  const score = topicalScore(persona, event);
+  if (score < 0) return 'passes over';
+  return score > 0 ? 'notices' : 'no strong pattern';
+}
+
+/**
+ * How strongly this moment reads as being for this character: -1 for a declared-ignored event
+ * type, 0 for no signal, otherwise the best topical relevance of any of their interests or
+ * knowledge against the moment. The number the shortlist ranks its topic tier by — "likes Dota"
+ * and "knows Dota deeply, and the moment is about exactly that" stopped being the same seat once
+ * an ordinary Dota sentence started making nineteen of twenty-nine personas equally 'relevant'.
+ */
+export function topicalScore(persona: ReactionBotCandidate['persona'], event: StreamEvent): number {
   const activity = persona.behavior.activity;
-  if (activity.ignoredEventTypes.includes(event.type)) return 'passes over';
-  if (activity.preferredEventTypes.includes(event.type)) return 'notices';
+  if (activity.ignoredEventTypes.includes(event.type)) return -1;
   const momentText = [event.summary, event.speech, event.visualContext, event.gameContext]
     .filter(Boolean).join(' ');
-  if (topicTokens(momentText).size === 0) return 'no strong pattern';
-  const subjects = [
-    ...persona.interests.games, ...persona.interests.music,
-    ...persona.interests.food, ...persona.interests.other,
-    ...persona.knowledge.expertise, ...persona.knowledge.familiarTopics,
-  ];
-  // The shared topic yardstick, not raw token overlap: an interest written "Dota 2" must notice a
-  // stream that says «доту», or the channel's main subject never counts as anyone's.
-  return subjects.some((subject) => topicRelevance(momentText, subject) > 0)
-    ? 'notices'
-    : 'no strong pattern';
+  let best = 0;
+  if (topicTokens(momentText).size > 0) {
+    const subjects = [
+      ...persona.interests.games, ...persona.interests.music,
+      ...persona.interests.food, ...persona.interests.other,
+      ...persona.knowledge.expertise, ...persona.knowledge.familiarTopics,
+    ];
+    // The shared topic yardstick, not raw token overlap: an interest written "Dota 2" must notice
+    // a stream that says «доту», or the channel's main subject never counts as anyone's.
+    for (const subject of subjects) best = Math.max(best, topicRelevance(momentText, subject));
+  }
+  // A preferred event type is a real signal but a generic one; it ranks below any actual topical
+  // match (canonical matches floor at 0.3) while still clearing zero.
+  if (best === 0 && activity.preferredEventTypes.includes(event.type)) best = 0.15;
+  return best;
 }
 
 /**
@@ -48,14 +64,39 @@ export function attentionFor(persona: ReactionBotCandidate['persona'], event: St
  */
 export const SHORTLIST_TARGET_SIZE = 8;
 
+/** Why a candidate holds their seat — inspectable, so "why did 19 enter the Brain" is a query. */
+export type ShortlistReason = 'direct' | 'personal' | 'topic' | 'padding';
+
+export interface ShortlistSignals {
+  /**
+   * The candidate's own living state pressed against this moment: the best relevance of any open
+   * curiosity, unresolved loop or active life concern. Above PERSONAL_STRONG_MIN the seat is
+   * mandatory — a person whose own unfinished thought this moment answers must not be the one
+   * trimmed for room. Optional; absent means no personal tier, the pre-mind behavior.
+   */
+  personalRelevance?: (username: string) => number;
+  /** Lowercase usernames the event addresses directly. Always kept, labeled as such. */
+  direct?: ReadonlySet<string>;
+}
+
 export interface ShortlistResult {
   /** The candidates actually offered to the Brain — a subset of the input, same order otherwise. */
   shortlisted: ReactionBotCandidate[];
   /** Every eligible candidate's attention, including those the shortlist did not keep — for stats. */
   attentionByUsername: Map<string, CandidateAttention>;
+  /** Why each OFFERED candidate holds the seat. */
+  reasonByUsername: Map<string, ShortlistReason>;
+  /** Topically relevant candidates that did NOT fit — the number that says the trim is working. */
+  trimmedRelevant: number;
   /** True when the shortlist actually removed someone. False on an already-small pool. */
   reduced: boolean;
 }
+
+/**
+ * A curiosity, loop or concern has to genuinely bear on the moment to make its holder mandatory;
+ * matches the canonical-topic floor so an explicit registry hit on one's own open material counts.
+ */
+export const PERSONAL_STRONG_MIN = 0.3;
 
 /**
  * Twenty-nine distinct people is not twenty-nine equally plausible respondents to one ordinary
@@ -93,28 +134,70 @@ export function shortlistCandidates(
   candidates: ReactionBotCandidate[],
   event: StreamEvent,
   targetSize = SHORTLIST_TARGET_SIZE,
+  signals: ShortlistSignals = {},
 ): ShortlistResult {
-  const attentionByUsername = new Map(
-    candidates.map((candidate) => [candidate.username, attentionFor(candidate.persona, event)] as const),
-  );
+  const scores = new Map(candidates.map((candidate) =>
+    [candidate.username, topicalScore(candidate.persona, event)] as const));
+  const attentionByUsername = new Map(candidates.map((candidate) => {
+    const score = scores.get(candidate.username)!;
+    return [candidate.username, score < 0 ? 'passes over' as const : score > 0 ? 'notices' as const : 'no strong pattern' as const];
+  }));
+
+  const reasonFor = (candidate: ReactionBotCandidate): ShortlistReason => {
+    if (signals.direct?.has(candidate.username.toLowerCase())) return 'direct';
+    if ((signals.personalRelevance?.(candidate.username) ?? 0) >= PERSONAL_STRONG_MIN
+      && attentionByUsername.get(candidate.username) !== 'passes over') return 'personal';
+    return attentionByUsername.get(candidate.username) === 'notices' ? 'topic' : 'padding';
+  };
+
   if (candidates.length <= targetSize) {
-    return { shortlisted: candidates, attentionByUsername, reduced: false };
+    const reasonByUsername = new Map(candidates.map((candidate) => [candidate.username, reasonFor(candidate)] as const));
+    return { shortlisted: candidates, attentionByUsername, reasonByUsername, trimmedRelevant: 0, reduced: false };
   }
 
-  const notices = candidates.filter((candidate) => attentionByUsername.get(candidate.username) === 'notices');
-  const padCandidates = candidates.filter((candidate) => attentionByUsername.get(candidate.username) === 'no strong pattern');
-  const padCount = Math.max(0, targetSize - notices.length);
-  const padded = padCandidates
+  // MANDATORY seats: a direct address, or a moment that lands on this person's own open material —
+  // an unresolved loop, an open curiosity, a live concern. Kept even past the target: a small soft
+  // overflow when several genuinely mandatory candidates exist beats trimming the one person the
+  // moment is actually for. NOT mandatory: liking the topic. Nineteen people who like Dota is not
+  // nineteen people an ordinary Dota sentence is for, and that live spike (offered 17–21 against a
+  // target of 8) is exactly what the ranked tier below now absorbs.
+  const mandatory = candidates.filter((candidate) => {
+    const reason = reasonFor(candidate);
+    return reason === 'direct' || reason === 'personal';
+  });
+  const mandatoryNames = new Set(mandatory.map((candidate) => candidate.username));
+
+  // RANKABLE topical seats fill the room that is left, best fit first: actual topical relevance,
+  // then the same baseline prior padding uses. Relevance-based, never fairness — the order is who
+  // the moment reads as being for, not who has waited.
+  const topical = candidates
+    .filter((candidate) => !mandatoryNames.has(candidate.username)
+      && attentionByUsername.get(candidate.username) === 'notices')
+    .map((candidate) => ({ candidate, score: scores.get(candidate.username)!, baseline: baselineActivityScore(candidate.persona) }))
+    .sort((left, right) => right.score - left.score || right.baseline - left.baseline
+      || left.candidate.username.localeCompare(right.candidate.username));
+  const topicalRoom = Math.max(0, targetSize - mandatory.length);
+  const keptTopical = topical.slice(0, topicalRoom).map(({ candidate }) => candidate);
+  const trimmedRelevant = Math.max(0, topical.length - keptTopical.length);
+
+  const padCount = Math.max(0, targetSize - mandatory.length - keptTopical.length);
+  const padded = candidates
+    .filter((candidate) => !mandatoryNames.has(candidate.username)
+      && attentionByUsername.get(candidate.username) === 'no strong pattern')
     .map((candidate) => ({ candidate, score: baselineActivityScore(candidate.persona) }))
     .sort((left, right) => right.score - left.score || left.candidate.username.localeCompare(right.candidate.username))
     .slice(0, padCount)
     .map(({ candidate }) => candidate);
 
-  const keep = new Set([...notices, ...padded].map((candidate) => candidate.username));
+  const keep = new Set([...mandatory, ...keptTopical, ...padded].map((candidate) => candidate.username));
   // Preserve the caller's original ordering rather than the tier order, so downstream code that
   // assumes "same relative order as `candidates`" keeps working unchanged.
   const shortlisted = candidates.filter((candidate) => keep.has(candidate.username));
-  return { shortlisted, attentionByUsername, reduced: shortlisted.length < candidates.length };
+  const reasonByUsername = new Map(shortlisted.map((candidate) => [candidate.username, reasonFor(candidate)] as const));
+  return {
+    shortlisted, attentionByUsername, reasonByUsername, trimmedRelevant,
+    reduced: shortlisted.length < candidates.length,
+  };
 }
 
 /**

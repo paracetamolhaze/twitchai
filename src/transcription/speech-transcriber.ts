@@ -244,7 +244,24 @@ export class SpeechTranscriber {
         });
         return;
       }
-      const text = withoutRepeatedTail(this.stats.lastTranscript, result.text);
+      // The whole-response check above was not enough: the second live test leaked meta INSIDE
+      // otherwise-fine responses — "Usually the streamer is the male host (e.g." (the model
+      // paraphrasing its own instructions), scene captions, and format-correction artifacts like
+      // «штучку.") -> O». Each segment is now held to the speaker contract on its own, and what
+      // fails it is logged and dropped without taking the real speech around it.
+      const contract = result.text !== undefined ? enforceTranscriptContract(result.text) : undefined;
+      if (contract) {
+        for (const rejected of contract.rejected) {
+          this.logger.warn('TRANSCRIPT_OUTPUT_REJECTED', {
+            reason: rejected.reason, preview: rejected.preview, audioMs,
+          });
+        }
+      }
+      if (contract && contract.text === undefined) {
+        if (contract.rejected.length > 0) this.stats.failures += 1;
+        return;
+      }
+      const text = withoutRepeatedTail(this.stats.lastTranscript, contract?.text);
       if (!text) return;
       this.stats.transcriptsReceived += 1;
       this.stats.lastTranscript = text;
@@ -340,4 +357,55 @@ export function withoutRepeatedTail(previous: string | undefined, next: string |
     return undefined;
   }
   return text;
+}
+
+export type TranscriptRejectionReason = 'model_meta_prose' | 'format_artifact' | 'unlabeled_english_prose';
+
+export interface TranscriptContractResult {
+  /** The response with everything that failed the contract removed; undefined when nothing survived. */
+  text?: string;
+  rejected: Array<{ reason: TranscriptRejectionReason; preview: string }>;
+}
+
+/** English prose describing the stream rather than transcribing it — only ever applied to text that
+ *  carries NO speaker label, because labeled English is somebody actually speaking English. */
+const UNLABELED_ENGLISH_PROSE = /^[^\u0400-\u04FF]*\b[a-z]+(?:'s)?(?:\s+[a-z]+(?:'s)?){3,}[^\u0400-\u04FF]*$/i;
+
+/** The model correcting or annotating its own output: «...") -> O», «/ устал, по-моему. -> "на». */
+const FORMAT_ARTIFACT = /(?:"\)?\s*->|->\s*["OС]|\)\s*->)/;
+
+/**
+ * Holds one transcription response to the speaker contract, line by line.
+ *
+ * The prompt asks for turns labeled "S: " / "O: ", and real responses mostly comply — with the
+ * window's opening line often continuing the previous window's sentence without a label, which is
+ * legitimate speech and must survive. What must NOT survive: lines carrying self-correction
+ * arrows, model meta prose, and unlabeled all-English descriptive prose (labeled English is real
+ * speech on this bilingual stream; unlabeled English paragraphs in a Russian conversation are the
+ * model describing the scene or its task).
+ */
+export function enforceTranscriptContract(text: string): TranscriptContractResult {
+  const rejected: TranscriptContractResult['rejected'] = [];
+  const kept: string[] = [];
+  for (const line of text.split(/\n+/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const preview = trimmed.slice(0, 80);
+    if (FORMAT_ARTIFACT.test(trimmed)) {
+      rejected.push({ reason: 'format_artifact', preview });
+      continue;
+    }
+    if (looksLikeModelMeta(trimmed)) {
+      rejected.push({ reason: 'model_meta_prose', preview });
+      continue;
+    }
+    const labeled = /^[\p{Lu}]:\s/u.test(trimmed) || /(?:^|\s)[SO]:\s/.test(trimmed);
+    if (!labeled && UNLABELED_ENGLISH_PROSE.test(trimmed)) {
+      rejected.push({ reason: 'unlabeled_english_prose', preview });
+      continue;
+    }
+    kept.push(trimmed);
+  }
+  const survived = kept.join('\n').trim();
+  return { ...(survived ? { text: survived } : {}), rejected };
 }

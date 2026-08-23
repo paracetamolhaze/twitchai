@@ -118,7 +118,11 @@ describe('what the brain is told about writing like a viewer', () => {
     // Measured without the interpolated style rules, which have their own cap: sharing one budget
     // meant a principle and a typing rule competed for the same room.
     const instructionOnly = BRAIN_SYSTEM_INSTRUCTION.length - REACTION_NATURALNESS_PROMPT.length;
-    expect(instructionOnly).toBeLessThan(10_000);
+    // Raised from 10k once, deliberately: the v2 motive/grounding contract — honest sourceType
+    // reporting and the no-invented-specifics rule — is load-bearing after a live test where a
+    // fabricated "сигнатурный пудж" reached chat, and it earns its ~0.8k. Still a hard pin: the
+    // next addition must argue with this number the way this one did.
+    expect(instructionOnly).toBeLessThan(10_900);
     // And it stays a set of principles rather than a growing enumeration.
     expect(BRAIN_SYSTEM_INSTRUCTION.split('\n\n').length).toBeLessThanOrEqual(22);
   });

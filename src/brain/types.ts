@@ -1,6 +1,7 @@
 import { StreamerMemoryType } from '../global-memory/types';
 import { ReactionExample } from '../learning/types';
 import { PersonaMemoryType } from '../personas/types';
+import { ChatRegister } from '../stream-brain/chat-register';
 import { ChatMessage, StreamEvent } from '../stream-brain/types';
 
 export type BrainThinkingLevel = 'low' | 'medium' | 'high';
@@ -128,6 +129,11 @@ export interface BrainEventInput {
   recentSpeech?: Array<{ timestamp: number; text: string }>;
   recentChatDelta: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
   /**
+   * How the real viewers around these accounts are currently talking, as aggregates over the last
+   * few minutes — environmental pressure, never style examples. Omitted below the minimum sample.
+   */
+  chatRegister?: ChatRegister;
+  /**
    * A couple of things each available account personally remembers.
    *
    * Their full profile arrives once at bootstrap, but memory is where a character's opinions
@@ -251,6 +257,8 @@ export interface BrainDriveOpportunityInput {
   streamContext: string;
   candidates: BrainDriveCandidate[];
   recentChat: Array<Pick<ChatMessage, 'timestamp' | 'username' | 'message' | 'kind'>>;
+  /** Same session register the event path carries; same rules, same omission below sample. */
+  chatRegister?: ChatRegister;
   /**
    * What this session has just heard and just seen — the only place a reason to speak could come
    * from, and until now the one thing this payload did not contain.
@@ -323,18 +331,32 @@ export const FIRST_MESSAGE_GATE = 'Nothing has been sent this session yet. A fir
  * is that it becomes rare, and visible when it is not.
  */
 export const REACTION_MOTIVES = [
-  'ask', 'tease', 'disagree', 'agree', 'correct', 'recall', 'share_experience', 'react',
-  'joke', 'answer', 'support', 'warn', 'advise', 'continue_thread', 'other',
+  'ask', 'reply', 'tease', 'disagree', 'agree', 'correct', 'recall', 'callback', 'share_experience',
+  'react', 'joke', 'answer', 'support', 'warn', 'advise', 'continue_thread', 'other',
 ] as const;
+
+/**
+ * Bumped whenever the reaction output contract changes shape, and logged with every decision, so a
+ * production log slice says which contract generated it without cross-referencing deploy dates.
+ * v2: chat_reply/event_observation source types, reply/callback motives, and the hard rule that a
+ * selected reaction without motive+sourceType is dropped as an incomplete structured generation.
+ */
+export const BRAIN_SCHEMA_VERSION = 2;
 
 export const REACTION_SOURCE_TYPES = [
   'knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life',
-  'open_loop', 'expertise', 'event_emotion', 'chat', 'none',
+  'open_loop', 'expertise', 'event_emotion', 'event_observation', 'chat', 'chat_reply', 'none',
 ] as const;
 
 /** Source types that mean the message came from somewhere inside this particular person. */
+/**
+ * Persistent personal origins only. 'chat'/'chat_reply' left out deliberately in v2: answering the
+ * streamer is a perfectly valid message, but it says nothing about whether the persona's own life
+ * produced it, and the analytics question this set exists for is exactly that. Chat replies get
+ * their own bucket instead of inflating the personal one.
+ */
 export const PERSONAL_SOURCE_TYPES: ReadonlySet<string> = new Set([
-  'knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life', 'open_loop', 'expertise', 'chat',
+  'knowledge_gap', 'curiosity', 'belief', 'memory', 'relationship', 'current_life', 'open_loop', 'expertise',
 ]);
 
 export interface BrainReaction {

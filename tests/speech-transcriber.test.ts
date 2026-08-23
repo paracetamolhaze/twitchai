@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Logger } from '../src/logger';
-import { looksLikeModelMeta, SpeechTranscriber, withoutRepeatedTail } from '../src/transcription/speech-transcriber';
+import { enforceTranscriptContract, looksLikeModelMeta, SpeechTranscriber, withoutRepeatedTail } from '../src/transcription/speech-transcriber';
 
 const SAMPLE_RATE = 16_000;
 
@@ -231,5 +231,45 @@ describe('model meta-output leaking as a transcript', () => {
     ]) {
       expect(looksLikeModelMeta(speech)).toBe(false);
     }
+  });
+});
+
+describe('strict transcript contract — production leaks from the 2026-08-23 live test', () => {
+  it('drops unlabeled English descriptive prose — the model paraphrasing its task, not speech', () => {
+    const result = enforceTranscriptContract('Usually the streamer is the male host (e.g.');
+    expect(result.text).toBeUndefined();
+    expect(result.rejected).toEqual([
+      expect.objectContaining({ reason: 'unlabeled_english_prose' }),
+    ]);
+  });
+
+  it('keeps labeled English — this stream genuinely mixes languages', () => {
+    const result = enforceTranscriptContract('S: было тут быть. Я говорила: I am operator Iron Wing,');
+    expect(result.text).toContain('Iron Wing');
+    expect(result.rejected).toEqual([]);
+    const camera = enforceTranscriptContract('S: The camera is fixed on a tripod');
+    expect(camera.text).toBe('S: The camera is fixed on a tripod');
+  });
+
+  it('drops format-artifact lines — the model correcting its own output mid-response', () => {
+    const result = enforceTranscriptContract('но доделать вот эту вот штучку.") -> O');
+    expect(result.text).toBeUndefined();
+    expect(result.rejected).toEqual([expect.objectContaining({ reason: 'format_artifact' })]);
+    const arrows = enforceTranscriptContract('походу. / устал, по-моему. -> "на');
+    expect(arrows.text).toBeUndefined();
+  });
+
+  it('keeps an unlabeled Russian continuation — a window often opens mid-sentence', () => {
+    const result = enforceTranscriptContract('кой пользоваться? Помогите. Помогите.');
+    expect(result.text).toBe('кой пользоваться? Помогите. Помогите.');
+    expect(result.rejected).toEqual([]);
+  });
+
+  it('salvages the good lines around a bad one instead of dropping the window', () => {
+    const result = enforceTranscriptContract(
+      'S: Привет, как дела?\nUsually the streamer is the male host describing the scene here\nO: нормально всё',
+    );
+    expect(result.text).toBe('S: Привет, как дела?\nO: нормально всё');
+    expect(result.rejected).toHaveLength(1);
   });
 });

@@ -460,3 +460,75 @@ describe('fixture A and G — observation is presence, not the reaction shortlis
     expect(second.store.byUsername('one')).toEqual(first.store.byUsername('one'));
   });
 });
+
+describe('finding 7 — a heard world fact is not domain knowledge', () => {
+  const mmrEvent = () => streamEvent({
+    summary: 'Девушка говорит что у неё 13к ммр',
+    speech: 'O: Девушки тоже могут в Доту ебашиться. O: У меня 13 к ммр.',
+  });
+
+  it('a topical mention with a number does NOT close a curiosity whose question it never answered', async () => {
+    // The exact production failure: «у меня 13к ммр» closed three personas' Dota curiosities and
+    // filed itself as a note inside their domain knowledge, because the canonical topic alias plus
+    // any digit cleared the old bar. Resolution now has to answer the QUESTION.
+    const watcher = mind('dota_watcher', {
+      curiosities: [{
+        id: 'c1', topic: 'Dota 2 как зритель', question: 'почему решающий ультимейт так часто мажут',
+        status: 'open', strength: 0.8, createdAt: NOW, updatedAt: NOW,
+      }],
+    });
+    const { store } = await storeWith([watcher]);
+    await store.observeEvent(mmrEvent(), ['dota_watcher']);
+    const updated = store.byUsername('dota_watcher')!;
+    expect(updated.curiosities[0]?.status).toBe('open');
+    expect(updated.knowledge.find((item) => item.topic === 'Dota 2 как зритель')).toBeUndefined();
+  });
+
+  it('a fact that actually answers the question still resolves it — the club-price fixture holds', async () => {
+    const curious = mind('pc_guy', {
+      curiosities: [{
+        id: 'c1', topic: 'цены в компьютерном клубе', question: 'сколько стоит час в компьютерном клубе',
+        status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW,
+      }],
+    });
+    const { store } = await storeWith([curious]);
+    await store.observeEvent(streamEvent({
+      summary: 'S: час в компьютерном клубе стоит 30 юаней',
+      speech: 'S: час в компьютерном клубе стоит 30 юаней',
+    }), ['pc_guy']);
+    expect(store.byUsername('pc_guy')?.curiosities[0]?.status).toBe('answered');
+  });
+
+  it('hearing a fact never downgrades real expertise, and the note names its source', async () => {
+    const expert = mind('expert', {
+      knowledge: [{ topic: 'цены в компьютерном клубе', state: 'knows_well', updatedAt: NOW }],
+      curiosities: [{
+        id: 'c1', topic: 'цены в компьютерном клубе', question: 'сколько стоит час в компьютерном клубе',
+        status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW,
+      }],
+    });
+    const { store } = await storeWith([expert]);
+    await store.observeEvent(streamEvent({
+      summary: 'S: час в компьютерном клубе стоит 30 юаней',
+      speech: 'S: час в компьютерном клубе стоит 30 юаней',
+    }), ['expert']);
+    const knowledge = store.byUsername('expert')!.knowledge.find((item) => item.topic === 'цены в компьютерном клубе');
+    // knows_well is epistemic competence; a stream fact must not rewrite it as "heard_of".
+    expect(knowledge?.state).toBe('knows_well');
+    // The episodic trace lives in the open loop, marked as heard on stream — speaker uncertainty
+    // preserved by construction: it is a quote of what was heard, never a promoted world truth.
+    expect(store.byUsername('expert')!.openLoops[0]?.text).toContain('на стриме');
+  });
+});
+
+describe('life pool draws from the biography, not one shared mold', () => {
+  it('thirty seeded personas do not collapse onto a handful of identical concerns', () => {
+    const personas = Object.keys(PERSONA_BLUEPRINTS).map((username) => generatePersonaV3(username));
+    const concerns = personas.flatMap((persona) => seedMind(persona, persona.generatedFromUsername, NOW).life)
+      .map((concern) => concern.concern);
+    const distinct = new Set(concerns);
+    // At least half of all seeded concerns are distinct strings — occupation and interests are
+    // authored per persona, so concerns built from them differ by construction.
+    expect(distinct.size).toBeGreaterThanOrEqual(Math.floor(concerns.length / 2));
+  });
+});

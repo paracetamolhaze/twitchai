@@ -81,13 +81,77 @@ describe('shortlistCandidates', () => {
     expect(result.reduced).toBe(false);
   });
 
-  it('never truncates the notices tier, even past the target size', () => {
+  it('ranks and trims the topic tier to the target — merely liking the subject is not a mandatory seat', () => {
+    // The live spike this replaces: an ordinary Dota sentence made 19 of 29 personas 'notices' and
+    // every one of them was offered, because tier-1 was never truncated. Topical interest is now
+    // RANKABLE: best fits take the room that mandatory seats leave, the rest are counted as
+    // trimmed rather than shown.
     const noticing = ['a', 'b', 'c', 'd'].map((name) => candidate(name, (p) => { p.interests.games = ['доту']; }));
     const filler = ['e', 'f', 'g', 'h', 'i'].map((name) => candidate(name));
     const result = shortlistCandidates([...noticing, ...filler], streamEvent({ summary: 'стример катает доту' }), 3);
-    const shortlistedUsernames = result.shortlisted.map((c) => c.username);
-    expect(shortlistedUsernames).toEqual(expect.arrayContaining(['a', 'b', 'c', 'd']));
+    expect(result.shortlisted).toHaveLength(3);
+    for (const kept of result.shortlisted) {
+      expect(result.reasonByUsername.get(kept.username)).toBe('topic');
+    }
+    expect(result.trimmedRelevant).toBe(1);
     expect(result.reduced).toBe(true);
+  });
+
+  it('an ordinary topic event with 18 interested personas does not offer all 18', () => {
+    const dotaFans = Array.from({ length: 18 }, (_, index) =>
+      candidate(`fan-${String(index).padStart(2, '0')}`, (p) => { p.interests.games = ['Dota 2']; }));
+    const others = Array.from({ length: 11 }, (_, index) => candidate(`other-${index}`));
+    const result = shortlistCandidates([...dotaFans, ...others], streamEvent({ summary: 'стример решил катать доту вечером' }));
+    expect(result.shortlisted).toHaveLength(SHORTLIST_TARGET_SIZE);
+    expect(result.trimmedRelevant).toBe(10);
+  });
+
+  it('a personal-strong candidate is mandatory and survives trimming past 18 topic fans', () => {
+    const dotaFans = Array.from({ length: 18 }, (_, index) =>
+      candidate(`fan-${String(index).padStart(2, '0')}`, (p) => { p.interests.games = ['Dota 2']; }));
+    // The one person whose OWN open loop this moment answers — no topical interest at all.
+    const loopHolder = candidate('loop-holder');
+    const result = shortlistCandidates(
+      [...dotaFans, loopHolder],
+      streamEvent({ summary: 'стример решил катать доту вечером' }),
+      undefined,
+      { personalRelevance: (username) => (username === 'loop-holder' ? 0.6 : 0) },
+    );
+    expect(result.shortlisted.map((c) => c.username)).toContain('loop-holder');
+    expect(result.reasonByUsername.get('loop-holder')).toBe('personal');
+    expect(result.shortlisted).toHaveLength(SHORTLIST_TARGET_SIZE);
+  });
+
+  it('mandatory seats may softly overflow the target, and never pull in padding beside them', () => {
+    const personal = Array.from({ length: 10 }, (_, index) =>
+      candidate(`p-${String(index).padStart(2, '0')}`, (p) => { p.interests.games = ['Dota 2']; }));
+    const others = Array.from({ length: 5 }, (_, index) => candidate(`o-${index}`));
+    const result = shortlistCandidates(
+      [...personal, ...others],
+      streamEvent({ summary: 'стример решил катать доту вечером' }),
+      8,
+      { personalRelevance: (username) => (username.startsWith('p-') ? 0.5 : 0) },
+    );
+    // All ten genuinely mandatory seats survive — a soft overflow of the target of eight...
+    expect(result.shortlisted).toHaveLength(10);
+    // ...and nothing else rides along with them.
+    expect(result.shortlisted.every((c) => c.username.startsWith('p-'))).toBe(true);
+  });
+
+  it('a direct mention survives whatever the topic tier does', () => {
+    const dotaFans = Array.from({ length: 18 }, (_, index) =>
+      candidate(`fan-${String(index).padStart(2, '0')}`, (p) => { p.interests.games = ['Dota 2']; }));
+    const named = candidate('named-one');
+    const all = [...dotaFans, named];
+    // The coordinator's direct path passes the pool's own size as the target, and the direct set.
+    const result = shortlistCandidates(
+      all,
+      streamEvent({ summary: 'стример решил катать доту вечером', directMentions: ['named-one'] }),
+      all.length,
+      { direct: new Set(['named-one']) },
+    );
+    expect(result.shortlisted.map((c) => c.username)).toContain('named-one');
+    expect(result.reasonByUsername.get('named-one')).toBe('direct');
   });
 
   it('fills padding up to the target size, ranked by chatFrequency x reactionProbability', () => {

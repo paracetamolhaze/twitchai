@@ -196,7 +196,7 @@ describe('single-session reaction protocol', () => {
       expect(prepared.availableBots).toEqual(['bot-one']);
       const result = await coordinator.submitBatch({
         eventId: classifiedEvent.id,
-        reactions: [{ username: 'bot-one', message }],
+        reactions: [{ username: 'bot-one', message, motive: 'react', sourceType: 'event_emotion' }],
       });
 
       expect(result.accepted).toEqual([]);
@@ -216,7 +216,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(leakEvent, 0);
     const leak = await coordinator.submitBatch({
       eventId: leakEvent.id,
-      reactions: [{ username: 'bot-one', message: 'я Gemini personaId=account-bot-one' }],
+      reactions: [{ username: 'bot-one', message: 'я Gemini personaId=account-bot-one', motive: 'react', sourceType: 'event_emotion' }],
     });
 
     expect(leak.accepted).toEqual([]);
@@ -238,7 +238,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(externalAiEvent, 0);
     const externalTopic = await coordinator.submitBatch({
       eventId: externalAiEvent.id,
-      reactions: [{ username: 'bot-one', message: 'Gemini для кода иногда норм' }],
+      reactions: [{ username: 'bot-one', message: 'Gemini для кода иногда норм', motive: 'react', sourceType: 'event_emotion' }],
     });
 
     expect(externalTopic.rejected).toEqual([]);
@@ -261,7 +261,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(disclosureEvent, 0);
       const result = await coordinator.submitBatch({
         eventId: disclosureEvent.id,
-        reactions: [{ username: 'bot-one', message }],
+        reactions: [{ username: 'bot-one', message, motive: 'react', sourceType: 'event_emotion' }],
       });
 
       expect(result.accepted).toEqual([]);
@@ -286,7 +286,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(internalEvent, 0);
       const result = await coordinator.submitBatch({
         eventId: internalEvent.id,
-        reactions: [{ username: 'bot-one', message }],
+        reactions: [{ username: 'bot-one', message, motive: 'react', sourceType: 'event_emotion' }],
       });
       expect(result.accepted).toEqual([]);
       expect(result.rejected).toEqual(expect.arrayContaining([
@@ -318,7 +318,7 @@ describe('single-session reaction protocol', () => {
     expect(prepared.targetedPersonaContext.map(({ username }) => username)).toEqual(['bot-two']);
     const rejected = await coordinator.submitBatch({
       eventId: directEvent.id,
-      reactions: [{ username: 'bot-three', message: 'пытаюсь ответить не своей личностью' }],
+      reactions: [{ username: 'bot-three', message: 'пытаюсь ответить не своей личностью', motive: 'react', sourceType: 'event_emotion' }],
     });
     expect(rejected.rejected[0]).toMatchObject({ username: 'bot-three', reason: 'unknown_candidate' });
     expect(traces.at(-1)).toMatchObject({
@@ -402,7 +402,7 @@ describe('single-session reaction protocol', () => {
     currentTime += 2_500;
     const result = await coordinator.submitBatch({
       eventId: event.id,
-      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }],
     });
 
     expect(result.accepted).toHaveLength(1);
@@ -471,7 +471,7 @@ describe('single-session reaction protocol', () => {
       await coordinator.prepareBrainEvent(event, 0);
       await coordinator.submitBatch({
         eventId: event.id,
-        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }],
       });
       await vi.runOnlyPendingTimersAsync();
       expect(usage.snapshot().currentStream.undeliveredMessages).toBe(0);
@@ -491,7 +491,7 @@ describe('single-session reaction protocol', () => {
       await coordinator.prepareBrainEvent(event, 0);
       await coordinator.submitBatch({
         eventId: event.id,
-        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }],
       });
       await vi.runOnlyPendingTimersAsync();
       // Whitespace differs from what was sent; the channel showed the same message all the same.
@@ -513,7 +513,7 @@ describe('single-session reaction protocol', () => {
       await coordinator.prepareBrainEvent(event, 0);
       await coordinator.submitBatch({
         eventId: event.id,
-        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }],
       });
       await vi.runOnlyPendingTimersAsync();
 
@@ -538,7 +538,7 @@ describe('single-session reaction protocol', () => {
       await coordinator.prepareBrainEvent(event, 0);
       await coordinator.submitBatch({
         eventId: event.id,
-        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+        reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }],
       });
       await vi.advanceTimersByTimeAsync(60_000);
       expect(usage.snapshot().currentStream.undeliveredMessages).toBe(0);
@@ -554,8 +554,8 @@ describe('single-session reaction protocol', () => {
     const result = await coordinator.submitBatch({
       eventId: event.id,
       reactions: [
-        { username: 'bot-one', message: 'первая реплика про этот момент' },
-        { username: 'bot-three', message: 'вторая реплика совершенно другая' },
+        { username: 'bot-one', message: 'первая реплика про этот момент', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-three', message: 'вторая реплика совершенно другая', motive: 'react', sourceType: 'event_emotion' },
       ],
     });
     // The first account still answers immediately — this is transport spacing, not a typing delay.
@@ -583,8 +583,8 @@ describe('single-session reaction protocol', () => {
     const result = await coordinator.submitBatch({
       eventId: event.id,
       reactions: [
-        { username: 'bot-one', message: 'работает — не трогай, золотое правило' },
-        { username: 'bot-three', message: 'работает, не трогай' },
+        { username: 'bot-one', message: 'работает — не трогай, золотое правило', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-three', message: 'работает, не трогай', motive: 'react', sourceType: 'event_emotion' },
       ],
     });
     expect(result.rejected).toContainEqual({ username: 'bot-one', reason: 'typographic_dash' });
@@ -661,7 +661,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(yandex, 0);
     const result = await coordinator.submitBatch({
       eventId: 'yandex-event',
-      reactions: [{ username: 'bot-one', message: 'Яндекс это мощно конечно' }],
+      reactions: [{ username: 'bot-one', message: 'Яндекс это мощно конечно', motive: 'react', sourceType: 'event_emotion' }],
     });
     await vi.advanceTimersByTimeAsync(10_000);
 
@@ -693,7 +693,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(asked, 0);
     await coordinator.submitBatch({
       eventId: 'garena-event',
-      reactions: [{ username: 'bot-one', message: 'олды на месте' }],
+      reactions: [{ username: 'bot-one', message: 'олды на месте', motive: 'react', sourceType: 'event_emotion' }],
     });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(sent).toEqual([{ username: 'bot-one', message: 'олды на месте' }]);
@@ -726,7 +726,7 @@ describe('single-session reaction protocol', () => {
     await failing.coordinator.prepareBrainEvent({ ...event, id: 'failed-send' }, 0);
     await failing.coordinator.submitBatch({
       eventId: 'failed-send',
-      reactions: [{ username: 'bot-one', message: 'ахах' }],
+      reactions: [{ username: 'bot-one', message: 'ахах', motive: 'react', sourceType: 'event_emotion' }],
     });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(failing.sent).toHaveLength(1);
@@ -738,7 +738,7 @@ describe('single-session reaction protocol', () => {
     await landing.coordinator.prepareBrainEvent({ ...event, id: 'good-send' }, 0);
     await landing.coordinator.submitBatch({
       eventId: 'good-send',
-      reactions: [{ username: 'bot-one', message: 'ахах' }],
+      reactions: [{ username: 'bot-one', message: 'ахах', motive: 'react', sourceType: 'event_emotion' }],
     });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(landing.messageSentCalls()).toBe(1);
@@ -1124,15 +1124,36 @@ describe('single-session reaction protocol', () => {
       await coordinator.stop();
     });
 
-    it('a reaction without motive fields still parses, counted as unreported rather than rejected', async () => {
-      const { coordinator } = await setup();
+    it('a selected reaction without motive fields is dropped as schema_incomplete, never sent as unreported', async () => {
+      // The v1.1 tolerance ("still parses, counted as unreported") is exactly what let a whole
+      // live test ship with 100% unreported motives while the schema said required. The contract
+      // now: the model honors its own output schema or that item is silence — no retry, no
+      // backend-invented source, and a warn log naming the missing fields.
+      const warnings: Array<Record<string, unknown>> = [];
+      vi.spyOn(console, 'warn').mockImplementation((line: unknown) => {
+        if (typeof line === 'string') {
+          try { warnings.push(JSON.parse(line) as Record<string, unknown>); } catch { /* not ours */ }
+        }
+      });
+      const { coordinator } = await setup(true, () => event.timestamp, true);
       await coordinator.prepareBrainEvent(event, 0);
       const result = await coordinator.submitBatch({
         eventId: event.id,
-        reactions: [{ username: 'bot-one', message: 'ну и моменты пошли' }],
+        reactions: [
+          { username: 'bot-one', message: 'ну и моменты пошли' },
+          { username: 'bot-two', message: 'вот это поворот', motive: 'react', sourceType: 'event_emotion' },
+        ],
       });
-      expect(result.accepted.map((item) => item.username)).toEqual(['bot-one']);
+      expect(result.accepted.map((item) => item.username)).toEqual(['bot-two']);
+      expect(result.rejected).toEqual(expect.arrayContaining([
+        expect.objectContaining({ username: 'bot-one', reason: 'schema_incomplete' }),
+      ]));
+      const warned = warnings.find((entry) => entry['message'] === 'BRAIN_REACTION_SCHEMA_INCOMPLETE');
+      expect(warned?.['missing']).toEqual(['motive', 'sourceType']);
+      // And the inspection log lets the operator read exactly what was dropped.
+      expect(coordinator.listRejectedReactions()[0]).toMatchObject({ reason: 'schema_incomplete' });
       await coordinator.stop();
+      vi.restoreAllMocks();
     });
   });
 
@@ -1152,7 +1173,7 @@ describe('single-session reaction protocol', () => {
       await coordinator.prepareBrainEvent(event, 0);
       const result = await coordinator.submitBatch({
         eventId: event.id,
-        reactions: [{ username: 'bot-one', message: 'го дальше по классике чё как' }],
+        reactions: [{ username: 'bot-one', message: 'го дальше по классике чё как', motive: 'react', sourceType: 'event_emotion' }],
       });
       expect(result.accepted).toEqual([]);
       expect(result.rejected).toEqual(expect.arrayContaining([
@@ -1167,7 +1188,7 @@ describe('single-session reaction protocol', () => {
       await coordinator.prepareBrainEvent(event, 0);
       const result = await coordinator.submitBatch({
         eventId: event.id,
-        reactions: [{ username: 'bot-one', message: 'кто-нибудь смотрел новый сериал' }],
+        reactions: [{ username: 'bot-one', message: 'кто-нибудь смотрел новый сериал', motive: 'react', sourceType: 'event_emotion' }],
       });
       expect(result.accepted.map((item) => item.username)).toEqual(['bot-one']);
       await coordinator.stop();
@@ -1214,7 +1235,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(event, 0);
     const result = await coordinator.submitBatch({
       eventId: event.id,
-      reactions: [{ username: 'bot-one', message: 'картошку хоть не испортили?' }],
+      reactions: [{ username: 'bot-one', message: 'картошку хоть не испортили?', motive: 'react', sourceType: 'event_emotion' }],
     });
     expect(result.accepted).toHaveLength(1);
 
@@ -1248,7 +1269,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(failedEvent, 0);
     const result = await coordinator.submitBatch({
       eventId: failedEvent.id,
-      reactions: [{ username: 'bot-one', message: 'valid message that the sender cannot deliver' }],
+      reactions: [{ username: 'bot-one', message: 'valid message that the sender cannot deliver', motive: 'react', sourceType: 'event_emotion' }],
     });
     expect(result.accepted).toHaveLength(1);
 
@@ -1280,7 +1301,7 @@ describe('single-session reaction protocol', () => {
     });
     await coordinator.submitBatch({
       eventId: submittedEvent.id,
-      reactions: [{ username: 'bot-one', message: 'сообщение уже принял Twitch' }],
+      reactions: [{ username: 'bot-one', message: 'сообщение уже принял Twitch', motive: 'react', sourceType: 'event_emotion' }],
     });
     currentTime += 25;
 
@@ -1312,7 +1333,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(mixedEvent, 0);
       await coordinator.submitBatch({
         eventId,
-        reactions: usernames.map((username) => ({ username, message: `сообщение от ${username}` })),
+        reactions: usernames.map((username) => ({ username, message: `сообщение от ${username}`, motive: 'react', sourceType: 'event_emotion' })),
       });
       currentTime += 15;
       await vi.runAllTimersAsync();
@@ -1345,11 +1366,11 @@ describe('single-session reaction protocol', () => {
     const result = await coordinator.submitBatch({
       eventId: event.id,
       reactions: [
-        { username: 'bot-one', message: 'первый нормальный ответ' },
+        { username: 'bot-one', message: 'первый нормальный ответ', motive: 'react', sourceType: 'event_emotion' },
         { username: 'broken', message: 42 },
-        { username: 'bot-one', message: 'второй ответ тем же аккаунтом' },
-        { username: 'bot-two', message: 'я сейчас не подключен' },
-        { username: 'bot-three', message: 'а вот этот тоже можно отправить' },
+        { username: 'bot-one', message: 'второй ответ тем же аккаунтом', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-two', message: 'я сейчас не подключен', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-three', message: 'а вот этот тоже можно отправить', motive: 'react', sourceType: 'event_emotion' },
       ],
     });
     expect(result.accepted.map((item) => item.username)).toEqual(['bot-one', 'bot-three']);
@@ -1371,8 +1392,8 @@ describe('single-session reaction protocol', () => {
     const result = await coordinator.submitBatch({
       eventId: exactEvent.id,
       reactions: [
-        { username: 'BOT-ONE', message: 'wrong casing' },
-        { username: ' bot-two ', message: 'extra whitespace' },
+        { username: 'BOT-ONE', message: 'wrong casing', motive: 'react', sourceType: 'event_emotion' },
+        { username: ' bot-two ', message: 'extra whitespace', motive: 'react', sourceType: 'event_emotion' },
       ],
     });
 
@@ -1392,8 +1413,8 @@ describe('single-session reaction protocol', () => {
     const result = await coordinator.submitBatch({
       eventId: event.id,
       reactions: [
-        { username: 'bot-one', message: 'ну это ульт года' },
-        { username: 'bot-two', message: 'карта увернулась заранее' },
+        { username: 'bot-one', message: 'ну это ульт года', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-two', message: 'карта увернулась заранее', motive: 'react', sourceType: 'event_emotion' },
       ],
     });
     expect(result.rejected[0]).toMatchObject({ username: 'bot-one', reason: 'recent_duplicate' });
@@ -1411,7 +1432,7 @@ describe('single-session reaction protocol', () => {
       trigger: { kind: 'stream_event', event },
       permittedUsernames: new Set(['bot-one']),
       currentCandidates: [bot('bot-one', 0)],
-      reactions: [{ username: 'bot-one', message: 'валидное уникальное сообщение' }],
+      reactions: [{ username: 'bot-one', message: 'валидное уникальное сообщение', motive: 'react', sourceType: 'event_emotion' }],
       isDuplicate: async () => false,
     });
     expect(result.accepted).toEqual([]);
@@ -1433,7 +1454,7 @@ describe('single-session reaction protocol', () => {
     await coordinator.prepareBrainEvent(event, 0);
     const accepted = await coordinator.submitBatch({
       eventId: event.id,
-      reactions: [{ username: 'bot-one', message: 'сообщение от старой личности' }],
+      reactions: [{ username: 'bot-one', message: 'сообщение от старой личности', motive: 'react', sourceType: 'event_emotion' }],
     });
     expect(accepted.accepted).toHaveLength(1);
     setCandidates([bot('bot-one', 3), bot('bot-two', 1), bot('bot-three', 2)]);
@@ -1508,7 +1529,7 @@ describe('cold-start bookkeeping against a real StreamSession clock', () => {
 
     clock += 41_000; // 41 seconds into the strict window
     await coordinator.prepareBrainEvent({ ...event, id: 'e1' }, 0);
-    await coordinator.submitBatch({ eventId: 'e1', reactions: [{ username: 'bot-one', message: 'ого' }] });
+    await coordinator.submitBatch({ eventId: 'e1', reactions: [{ username: 'bot-one', message: 'ого', motive: 'react', sourceType: 'event_emotion' }] });
     await vi.runAllTimersAsync();
     expect(sent).toHaveLength(1);
 
@@ -1567,7 +1588,7 @@ describe('cold-start bookkeeping against a real StreamSession clock', () => {
     }, 0);
     const result = await coordinator.submitBatch({
       eventId: 'rejected-1',
-      reactions: [{ username: 'bot-one', message: 'Яндекс это мощно конечно' }],
+      reactions: [{ username: 'bot-one', message: 'Яндекс это мощно конечно', motive: 'react', sourceType: 'event_emotion' }],
     });
     expect(result.rejected).toEqual([{ username: 'bot-one', reason: 'generic_evaluator' }]);
     expect(sent).toEqual([]);
@@ -1613,8 +1634,8 @@ describe('durable reaction id — one generated reaction, one stable id, end to 
     const result = await coordinator.submitBatch({
       eventId: event.id,
       reactions: [
-        { username: 'bot-one', message: 'ну и момент' },
-        { username: 'bot-two', message: 'ахахах' },
+        { username: 'bot-one', message: 'ну и момент', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-two', message: 'ахахах', motive: 'react', sourceType: 'event_emotion' },
       ],
     });
     const ids = result.accepted.map((item) => item.reactionId);
@@ -1628,7 +1649,7 @@ describe('durable reaction id — one generated reaction, one stable id, end to 
     await coordinator.prepareBrainEvent(event, 0);
     const result = await coordinator.submitBatch({
       eventId: event.id,
-      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }],
     });
     await vi.runOnlyPendingTimersAsync();
     const reactionId = result.accepted[0]!.reactionId;
@@ -1650,7 +1671,7 @@ describe('durable reaction id — one generated reaction, one stable id, end to 
     await coordinator.prepareBrainEvent(event, 0);
     const result = await coordinator.submitBatch({
       eventId: event.id,
-      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную' }],
+      reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }],
     });
     await vi.runOnlyPendingTimersAsync();
     // Past the 10s echo window: the delivery is already marked undelivered...

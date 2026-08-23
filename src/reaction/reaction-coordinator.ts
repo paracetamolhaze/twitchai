@@ -14,11 +14,12 @@ import { PersonaRuntimeStore } from '../personas/persona-runtime-store';
 import { ContextStore } from '../stream-brain/context-store';
 import { StreamEvent } from '../stream-brain/types';
 import { ColdStartStatus } from '../stream-brain/stream-session';
-import { BrainEventInput, FIRST_MESSAGE_GATE, PERSONAL_SOURCE_TYPES } from '../brain/types';
+import { BRAIN_SCHEMA_VERSION, BrainEventInput, FIRST_MESSAGE_GATE, PERSONAL_SOURCE_TYPES } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
+import { computeChatRegister } from '../stream-brain/chat-register';
 import { shortlistCandidates } from './candidate-shortlist';
 import { emptyProvenancePools, ProvenancePools, ProvenanceVerdict, validateMotiveProvenance } from './motive-provenance';
-import { NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
+import { hasTrailingLaughterTag, isEventParaphrase, NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
 import { ReactionPolicyGuard } from './reaction-policy-guard';
 import {
   PlannedReaction,
@@ -148,7 +149,17 @@ interface PendingContext {
   /** Which learned rules were actually attached to this decision, for the decision log. Frozen at
    *  payload time for the same reason coldStartActive is: what was in the prompt, not what is true
    *  now. Ids and scopes only — the rule text is already in the payload and the store. */
-  learnedRulesSupplied: Array<{ id: string; scope: string; scopeKey: string }>;
+  learnedRulesSupplied: Array<{ id: string; scope: string; scopeKey: string; enforcementClass?: string }>;
+  /**
+   * Every number the payload could have grounded — from the event, the chat delta, the speech, the
+   * supplied personal material and the accounts' own recent lines. A sent message introducing a
+   * number outside this set is confident specificity with nothing under it: the live test's
+   * fabricated hero rode next to a REAL number, so numbers are the deterministically checkable
+   * slice of that failure, and words stay with the instruction.
+   */
+  groundedNumbers: Set<string>;
+  /** Why each offered seat existed, as counts — for the decision log and the session summary. */
+  shortlistReasons: { mandatory: number; topicRelevant: number; padding: number; trimmedRelevant: number };
   /**
    * Everything the payload actually gave each offered persona to ground a message in, keyed by
    * lowercase username and frozen at payload time. This is what a claimed motive source is checked
@@ -195,7 +206,7 @@ interface SessionDecisionStats {
    * rejecting a third of everything generated has a class that is too wide.
    */
   naturalnessChecked: number;
-  naturalnessRejected: Record<'semantic_echo' | 'borrowed_opinion' | 'generic_evaluator' | 'majority_echo' | 'transcript_echo', number>;
+  naturalnessRejected: Record<'semantic_echo' | 'borrowed_opinion' | 'generic_evaluator' | 'majority_echo' | 'transcript_echo' | 'short_question_echo', number>;
   naturalnessGuardMs: number;
   /**
    * How much of the strict quality window's cost fell on each mechanism. A live run spent this on
@@ -221,6 +232,10 @@ interface SessionDecisionStats {
     reducedEvents: number;
     noticesShown: number;
     paddingShown: number;
+    mandatorySum: number;
+    topicRelevantSum: number;
+    paddingSum: number;
+    trimmedRelevantSum: number;
   };
   /**
    * Where sent messages came from, by the Brain's own structured account of it. The number that
@@ -240,6 +255,15 @@ interface SessionDecisionStats {
     sourcesValidated: number;
     /** Reactions rejected outright because a persistent source claim matched nothing supplied. */
     invalidSourceRejected: number;
+    /** The v2 contract, observed: selected reactions that arrived with/without motive+sourceType. */
+    generatedWithMotive: number;
+    generatedWithoutMotive: number;
+    chatReply: number;
+    eventObservation: number;
+    /** Sent messages wearing a decorative trailing laugh while the laughter rule was supplied. */
+    formulaicLaughterTagged: number;
+    unsupportedSpecificityRejected: number;
+    eventParaphraseRejected: number;
   };
   /**
    * What the whole room learned, not just who was offered the floor. Before V1.1 ingestion ran on
@@ -277,14 +301,20 @@ function emptySessionStats(): SessionDecisionStats {
     naturalnessChecked: 0,
     naturalnessRejected: {
       semantic_echo: 0, borrowed_opinion: 0, generic_evaluator: 0, majority_echo: 0, transcript_echo: 0,
+      short_question_echo: 0,
     },
     naturalnessGuardMs: 0,
     coldStart: { streamEventDecisions: 0, driveDecisions: 0 },
-    shortlist: { shortlistedSum: 0, reducedEvents: 0, noticesShown: 0, paddingShown: 0 },
+    shortlist: {
+      shortlistedSum: 0, reducedEvents: 0, noticesShown: 0, paddingShown: 0,
+      mandatorySum: 0, topicRelevantSum: 0, paddingSum: 0, trimmedRelevantSum: 0,
+    },
     motives: {
       personalSource: 0, eventEmotion: 0, noSource: 0, unreported: 0,
       questionsFromKnowledgeGap: 0, callbacksFromMemory: 0, relationshipMotives: 0, lifeStateMotives: 0,
       sourcesValidated: 0, invalidSourceRejected: 0,
+      generatedWithMotive: 0, generatedWithoutMotive: 0, chatReply: 0, eventObservation: 0,
+      formulaicLaughterTagged: 0, unsupportedSpecificityRejected: 0, eventParaphraseRejected: 0,
     },
     observation: {
       considered: 0, observed: 0, memoryWrites: 0, knowledgeUpdates: 0, loopsResolved: 0,
@@ -321,7 +351,8 @@ export interface RejectedReactionRecord {
  *  room, not the message, and would bury the reviewable entries in noise. */
 const INSPECTABLE_REJECTION_REASONS: ReadonlySet<string> = new Set([
   'semantic_echo', 'borrowed_opinion', 'generic_evaluator', 'majority_echo', 'transcript_echo',
-  'disliked_near_duplicate', 'invalid_motive_source',
+  'short_question_echo', 'disliked_near_duplicate', 'invalid_motive_source', 'schema_incomplete',
+  'unsupported_specificity', 'event_paraphrase_no_delta',
 ]);
 
 const REJECTED_REACTION_LOG_LIMIT = 100;
@@ -425,14 +456,42 @@ export class ReactionCoordinator extends EventEmitter {
       return { eventId: parsed.eventId, accepted: [], rejected: itemRejections };
     }
 
-    // Naturalness first: what survives here is what the policy guard is then asked to schedule.
+    // The output contract first: schema v2 requires motive and sourceType on every selected
+    // reaction, and a selected item without them is an incomplete structured generation — dropped,
+    // logged, never silently converted to "unreported" and sent. That silent conversion is exactly
+    // how a whole live test shipped with 100% unreported motives while the schema said required.
+    // No retry and no second call, deliberately: the first call must honor its own schema.
+    const contractRejections: ReactionRejection[] = [];
+    const wellFormed = parsed.reactions.filter((reaction) => {
+      const missing = [
+        ...(reaction.motive?.trim() ? [] : ['motive']),
+        ...(reaction.sourceType?.trim() ? [] : ['sourceType']),
+      ];
+      if (missing.length === 0) {
+        this.session.motives.generatedWithMotive += 1;
+        return true;
+      }
+      this.session.motives.generatedWithoutMotive += 1;
+      const username = reaction.username.trim().toLowerCase();
+      contractRejections.push({ username, reason: 'schema_incomplete' });
+      this.options.usage.recordGuardRejection();
+      this.recordRejectedReaction(pending, parsed.eventId, reaction, 'schema_incomplete');
+      this.logger.warn('BRAIN_REACTION_SCHEMA_INCOMPLETE', {
+        eventId: parsed.eventId, bot: username, missing, brainSchemaVersion: BRAIN_SCHEMA_VERSION,
+        text: reaction.message,
+      });
+      return false;
+    });
+
+    // Naturalness next: what survives here is what the policy guard is then asked to schedule.
     const naturalnessStartedAt = this.now();
     const naturalnessRejections: ReactionRejection[] = [];
     const natural = this.options.naturalness
-      ? parsed.reactions.filter((reaction) => {
+      ? wellFormed.filter((reaction) => {
         const verdict = this.options.naturalness!.check({
           message: reaction.message,
           ...(pending.naturalnessEvent ? { event: pending.naturalnessEvent } : {}),
+          ...(reaction.sourceType ? { claimedSourceType: reaction.sourceType.trim() } : {}),
         });
         if (verdict.ok) return true;
         const username = reaction.username.trim().toLowerCase();
@@ -444,8 +503,8 @@ export class ReactionCoordinator extends EventEmitter {
         });
         return false;
       })
-      : parsed.reactions;
-    this.session.naturalnessChecked += parsed.reactions.length;
+      : wellFormed;
+    this.session.naturalnessChecked += wellFormed.length;
     this.session.naturalnessGuardMs += this.now() - naturalnessStartedAt;
     naturalnessRejections.forEach(() => this.options.usage.recordGuardRejection());
 
@@ -479,9 +538,42 @@ export class ReactionCoordinator extends EventEmitter {
       return false;
     });
 
+    // Two deterministic content checks with the whole grounded context in hand. A number the
+    // payload never contained is fabricated specificity — the checkable slice of the failure that
+    // sent an invented hero to a live chat. And a self-declared event_observation that is only the
+    // event's own words restated is a caption, not a message: the motive contract is what finally
+    // makes this decidable, because the model itself declared "nothing personal in this".
+    const contentRejections: ReactionRejection[] = [];
+    const substantive = grounded.filter((reaction) => {
+      const username = reaction.username.trim().toLowerCase();
+      const fabricated = ungroundedNumbers(reaction.message, pending.groundedNumbers);
+      if (fabricated.length > 0) {
+        contentRejections.push({ username, reason: 'unsupported_specificity' });
+        this.session.motives.unsupportedSpecificityRejected += 1;
+        this.options.usage.recordGuardRejection();
+        this.recordRejectedReaction(pending, parsed.eventId, reaction, 'unsupported_specificity');
+        this.logger.warn('Reaction rejected: introduces numbers nothing in the context contains', {
+          eventId: parsed.eventId, bot: username, text: reaction.message, numbers: fabricated,
+        });
+        return false;
+      }
+      if (reaction.sourceType?.trim() === 'event_observation' && pending.naturalnessEvent
+        && isEventParaphrase(reaction.message, pending.naturalnessEvent)) {
+        contentRejections.push({ username, reason: 'event_paraphrase_no_delta' });
+        this.session.motives.eventParaphraseRejected += 1;
+        this.options.usage.recordGuardRejection();
+        this.recordRejectedReaction(pending, parsed.eventId, reaction, 'event_paraphrase_no_delta');
+        this.logger.info('Reaction rejected: event observation with no delta of its own', {
+          eventId: parsed.eventId, bot: username, text: reaction.message,
+        });
+        return false;
+      }
+      return true;
+    });
+
     const result = await this.options.policy.validateBatch({
       trigger: pending.trigger,
-      reactions: grounded,
+      reactions: substantive,
       permittedUsernames: pending.permittedUsernames,
       currentCandidates: this.options.candidates(),
       isDuplicate: (username, message) => this.options.history.isDuplicate(username, message),
@@ -489,7 +581,10 @@ export class ReactionCoordinator extends EventEmitter {
         ? (username, message) => this.options.feedbackStore!.isNearDuplicateOfDisliked(username, message)
         : undefined,
     });
-    const allRejections = [...itemRejections, ...naturalnessRejections, ...provenanceRejections, ...result.rejected];
+    const allRejections = [
+      ...itemRejections, ...contractRejections, ...naturalnessRejections, ...provenanceRejections,
+      ...contentRejections, ...result.rejected,
+    ];
     const submittedByUser = new Map(parsed.reactions.map((item) => [item.username.trim().toLowerCase(), item]));
     for (const rejection of result.rejected) {
       this.options.usage.recordGuardRejection();
@@ -540,6 +635,20 @@ export class ReactionCoordinator extends EventEmitter {
       const sourceValidated = verdict?.sourceValidated ?? false;
       const validatedSourceType = verdict?.validatedSourceType;
       if (sourceValidated) this.session.motives.sourcesValidated += 1;
+      const effectiveSource = sourceValidated && validatedSourceType ? validatedSourceType : sourceType;
+      if (effectiveSource === 'chat_reply' || effectiveSource === 'chat') this.session.motives.chatReply += 1;
+      if (effectiveSource === 'event_observation') this.session.motives.eventObservation += 1;
+      // The learned laughter rule, machine-observed: a decorative trailing laugh on a sent message
+      // while that exact rule was in the prompt. Counted, never rejected here — the echo classes
+      // already drop the subset where the laugh was hiding somebody else's words, and hard-banning
+      // the rest would take genuine laughing agreement with it.
+      if (hasTrailingLaughterTag(plan.message)
+        && pending.learnedRulesSupplied.some((rule) => rule.enforcementClass === 'formulaic_laughter_tag')) {
+        this.session.motives.formulaicLaughterTagged += 1;
+        this.logger.info('FORMULAIC_LAUGHTER_TAGGED', {
+          eventId: parsed.eventId, bot: plan.bot.username, reactionId: plan.reactionId, text: plan.message,
+        });
+      }
       sentMotives.push({
         username: plan.bot.username, motive, sourceType, sourceValidated,
         ...(sourceRef ? { sourceRef } : {}),
@@ -636,6 +745,8 @@ export class ReactionCoordinator extends EventEmitter {
       // broke one of them, which is the kind of number that hides a bug instead of surfacing it.
       // Whether a rule was obeyed is a question for the operator's next verdict, not for this line.
       learnedRulesSupplied: pending.learnedRulesSupplied.length,
+      brainSchemaVersion: BRAIN_SCHEMA_VERSION,
+      shortlistReasons: pending.shortlistReasons,
       // The audit trail the operator asked for: not reasoning, the structured origin. Reading
       // "а сколько там аренда?" next to motive=ask source=knowledge_gap(china_rent) is the whole
       // point of the field.
@@ -715,12 +826,13 @@ export class ReactionCoordinator extends EventEmitter {
       naturalnessChecked: stats.naturalnessChecked,
       naturalnessRejected: stats.naturalnessRejected.semantic_echo + stats.naturalnessRejected.borrowed_opinion
         + stats.naturalnessRejected.generic_evaluator + stats.naturalnessRejected.majority_echo
-        + stats.naturalnessRejected.transcript_echo,
+        + stats.naturalnessRejected.transcript_echo + stats.naturalnessRejected.short_question_echo,
       naturalnessSemanticEcho: stats.naturalnessRejected.semantic_echo,
       naturalnessBorrowedOpinion: stats.naturalnessRejected.borrowed_opinion,
       naturalnessGenericEvaluator: stats.naturalnessRejected.generic_evaluator,
       naturalnessMajorityEcho: stats.naturalnessRejected.majority_echo,
       naturalnessTranscriptEcho: stats.naturalnessRejected.transcript_echo,
+      naturalnessShortQuestionEcho: stats.naturalnessRejected.short_question_echo,
       naturalnessGuardMs: Number(stats.naturalnessGuardMs.toFixed(1)),
       // How much of the above happened under the strict first-message bar, and whether it is still
       // up. A live run put all eighteen of its stream-event decisions and all three of its Persona
@@ -739,6 +851,12 @@ export class ReactionCoordinator extends EventEmitter {
       // topical match versus filled in as plausible general audience.
       shortlistNoticesShown: stats.shortlist.noticesShown,
       shortlistPaddingShown: stats.shortlist.paddingShown,
+      // The v1.2 reason model: why seats existed, and how many topically-relevant candidates were
+      // trimmed — the number that says an ordinary Dota sentence no longer buys nineteen seats.
+      shortlistMandatory: stats.shortlist.mandatorySum,
+      shortlistTopicRelevant: stats.shortlist.topicRelevantSum,
+      shortlistPaddingSeats: stats.shortlist.paddingSum,
+      shortlistTrimmedRelevant: stats.shortlist.trimmedRelevantSum,
       // The gates in front of the drive, which is a different question from what it then decided.
       // driveBrainCalls minus driveSilentDecisions minus driveCancelledForExternalEvent is what
       // actually reached a persona; the last of those was invisible here and made three cancelled
@@ -785,6 +903,17 @@ export class ReactionCoordinator extends EventEmitter {
       // could confirm, and how many drafts were rejected for citing a source that never existed.
       motiveSourcesValidated: stats.motives.sourcesValidated,
       invalidMotiveSourceRejected: stats.motives.invalidSourceRejected,
+      // The v2 output contract, observed: every selected reaction either carried its motive or was
+      // dropped as schema_incomplete. generatedWithoutMotive above zero is a provider/schema bug to
+      // chase, never something to paper over with "unreported".
+      brainSchemaVersion: BRAIN_SCHEMA_VERSION,
+      generatedWithMotive: stats.motives.generatedWithMotive,
+      generatedWithoutMotive: stats.motives.generatedWithoutMotive,
+      chatReplyReactions: stats.motives.chatReply,
+      eventObservationReactions: stats.motives.eventObservation,
+      formulaicLaughterTagged: stats.motives.formulaicLaughterTagged,
+      unsupportedSpecificityRejected: stats.motives.unsupportedSpecificityRejected,
+      eventParaphraseRejected: stats.motives.eventParaphraseRejected,
       // What the room learned, decoupled from who spoke. observedButNotOffered above zero is the
       // proof that silent personas are accumulating a life; memoryWrites near zero on a talkative
       // evening means the attention gates are set too tight.
@@ -928,9 +1057,34 @@ export class ReactionCoordinator extends EventEmitter {
     // fill, before building the payload below — a direct mention passes its own size as the target,
     // which makes the size guard inside shortlistCandidates a structural no-op for it rather than a
     // rule to remember here.
-    const shortlist = shortlistCandidates(candidates, event, directTargets.size > 0 ? candidates.length : undefined);
+    const eventText = [event.summary, event.speech, event.visualContext, event.gameContext]
+      .filter(Boolean).join(' ');
+    const shortlist = shortlistCandidates(
+      candidates,
+      event,
+      directTargets.size > 0 ? candidates.length : undefined,
+      {
+        direct: directTargets,
+        // The mandatory tier: this moment landing on somebody's own open curiosity, loop or live
+        // concern. Comes from the mind store, deterministically, before any payload is built.
+        ...(this.options.mind
+          ? { personalRelevance: (username: string) => this.options.mind!.personalRelevance(username, eventText) }
+          : {}),
+      },
+    );
     const offered = shortlist.shortlisted;
+    const shortlistReasons = {
+      mandatory: [...shortlist.reasonByUsername.values()]
+        .filter((reason) => reason === 'direct' || reason === 'personal').length,
+      topicRelevant: [...shortlist.reasonByUsername.values()].filter((reason) => reason === 'topic').length,
+      padding: [...shortlist.reasonByUsername.values()].filter((reason) => reason === 'padding').length,
+      trimmedRelevant: shortlist.trimmedRelevant,
+    };
     this.session.shortlist.shortlistedSum += offered.length;
+    this.session.shortlist.mandatorySum += shortlistReasons.mandatory;
+    this.session.shortlist.topicRelevantSum += shortlistReasons.topicRelevant;
+    this.session.shortlist.paddingSum += shortlistReasons.padding;
+    this.session.shortlist.trimmedRelevantSum += shortlistReasons.trimmedRelevant;
     if (shortlist.reduced) this.session.shortlist.reducedEvents += 1;
     for (const candidate of candidates) {
       const attention = shortlist.attentionByUsername.get(candidate.username) ?? 'no strong pattern';
@@ -1004,6 +1158,10 @@ export class ReactionCoordinator extends EventEmitter {
       candidateCount: candidates.length,
       viewerByUsername,
       learnedRulesSupplied: learnedPolicy?.supplied ?? [],
+      shortlistReasons,
+      // Numbers start with what the moment itself carries; the chat delta, the speech tail, the
+      // recalled material and the accounts' own lines are added below as they are computed.
+      groundedNumbers: extractNumbers(eventText),
       // Filled below once the recalled memories are known — the pending object is held by
       // reference, and the batch that reads this cannot arrive before this method returns.
       provenancePools: new Map(),
@@ -1063,6 +1221,23 @@ export class ReactionCoordinator extends EventEmitter {
           hadRecentChat: chatDeltaForPools.length > 0,
         });
       }
+      // Everything the payload could ground a number in: the chat, the speech tail, each offered
+      // account's recalled material and its own recent lines. Frozen alongside the pools.
+      addNumbers(pendingForPools.groundedNumbers, [
+        ...chatDeltaForPools.map((message) => message.message),
+        ...snapshot.recentSpeech.map((line) => line.text),
+        ...recentAccountMessages.flatMap((item) => item.messages),
+        ...recalledMemories.flatMap((item) => item.memories.map((memory) => memory.summary)),
+        ...offered.flatMap((candidate) => {
+          const supplied = mindContext?.supplied[candidate.username];
+          return supplied
+            ? [
+              ...supplied.knowledge_gap, ...supplied.curiosity, ...supplied.open_loop,
+              ...supplied.current_life, ...supplied.relationship, ...supplied.expertise,
+            ]
+            : [];
+        }),
+      ]);
     }
 
     return {
@@ -1106,6 +1281,17 @@ export class ReactionCoordinator extends EventEmitter {
         };
       }),
       ...(streamerMemories.length > 0 ? { streamerMemories } : {}),
+      // The room's register: how real viewers are talking right now, as numbers. Bots, service
+      // bots and the broadcaster never enter the sample, and below 30 human messages in ten
+      // minutes the block is simply absent.
+      ...((): { chatRegister?: NonNullable<BrainEventInput['chatRegister']> } => {
+        const register = computeChatRegister(snapshot.recentChat, {
+          botUsernames: new Set(allCandidates.map((candidate) => candidate.username.toLowerCase())),
+          channel: snapshot.channel,
+          now: this.now(),
+        });
+        return register ? { chatRegister: register } : {};
+      })(),
       // Only what was said around this moment: older lines belong to a part of the stream the
       // event is not about, and the chain already carries them from earlier turns.
       recentSpeech: snapshot.recentSpeech.filter((line) => line.timestamp > chatAfter).slice(-8),
@@ -1141,6 +1327,13 @@ export class ReactionCoordinator extends EventEmitter {
     observed?: NaturalnessInput['event'],
     coldStartActive = false,
     provenancePools?: Map<string, ProvenancePools>,
+    extras: {
+      /** The rules the drive actually attached to its own payload — same semantic fact, same value
+       *  in PERSONA_DRIVE_BRAIN_CALL and in the decision log, instead of a hardcoded zero. */
+      learnedRulesSupplied?: Array<{ id: string; scope: string; scopeKey: string; enforcementClass?: string }>;
+      /** Numbers the drive payload could ground, for the same specificity check events get. */
+      groundedNumbers?: Set<string>;
+    } = {},
   ): string {
     const id = `persona-drive:${randomUUID()}`;
     const expiresAt = this.now() + this.contextTtlMs;
@@ -1155,9 +1348,13 @@ export class ReactionCoordinator extends EventEmitter {
       candidateCount: usernames.length,
       viewerByUsername: new Map(),
       // The drive builds its own payload in PersonaDriveService and does not route through
-      // prepareBrainEvent, so nothing was attached here; recorded as empty rather than left
-      // undefined so the decision log reads the same for both mechanisms.
-      learnedRulesSupplied: [],
+      // prepareBrainEvent; what IT attached arrives through extras. Production logged the same
+      // request as learnedRulesSupplied=3 in PERSONA_DRIVE_BRAIN_CALL and =0 here, because this
+      // used to be a hardcoded empty list — a telemetry lie, and a real data loss for the Teacher,
+      // whose drive-message cases carried no rulesSuppliedAtGeneration.
+      learnedRulesSupplied: extras.learnedRulesSupplied ?? [],
+      shortlistReasons: { mandatory: 0, topicRelevant: 0, padding: 0, trimmedRelevant: 0 },
+      groundedNumbers: extras.groundedNumbers ?? new Set(),
       // The drive freezes its own pools because it builds its own payload; an absent map means
       // every claim validates against nothing supplied, which is exactly right for a caller that
       // supplied nothing.
@@ -1593,4 +1790,34 @@ function directTargetUnavailableReason(
 function safeErrorReason(cause: unknown): string {
   if (cause instanceof Error) return cause.message.slice(0, 160) || cause.name;
   return 'unknown_send_error';
+}
+
+/**
+ * The digit cores of a text: "13к", "13 к" and "13000" all yield "13"/"13000" forms so a number
+ * grounded in one spelling stays grounded in another. Deliberately digits only — words are
+ * ungeneralizable without understanding them, and this check exists to be safe, not smart.
+ */
+export function extractNumbers(text: string): Set<string> {
+  const numbers = new Set<string>();
+  for (const match of text.toLowerCase().match(/\d+/g) ?? []) {
+    numbers.add(match);
+  }
+  return numbers;
+}
+
+function addNumbers(into: Set<string>, texts: string[]): void {
+  for (const text of texts) {
+    for (const number of extractNumbers(text)) into.add(number);
+  }
+}
+
+/** Numbers the message introduces that nothing in the grounded context contains. Times of day and
+ *  tiny counts are exempt — "смотрю 2 часа" fabricates nothing worth a rejection. */
+export function ungroundedNumbers(message: string, grounded: Set<string>): string[] {
+  return [...extractNumbers(message)].filter((number) => {
+    if (grounded.has(number)) return false;
+    // Single digits and common small counts are conversational arithmetic, not claimed facts.
+    if (number.length === 1) return false;
+    return true;
+  });
 }

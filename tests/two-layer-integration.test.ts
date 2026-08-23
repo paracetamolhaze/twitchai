@@ -60,7 +60,7 @@ describe('Live perception → stateful Brain → Twitch integration', () => {
           outputText: request.kind === 'bootstrap'
             ? '{"ready":true}'
             : greeting
-              ? '{"reactions":[{"username":"gigantiuz","message":"привет"}],"memoryUpdates":[]}'
+              ? '{"reactions":[{"username":"gigantiuz","message":"привет","motive":"reply","sourceType":"event_emotion"}],"memoryUpdates":[]}'
               : '{"reactions":[],"memoryUpdates":[]}',
           usage: { inputTokens: 100, cachedInputTokens: 50, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
         };
@@ -75,7 +75,8 @@ describe('Live perception → stateful Brain → Twitch integration', () => {
         coordinator.prepareBrainEvent(streamEvent, chatAfter, emittedAt),
       onDecision: async (streamEvent, decision, latencyMs, interactionId, previousInteractionId) => {
         coordinator.recordBrainDecision(streamEvent.id, { interactionId, previousInteractionId, latencyMs });
-        await coordinator.submitBatch({ eventId: streamEvent.id, reactions: decision.reactions.map(({ username, message }) => ({ username, message })) });
+        // Mirrors the fixed application glue: the whole structured reaction travels, not a pair.
+        await coordinator.submitBatch({ eventId: streamEvent.id, reactions: decision.reactions });
       },
       eventMergeWindowMs: 0,
       contextRolloverTokens: 800_000,

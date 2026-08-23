@@ -39,11 +39,26 @@ export type NaturalnessRejection =
   | 'generic_evaluator'
   | 'majority_echo'
   /** The message is a run of the transcript's own words in the transcript's own order. */
-  | 'transcript_echo';
+  | 'transcript_echo'
+  /**
+   * The message hands a just-asked question back as its own: almost all of its meaningful words
+   * come from one interrogative utterance somebody just spoke, and what it adds is particles and
+   * laughter. "брутские это кто вообще лол" after "Брутские парни — это кто?" is the stream's own
+   * question re-asked, not a viewer wondering. Utterance-level on purpose: the comparison is
+   * against one spoken sentence, never the whole event bag, so ordinary topical questions that
+   * merely share the subject stay legal.
+   */
+  | 'short_question_echo';
 
 export interface NaturalnessInput {
   message: string;
   event?: Pick<StreamEvent, 'type' | 'summary' | 'speech' | 'visualContext' | 'audience' | 'directMentions'>;
+  /**
+   * What the Brain says the message is, when it says so. An explicit chat_reply answers something
+   * said to the chat, and an answer repeats the question's words by nature — so it is exempt from
+   * the question-echo class specifically, and from nothing else.
+   */
+  claimedSourceType?: string;
 }
 
 export interface NaturalnessVerdict {
@@ -152,6 +167,15 @@ export class NaturalnessGuard {
     // being addressed and whatever punctuation it happens to contain.
     if (replaysTranscript(message, event)) return { ok: false, reason: 'transcript_echo' };
 
+    // Before the question exemption, because this echo IS a question: handing a just-asked question
+    // back re-asked is not asking for anything. Being addressed exempts it — an answer legitimately
+    // reuses the question's words — and so does an explicit chat_reply claim.
+    if ((event.directMentions?.length ?? 0) === 0 && event.audience !== 'twitch_chat'
+      && input.claimedSourceType !== 'chat_reply'
+      && echoesQuestionUtterance(message, event)) {
+      return { ok: false, reason: 'short_question_echo' };
+    }
+
     // A question asks for something, and a negation is very often a disagreement or a correction —
     // the two cases most easily mistaken for an echo, because both reuse the subject by nature.
     if (/[?？]/.test(message) || NEGATION.test(message)) return { ok: true };
@@ -212,6 +236,19 @@ export class NaturalnessGuard {
       return { ok: false, reason: 'transcript_echo' };
     }
 
+    // The same short-echo measure with decoration removed: a laugh token is not a thought, so a
+    // message that is echoed words plus laughter is judged by the words alone. "из америки ахаха"
+    // after "эта тёлка из Америки?" is one echoed word wearing a laugh; the live production rule
+    // "do not append formulaic laughter tags to commentary" failed as prompt-only three times in
+    // one evening, and this is the machine-checkable core of it — a laugh must never rescue a
+    // message that would be rejected without it. Genuine laughter alone still always passes: with
+    // every word a laugh token there is nothing left to measure and the early return kept it legal.
+    const spoken = words.filter((word) => !LAUGH_TOKEN.test(word.raw));
+    if (spoken.length > 0 && spoken.length <= MAX_SHORT_ECHO_WORDS
+      && spoken.every((word) => heard.has(word.key) || matchesLoosely(word.key, heard))) {
+      return { ok: false, reason: 'transcript_echo' };
+    }
+
     // Scene labels are deliberately not here. "Планёрка на улице пошла" and "чисто домашний вайб
     // пошел ахах" reduce to a novel noun over scene words, and nothing local separates that from
     // "у него рюкзак больше него" — which is the same shape and a perfectly good joke. A rule that
@@ -239,7 +276,7 @@ const MIN_REPLAY_WORDS = 4;
  * Restrictive enough that ordinary words are not laughs: "хоть" and "хочешь" both start with х and
  * neither matches, because ь, ч and ш are not in the class.
  */
-const LAUGH_TOKEN = /^(?:[аaхxеeиiяоoуy]*[хx][аaхxеeиiяоoуy]*|о+|е+|ы+|kekw|lul+|lol+|pog\p{L}*|omegalul|monkas|sadge)$/iu;
+const LAUGH_TOKEN = /^(?:[аaхxеeиiяоoуy]*[хx][аaхxеeиiяоoуy]*|о+|е+|ы+|kekw|lul+|lol+|лол+|лу?л+|кек\p{L}*|pog\p{L}*|omegalul|monkas|sadge)$/iu;
 
 /**
  * Whether the message is the transcript's own words, in the transcript's own order.
@@ -307,6 +344,89 @@ function alreadyJudged(event: NaturalnessInput['event']): boolean {
     return true;
   }
   return (text.match(/[\p{L}]+/gu) ?? []).some((word) => GENERIC_VERDICT.has(word));
+}
+
+/**
+ * Fillers that carry no content of their own inside a short question or caption: demonstratives,
+ * "what kind of", and the like. Local to the echo checks — adding them to STOP would change how the
+ * established classes measure every message.
+ */
+const ECHO_FILLER = new Set([
+  'вообще', 'какой', 'какое', 'какая', 'какие', 'какого', 'каких', 'че', 'чё', 'чо', 'блин',
+]);
+
+/** Interrogative utterances actually spoken: sentence-split, question marks kept where they fell. */
+function questionUtterances(event: NonNullable<NaturalnessInput['event']>): string[] {
+  return [event.speech, event.summary]
+    .filter((source): source is string => Boolean(source))
+    .flatMap((source) => source.split(/(?<=[.!?…])\s+|\n+/u))
+    .filter((utterance) => utterance.includes('?'));
+}
+
+/**
+ * Whether the message is one just-asked question handed back: all of its meaningful words (minus
+ * laughter, stop words and fillers) come from a single interrogative utterance, and it contributes
+ * nothing of its own. A fresh negation is a stance and exempts it — "не, на пудже" corrects the
+ * question rather than repeating it — and a message whose remaining words include anything the
+ * utterance did not say is a real question about the subject, which stays legal.
+ */
+function echoesQuestionUtterance(message: string, event: NonNullable<NaturalnessInput['event']>): boolean {
+  const utterances = questionUtterances(event);
+  if (utterances.length === 0) return false;
+  const tokens = transcriptTokens(message)
+    .filter((token) => !LAUGH_TOKEN.test(token) && !STOP.has(token) && !ECHO_FILLER.has(token));
+  if (tokens.length === 0) return false;
+  for (const utterance of utterances) {
+    if (NEGATION.test(message) && !NEGATION.test(utterance)) continue;
+    const heard = new Set(transcriptTokens(utterance).map((token) => translitKey(token)));
+    if (tokens.every((token) => {
+      const key = translitKey(token);
+      return heard.has(key) || matchesLoosely(key, heard);
+    })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a self-declared event observation is only the event's own words handed back: a caption of
+ * the stream, restated at it. Used by the coordinator ONLY for reactions whose sourceType is
+ * event_observation — the model itself said "this is about what is on stream, nothing personal",
+ * which is exactly when a message must add a stance, a question, a correction or a feeling to be a
+ * message at all. Unlike replaysTranscript this one does read visualContext, because a caption of
+ * the scene is the failure being caught, not a punishment for describing what is visible.
+ */
+export function isEventParaphrase(message: string, event: NonNullable<NaturalnessInput['event']>): boolean {
+  if (/[?？]/.test(message)) return false;
+  const eventText = [event.summary, event.speech, event.visualContext].filter(Boolean).join(' ');
+  if (NEGATION.test(message) && !NEGATION.test(eventText)) return false;
+  const heard = new Set<string>();
+  for (const word of eventText.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
+    if (!STOP.has(word)) heard.add(translitKey(word));
+  }
+  const tokens = transcriptTokens(message)
+    .filter((token) => !LAUGH_TOKEN.test(token) && !STOP.has(token) && !ECHO_FILLER.has(token)
+      && !GENERIC_VERDICT.has(token) && !ENDORSEMENT.has(token) && !INFERENCE_MARKER.has(token));
+  if (tokens.length === 0) return false;
+  return tokens.every((token) => {
+    const key = translitKey(token);
+    return heard.has(key) || matchesLoosely(key, heard);
+  });
+}
+
+/**
+ * A message wearing a decorative laugh: at least one real word, with a laugh token tacked on the
+ * end. Observability for the learned laughter rule, never a rejection by itself — genuine emotional
+ * laughter attached to a real thought is ordinary chat, and only the echo classes above can say the
+ * thought was not the account's own.
+ */
+export function hasTrailingLaughterTag(message: string): boolean {
+  const tokens = message.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (tokens.length < 2) return false;
+  const last = tokens[tokens.length - 1]!;
+  if (!LAUGH_TOKEN.test(last)) return false;
+  return tokens.some((token) => !LAUGH_TOKEN.test(token));
 }
 
 function matchesLoosely(key: string, heard: Set<string>): boolean {
