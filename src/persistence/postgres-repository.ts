@@ -431,18 +431,21 @@ export class PostgresRepository implements AppRepository {
   async saveSentMessageMotive(record: SentMessageMotiveRecord): Promise<void> {
     await this.pool.query(
       `INSERT INTO sent_message_motives (id, created_at, username, message, event_id, trigger_kind,
-         motive, source_type, source_ref, source_validated, validated_source_type, learned_rule_ids)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+         motive, source_type, source_ref, source_validated, validated_source_type, learned_rule_ids,
+         burst_id, burst_index, burst_size)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
       [record.id, new Date(record.createdAt), record.username, record.message, record.eventId,
         record.triggerKind, record.motive, record.sourceType, record.sourceRef ?? null,
-        record.sourceValidated, record.validatedSourceType ?? null, JSON.stringify(record.learnedRuleIds)],
+        record.sourceValidated, record.validatedSourceType ?? null, JSON.stringify(record.learnedRuleIds),
+        record.burstId ?? null, record.burstIndex ?? null, record.burstSize ?? null],
     );
   }
 
   async listSentMessageMotives(limit: number): Promise<SentMessageMotiveRecord[]> {
     const result = await this.pool.query<SentMessageMotiveRow>(
       `SELECT id, created_at, username, message, event_id, trigger_kind, motive, source_type,
-              source_ref, source_validated, validated_source_type, learned_rule_ids
+              source_ref, source_validated, validated_source_type, learned_rule_ids,
+              burst_id, burst_index, burst_size
        FROM sent_message_motives ORDER BY created_at DESC LIMIT $1`,
       [limit],
     );
@@ -452,7 +455,8 @@ export class PostgresRepository implements AppRepository {
   async getSentMessageMotive(reactionId: string): Promise<SentMessageMotiveRecord | undefined> {
     const result = await this.pool.query<SentMessageMotiveRow>(
       `SELECT id, created_at, username, message, event_id, trigger_kind, motive, source_type,
-              source_ref, source_validated, validated_source_type, learned_rule_ids
+              source_ref, source_validated, validated_source_type, learned_rule_ids,
+              burst_id, burst_index, burst_size
        FROM sent_message_motives WHERE id=$1`,
       [reactionId],
     );
@@ -885,6 +889,7 @@ interface SentMessageMotiveRow {
   trigger_kind: SentMessageMotiveRecord['triggerKind']; motive: string; source_type: string;
   source_ref: string | null; source_validated: boolean; validated_source_type: string | null;
   learned_rule_ids: string[];
+  burst_id: string | null; burst_index: number | null; burst_size: number | null;
 }
 
 function toSentMessageMotive(row: SentMessageMotiveRow): SentMessageMotiveRecord {
@@ -894,6 +899,9 @@ function toSentMessageMotive(row: SentMessageMotiveRow): SentMessageMotiveRecord
     sourceValidated: row.source_validated, learnedRuleIds: row.learned_rule_ids,
     ...(row.source_ref ? { sourceRef: row.source_ref } : {}),
     ...(row.validated_source_type ? { validatedSourceType: row.validated_source_type } : {}),
+    ...(row.burst_id ? { burstId: row.burst_id } : {}),
+    ...(row.burst_index !== null ? { burstIndex: row.burst_index } : {}),
+    ...(row.burst_size !== null ? { burstSize: row.burst_size } : {}),
   };
 }
 

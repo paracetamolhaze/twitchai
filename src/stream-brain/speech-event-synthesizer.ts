@@ -1,3 +1,4 @@
+import { detectChatCall } from './chat-call';
 import { Logger } from '../logger';
 import { BotMentionMatcher } from '../shared/bot-mention-matcher';
 import { SpeechAudience, StreamEventCandidate } from './types';
@@ -172,9 +173,19 @@ export class SpeechEventSynthesizer {
     if (!speech) return;
     this.lastEmittedAt = this.now();
     const mention = this.mentionsBot(speech);
-    const addressee = mention
+    // An explicit invitation to the room upgrades the audience even when the chat is not NAMED:
+    // «тоже расскажите, что вам было полезным» is addressed to everyone by its grammar (second
+    // person plural imperative), and production classified it unclear/0.4 — one bot answered a
+    // question the streamer had asked of the whole room.
+    const chatCall = detectChatCall(speech);
+    const base = mention
       ? { audience: 'twitch_chat' as const, audienceConfidence: 0.95 }
       : audienceOf(speech);
+    // The call upgrades an UNCLEAR audience; it never waters down the stronger verdict that the
+    // chat was named outright («чат, кого брать?» stays 0.9).
+    const addressee = base.audience !== 'twitch_chat' && chatCall
+      ? { audience: 'twitch_chat' as const, audienceConfidence: Math.max(base.audienceConfidence, 0.75) }
+      : base;
     this.logger.info('Speech became a moment worth deciding on', {
       reason,
       characters: speech.length,
@@ -182,6 +193,7 @@ export class SpeechEventSynthesizer {
       directMention: mention,
       audience: addressee.audience,
       audienceConfidence: addressee.audienceConfidence,
+      ...(chatCall ? { chatCall } : {}),
     });
     this.options.emit({
       type: mention ? 'direct_mention' : speechType(speech),
@@ -194,6 +206,7 @@ export class SpeechEventSynthesizer {
       // Heard, not inferred: the only uncertainty left is the transcription itself.
       confidence: 0.9,
       ...addressee,
+      ...(chatCall ? { chatCall } : {}),
     });
   }
 

@@ -86,6 +86,9 @@ export interface ApiServerDependencies {
   teacherStatus?: () => Promise<TeacherStatus | undefined>;
   /** Operator verdicts joined against the durable motive log — approval rates by message origin. */
   motiveAnalytics?: () => Promise<MotiveAnalytics>;
+  /** The session's social participation topology: crowd calls, multi-responder events, bursts,
+   *  continuity — live counters, reset with the session summary. */
+  participation?: () => Record<string, unknown>;
   /** What the quality filters threw away this session, newest first, with false-positive marking. */
   rejectedReactions?: () => RejectedReactionRecord[];
   markRejectedReactionFalsePositive?: (id: string, falsePositive: boolean) => boolean;
@@ -408,6 +411,11 @@ export function createApiServer(dependencies: ApiServerDependencies): ApiServer 
     try {
       return response.json(await dependencies.motiveAnalytics());
     } catch (error) { return next(error); }
+  });
+  // The session's social shape: how participation clustered. Read-only, in-memory counters.
+  app.get('/api/participation', (_request, response) => {
+    if (!dependencies.participation) return response.status(503).json({ error: 'Статистика участия недоступна' });
+    return response.json(dependencies.participation());
   });
   // What the quality filters threw away, for the operator to audit. The one mutation is the
   // operator's own judgement that a filter fired wrongly — kept on the record, changing nothing

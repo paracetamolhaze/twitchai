@@ -65,6 +65,14 @@ export interface StreamEvent {
   confidence: number;
   source: StreamEventSource;
   directMentions: string[];
+  /**
+   * The streamer explicitly inviting the whole chat to answer, and in what shape — detected
+   * deterministically from the words (see src/stream-brain/chat-call.ts). Present only on a
+   * confirmed invitation; its absence changes nothing. This is what turns «киньте плюсик в чат»
+   * from an ordinary moment with one polished reply into a moment where several short answers
+   * from different people are the natural shape.
+   */
+  chatCall?: 'binary_check' | 'poll' | 'show_of_hands' | 'open_feedback' | 'general_question' | 'request_for_opinion' | 'request_for_confirmation';
   /** Who the words were addressed to, when anything was said. Absent for a purely visual moment. */
   audience?: SpeechAudience;
   /** How much the audience reading is worth. Perception guesses here and may be wrong. */

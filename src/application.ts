@@ -590,6 +590,11 @@ export class Application {
         await this.repository.listSentMessageMotives(1_000),
         await this.repository.listMessageVerdicts(1_000),
       ),
+      participation: () => ({
+        ...this.coordinator.participationSnapshot(),
+        sentThisStream: this.usage.snapshot().currentStream.sentResponses,
+        streamDurationMinutes: this.usage.snapshot().currentStream.durationMinutes,
+      }),
       rejectedReactions: () => this.coordinator.listRejectedReactions(),
       markRejectedReactionFalsePositive: (id, falsePositive) =>
         this.coordinator.markRejectedReactionFalsePositive(id, falsePositive),

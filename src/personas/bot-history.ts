@@ -22,8 +22,15 @@ export class BotHistory {
 
   async isDuplicate(username: string, candidate: string): Promise<boolean> {
     const normalized = normalizeMessage(candidate);
-    if (!normalized) return true;
     const recent = (await this.recent(username)).slice(-20);
+    if (!normalized) {
+      // A message that is pure symbols — «+», «-», an emote string — used to be declared a
+      // duplicate UNCONDITIONALLY, which is how the one bot that answered a live «киньте плюсик»
+      // poll with a bare «+» was silently killed as recent_duplicate. Symbols carry identity too:
+      // it is a duplicate only of a recent message with the same characters, not of everything.
+      const trimmed = candidate.trim();
+      return trimmed.length === 0 || recent.some((item) => item.message.trim() === trimmed);
+    }
     return recent.some((item) => {
       const previous = normalizeMessage(item.message);
       return previous === normalized || tokenSimilarity(previous, normalized) >= this.similarityThreshold;

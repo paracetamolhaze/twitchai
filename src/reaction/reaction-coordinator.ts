@@ -16,7 +16,9 @@ import { StreamEvent } from '../stream-brain/types';
 import { ColdStartStatus } from '../stream-brain/stream-session';
 import { BRAIN_SCHEMA_VERSION, BrainEventInput, FIRST_MESSAGE_GATE, PERSONAL_SOURCE_TYPES } from '../brain/types';
 import { UsageTracker } from '../usage/usage-tracker';
+import { ChatCallKind, crowdResponseCeiling, detectChatCall, isConstrainedCall, isConstrainedReply } from '../stream-brain/chat-call';
 import { computeChatRegister } from '../stream-brain/chat-register';
+import { topicRelevance } from '../shared/topics';
 import { shortlistCandidates } from './candidate-shortlist';
 import { emptyProvenancePools, ProvenancePools, ProvenanceVerdict, validateMotiveProvenance } from './motive-provenance';
 import { hasTrailingLaughterTag, isEventParaphrase, NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
@@ -160,6 +162,14 @@ interface PendingContext {
   groundedNumbers: Set<string>;
   /** Why each offered seat existed, as counts — for the decision log and the session summary. */
   shortlistReasons: { mandatory: number; topicRelevant: number; padding: number; trimmedRelevant: number };
+  /** The confirmed invitation to the whole chat, when this moment carries one. */
+  chatCall?: ChatCallKind;
+  /** The crowd ceiling for this decision — unique accounts, computed from the call kind and how
+   *  loudly the real audience is already answering. Absent means the ordinary formula applies. */
+  maxReactionsOverride?: number;
+  /** Accounts allowed past their own cooldown because this moment directly continues their own
+   *  active thread — their question, their open loop. Never fairness, never a general pass. */
+  recencyExempt: Set<string>;
   /**
    * Everything the payload actually gave each offered persona to ground a message in, keyed by
    * lowercase username and frozen at payload time. This is what a claimed motive source is checked
@@ -280,6 +290,34 @@ interface SessionDecisionStats {
     observedButNotOffered: number;
   };
   /**
+   * The social topology of the session: how participation actually clustered, which is what a
+   * real chat has and a row of evenly spaced single replies does not. Counts only — none of this
+   * feeds back into any decision.
+   */
+  participation: {
+    crowd: {
+      detected: number;
+      byKind: Record<string, number>;
+      with0: number; with1: number; with2plus: number;
+      botResponses: number[];
+      humanRepliesObserved: number;
+      duplicateAllowedByExplicitCall: number;
+    };
+    multi: {
+      respondedEvents: number;
+      responsesTotal: number;
+      multiResponderEvents: number;
+      with2: number; with3plus: number;
+    };
+    bursts: { started: number; messages: number; sizes: number[]; canceled: number; rejected: number };
+    continuity: {
+      followupWithin30s: number; followupWithin60s: number;
+      recencyBypassedForActiveThread: number;
+      threadsOpened: number; threadsResolved: number; threadsExpired: number;
+    };
+    bySource: Record<'ordinary_single' | 'crowd_response' | 'shared_moment' | 'burst_followup' | 'conversation_followup' | 'persona_drive', number>;
+  };
+  /**
    * Per-account breakdown of the same three numbers the aggregates above already total, so a run
    * where messages landed on six of twenty-nine connected accounts can be read as "that is what
    * their interests and shortlist ranking actually produced" or "the shortlist keeps favoring the
@@ -320,9 +358,34 @@ function emptySessionStats(): SessionDecisionStats {
       considered: 0, observed: 0, memoryWrites: 0, knowledgeUpdates: 0, loopsResolved: 0,
       observedButNotOffered: 0,
     },
+    participation: {
+      crowd: {
+        detected: 0, byKind: {}, with0: 0, with1: 0, with2plus: 0,
+        botResponses: [], humanRepliesObserved: 0, duplicateAllowedByExplicitCall: 0,
+      },
+      multi: { respondedEvents: 0, responsesTotal: 0, multiResponderEvents: 0, with2: 0, with3plus: 0 },
+      bursts: { started: 0, messages: 0, sizes: [], canceled: 0, rejected: 0 },
+      continuity: {
+        followupWithin30s: 0, followupWithin60s: 0, recencyBypassedForActiveThread: 0,
+        threadsOpened: 0, threadsResolved: 0, threadsExpired: 0,
+      },
+      bySource: {
+        ordinary_single: 0, crowd_response: 0, shared_moment: 0,
+        burst_followup: 0, conversation_followup: 0, persona_drive: 0,
+      },
+    },
     personaStats: {},
   };
 }
+
+/** A persona's own live conversational thread: what they asked or brought up, and until when a
+ *  direct continuation may pass their cooldown. Ephemeral, in-memory, ninety seconds. */
+interface ActiveThread {
+  topicText: string;
+  expiresAt: number;
+}
+
+const ACTIVE_THREAD_TTL_MS = 90_000;
 
 function personaStatsFor(
   stats: SessionDecisionStats, username: string,
@@ -353,6 +416,9 @@ const INSPECTABLE_REJECTION_REASONS: ReadonlySet<string> = new Set([
   'semantic_echo', 'borrowed_opinion', 'generic_evaluator', 'majority_echo', 'transcript_echo',
   'short_question_echo', 'disliked_near_duplicate', 'invalid_motive_source', 'schema_incomplete',
   'unsupported_specificity', 'event_paraphrase_no_delta',
+  // Added after a live «киньте плюсик» poll: the one rejected answer left no text anywhere, and
+  // diagnosing WHY a duplicate fired required guessing. A duplicate is a quality judgement too.
+  'recent_duplicate',
 ]);
 
 const REJECTED_REACTION_LOG_LIMIT = 100;
@@ -384,6 +450,8 @@ export class ReactionCoordinator extends EventEmitter {
   /** Ring buffer of quality-filtered reactions, newest last. Session-scoped, capped, in-memory. */
   private readonly rejectedLog: RejectedReactionRecord[] = [];
   private readonly recentSends: RecentSend[] = [];
+  /** Lowercase username -> that persona's live thread. See ActiveThread. */
+  private readonly threads = new Map<string, ActiveThread>();
   private stopped = false;
 
   constructor(private readonly options: ReactionCoordinatorOptions) {
@@ -580,6 +648,17 @@ export class ReactionCoordinator extends EventEmitter {
       isDisliked: this.options.feedbackStore
         ? (username, message) => this.options.feedbackStore!.isNearDuplicateOfDisliked(username, message)
         : undefined,
+      ...(pending.maxReactionsOverride !== undefined ? { maxReactionsOverride: pending.maxReactionsOverride } : {}),
+      recencyExempt: pending.recencyExempt,
+      // «+» answering «киньте плюс» is a person doing exactly what was asked; the duplicate check
+      // must not read the room's most ordinary act as spam. Constrained calls only, short answers
+      // only, counted every time it actually matters.
+      duplicateExempt: (username, message) => {
+        if (!pending.chatCall || !isConstrainedCall(pending.chatCall)) return false;
+        if (!isConstrainedReply(message)) return false;
+        this.session.participation.crowd.duplicateAllowedByExplicitCall += 1;
+        return true;
+      },
     });
     const allRejections = [
       ...itemRejections, ...contractRejections, ...naturalnessRejections, ...provenanceRejections,
@@ -590,7 +669,13 @@ export class ReactionCoordinator extends EventEmitter {
       this.options.usage.recordGuardRejection();
       const submitted = submittedByUser.get(rejection.username);
       if (submitted) this.recordRejectedReaction(pending, parsed.eventId, submitted, rejection.reason);
-      this.logger.warn('Gemini reaction rejected by policy', { eventId: parsed.eventId, bot: rejection.username, reason: rejection.reason });
+      if (rejection.reason === 'duplicate_username') this.session.participation.bursts.rejected += 1;
+      this.logger.warn('Gemini reaction rejected by policy', {
+        eventId: parsed.eventId, bot: rejection.username, reason: rejection.reason,
+        // The text used to be dropped here, which made the live recent_duplicate rejections
+        // undiagnosable after the fact. What was thrown away is exactly what a rejection log is for.
+        ...(submitted ? { text: submitted.message } : {}),
+      });
     }
     const policyCompletedAt = result.accepted.length === 0 ? this.now() : undefined;
     this.updateTrace(parsed.eventId, {
@@ -624,6 +709,51 @@ export class ReactionCoordinator extends EventEmitter {
     // of it. Counted only for messages that actually survived the guards: a motive on a rejected
     // draft is not behaviour. What is tallied and persisted is the VALIDATED source wherever one
     // exists; the raw claim is kept beside it so a disagreement stays visible.
+    // The social shape of this decision: who answered, in how many voices, and why each message
+    // existed. Counted at decision time, on accepted plans — the send path only confirms delivery.
+    const uniqueResponders = new Set(result.accepted.map((plan) => plan.bot.username.toLowerCase()));
+    const burstGroups = new Map<string, number>();
+    for (const plan of result.accepted) {
+      if (plan.burstId) burstGroups.set(plan.burstId, plan.burstSize ?? 0);
+    }
+    if (burstGroups.size > 0) {
+      const stats = this.session.participation.bursts;
+      stats.started += burstGroups.size;
+      for (const size of burstGroups.values()) {
+        stats.messages += size;
+        stats.sizes.push(size);
+      }
+    }
+    if (pending.trigger.kind === 'stream_event') {
+      if (pending.chatCall) {
+        const crowd = this.session.participation.crowd;
+        if (uniqueResponders.size === 0) crowd.with0 += 1;
+        else if (uniqueResponders.size === 1) crowd.with1 += 1;
+        else crowd.with2plus += 1;
+        crowd.botResponses.push(uniqueResponders.size);
+      } else if (uniqueResponders.size > 0) {
+        const multi = this.session.participation.multi;
+        multi.respondedEvents += 1;
+        multi.responsesTotal += uniqueResponders.size;
+        if (uniqueResponders.size > 1) multi.multiResponderEvents += 1;
+        if (uniqueResponders.size === 2) multi.with2 += 1;
+        if (uniqueResponders.size >= 3) multi.with3plus += 1;
+      }
+    }
+    for (const plan of result.accepted) {
+      const key = plan.bot.username.toLowerCase();
+      const source = pending.trigger.kind === 'persona_drive' ? 'persona_drive'
+        : (plan.burstIndex ?? 0) > 0 ? 'burst_followup'
+          : pending.recencyExempt.has(key) ? 'conversation_followup'
+            : pending.chatCall ? 'crowd_response'
+              : uniqueResponders.size > 1 ? 'shared_moment'
+                : 'ordinary_single';
+      this.session.participation.bySource[source] += 1;
+      if (pending.recencyExempt.has(key) && this.threads.delete(key)) {
+        this.session.participation.continuity.threadsResolved += 1;
+      }
+    }
+
     const sentMotives: SentMotiveEntry[] = [];
     for (const plan of result.accepted) {
       const username = plan.bot.username.toLowerCase();
@@ -674,6 +804,7 @@ export class ReactionCoordinator extends EventEmitter {
         ...(sourceRef ? { sourceRef } : {}),
         ...(validatedSourceType ? { validatedSourceType } : {}),
         learnedRuleIds: pending.learnedRulesSupplied.map((rule) => rule.id),
+        ...(plan.burstId ? { burstId: plan.burstId, burstIndex: plan.burstIndex, burstSize: plan.burstSize } : {}),
       });
     }
     const decision: ReactionDecisionRecord = {
@@ -747,6 +878,8 @@ export class ReactionCoordinator extends EventEmitter {
       learnedRulesSupplied: pending.learnedRulesSupplied.length,
       brainSchemaVersion: BRAIN_SCHEMA_VERSION,
       shortlistReasons: pending.shortlistReasons,
+      ...(pending.chatCall ? { chatCall: pending.chatCall, crowdCeiling: pending.maxReactionsOverride } : {}),
+      uniqueResponders: new Set(decision.selected.map((item) => item.username.toLowerCase())).size,
       // The audit trail the operator asked for: not reasoning, the structured origin. Reading
       // "а сколько там аренда?" next to motive=ask source=knowledge_gap(china_rent) is the whole
       // point of the field.
@@ -923,8 +1056,53 @@ export class ReactionCoordinator extends EventEmitter {
       observationKnowledgeUpdates: stats.observation.knowledgeUpdates,
       observationLoopsResolved: stats.observation.loopsResolved,
       observedButNotOffered: stats.observation.observedButNotOffered,
+      // The social topology of the evening: clusters instead of evenly spaced single replies.
+      participation: this.participationSnapshot(stats),
       ...(this.options.mind ? { mind: this.options.mind.snapshot() } : {}),
     });
+  }
+
+  /** The participation counters as one readable object — the session summary and the dashboard's
+   *  Participation block read the same numbers. Percentiles computed here, raw arrays kept out. */
+  participationSnapshot(stats: SessionDecisionStats = this.session): Record<string, unknown> {
+    const p = stats.participation;
+    const percentile = (values: number[], q: number): number => {
+      if (values.length === 0) return 0;
+      const sorted = [...values].sort((a, b) => a - b);
+      return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))]!;
+    };
+    return {
+      crowd: {
+        detected: p.crowd.detected,
+        byKind: p.crowd.byKind,
+        with0Responses: p.crowd.with0,
+        with1Response: p.crowd.with1,
+        with2PlusResponses: p.crowd.with2plus,
+        botResponsesP50: percentile(p.crowd.botResponses, 0.5),
+        botResponsesP90: percentile(p.crowd.botResponses, 0.9),
+        humanRepliesObserved: p.crowd.humanRepliesObserved,
+        duplicateAllowedByExplicitCall: p.crowd.duplicateAllowedByExplicitCall,
+      },
+      multi: {
+        respondedEvents: p.multi.respondedEvents,
+        multiResponderEvents: p.multi.multiResponderEvents,
+        responsesPerRespondedEvent: p.multi.respondedEvents > 0
+          ? Number((p.multi.responsesTotal / p.multi.respondedEvents).toFixed(2))
+          : 0,
+        eventsWith2Responses: p.multi.with2,
+        eventsWith3PlusResponses: p.multi.with3plus,
+      },
+      bursts: {
+        started: p.bursts.started,
+        messages: p.bursts.messages,
+        sizeP50: percentile(p.bursts.sizes, 0.5),
+        sizeMax: p.bursts.sizes.length > 0 ? Math.max(...p.bursts.sizes) : 0,
+        canceled: p.bursts.canceled,
+        rejected: p.bursts.rejected,
+      },
+      continuity: p.continuity,
+      messagesBySource: p.bySource,
+    };
   }
 
   clearPendingContexts(): void {
@@ -974,16 +1152,39 @@ export class ReactionCoordinator extends EventEmitter {
     const named = directTargets.size > 0
       ? eligibleCandidates.filter((candidate) => directTargets.has(candidate.username.toLowerCase()))
       : eligibleCandidates;
+    const eventText = [event.summary, event.speech, event.visualContext, event.gameContext]
+      .filter(Boolean).join(' ');
+    // The streamer explicitly inviting the whole chat — detected by the synthesizer for
+    // transcriber events and re-checked here so Live-perception events get the same treatment.
+    const chatCall = event.chatCall ?? detectChatCall([event.speech, event.summary].filter(Boolean).join(' '));
     // An account still inside its own interval cannot send anything, and offering it anyway meant
     // paying for a message the guard then binned: a measured fourteen minutes threw away 37
     // reactions to account_cooldown, and thirteen of thirty-four decisions ended up entirely empty
     // while the dashboard reported them as deliberate silence. Being named is the one exception —
-    // leaving a question to a specific account unanswered is worse than answering it early.
+    // leaving a question to a specific account unanswered is worse than answering it early. The
+    // second exception is conversational continuity: a persona whose OWN live thread this moment
+    // directly continues — the streamer answering their question — may pass its cooldown, because
+    // «сколько стоит?» followed by silence when the price finally lands is not how a person who
+    // just asked behaves. Busy-state and the global rate limit still apply.
+    const recencyExempt = new Set<string>();
     const candidates = directTargets.size > 0
       ? named
       : named.filter((candidate) => {
         const limit = this.options.policy.candidateRateLimit(candidate);
-        return limit.cooldownRemainingMs <= 0 && !limit.busy;
+        if (limit.busy) return false;
+        if (limit.cooldownRemainingMs <= 0) return true;
+        const key = candidate.username.toLowerCase();
+        const thread = this.threads.get(key);
+        if (!thread) return false;
+        if (thread.expiresAt <= this.now()) {
+          this.threads.delete(key);
+          this.session.participation.continuity.threadsExpired += 1;
+          return false;
+        }
+        if (topicRelevance(eventText, thread.topicText) <= 0) return false;
+        recencyExempt.add(key);
+        this.session.participation.continuity.recencyBypassedForActiveThread += 1;
+        return true;
       });
     const directTargetUnavailable = [...directTargets]
       .filter((username) => !candidates.some((candidate) => candidate.username.toLowerCase() === username))
@@ -1057,8 +1258,6 @@ export class ReactionCoordinator extends EventEmitter {
     // fill, before building the payload below — a direct mention passes its own size as the target,
     // which makes the size guard inside shortlistCandidates a structural no-op for it rather than a
     // rule to remember here.
-    const eventText = [event.summary, event.speech, event.visualContext, event.gameContext]
-      .filter(Boolean).join(' ');
     const shortlist = shortlistCandidates(
       candidates,
       event,
@@ -1066,10 +1265,11 @@ export class ReactionCoordinator extends EventEmitter {
       {
         direct: directTargets,
         // The mandatory tier: this moment landing on somebody's own open curiosity, loop or live
-        // concern. Comes from the mind store, deterministically, before any payload is built.
-        ...(this.options.mind
-          ? { personalRelevance: (username: string) => this.options.mind!.personalRelevance(username, eventText) }
-          : {}),
+        // concern — or directly continuing their own active thread. Deterministic, pre-payload.
+        personalRelevance: (username: string) => Math.max(
+          this.options.mind?.personalRelevance(username, eventText) ?? 0,
+          recencyExempt.has(username.toLowerCase()) ? 0.5 : 0,
+        ),
       },
     );
     const offered = shortlist.shortlisted;
@@ -1128,6 +1328,19 @@ export class ReactionCoordinator extends EventEmitter {
     const contextReadyAt = this.now();
     const expiresAt = contextReadyAt + this.contextTtlMs;
     const coldStartActive = this.options.coldStart?.()?.active ?? false;
+    // How loudly the real audience is already answering, so bot participation saturates instead
+    // of stacking a second wave on top of fifteen human plus-signs.
+    const humanRepliesRecent = snapshot.recentChat
+      .filter((message) => message.kind === 'viewer' && contextReadyAt - message.timestamp <= 45_000).length;
+    const maxReactionsOverride = chatCall
+      ? Math.min(crowdResponseCeiling(chatCall, humanRepliesRecent), offered.length)
+      : undefined;
+    if (chatCall) {
+      const crowd = this.session.participation.crowd;
+      crowd.detected += 1;
+      crowd.byKind[chatCall] = (crowd.byKind[chatCall] ?? 0) + 1;
+      crowd.humanRepliesObserved += humanRepliesRecent;
+    }
     // Narrowed to the shortlisted accounts, not the whole roster: a persona rule is only worth a
     // slot when the account it belongs to could actually speak on this moment.
     const learnedPolicy = this.options.learnedPolicy?.forDecision(event, offered.map((candidate) => candidate.username));
@@ -1159,6 +1372,9 @@ export class ReactionCoordinator extends EventEmitter {
       viewerByUsername,
       learnedRulesSupplied: learnedPolicy?.supplied ?? [],
       shortlistReasons,
+      ...(chatCall ? { chatCall } : {}),
+      ...(maxReactionsOverride !== undefined ? { maxReactionsOverride } : {}),
+      recencyExempt,
       // Numbers start with what the moment itself carries; the chat delta, the speech tail, the
       // recalled material and the accounts' own lines are added below as they are computed.
       groundedNumbers: extractNumbers(eventText),
@@ -1281,6 +1497,9 @@ export class ReactionCoordinator extends EventEmitter {
         };
       }),
       ...(streamerMemories.length > 0 ? { streamerMemories } : {}),
+      ...(chatCall && maxReactionsOverride !== undefined
+        ? { crowdCall: { kind: chatCall, maxVoices: maxReactionsOverride, humanRepliesRecent } }
+        : {}),
       // The room's register: how real viewers are talking right now, as numbers. Bots, service
       // bots and the broadcaster never enter the sample, and below 30 human messages in ten
       // minutes the block is simply absent.
@@ -1305,8 +1524,9 @@ export class ReactionCoordinator extends EventEmitter {
       deltas: [],
       constraints: {
         // The ceiling follows the moment, not just the crowd: an ordinary remark is one voice at
-        // most however many accounts are watching.
-        maxReactions: this.options.policy.maxReactionsFor(candidates.length, event.importance),
+        // most however many accounts are watching — and an explicit invitation to the room opens
+        // the social band the call kind deserves.
+        maxReactions: maxReactionsOverride ?? this.options.policy.maxReactionsFor(candidates.length, event.importance),
         maxMessageBytes: this.options.policy.maxMessageBytes(),
         globalSlotsAvailable: this.options.policy.globalSlotsAvailable(),
         expiresAt,
@@ -1354,6 +1574,7 @@ export class ReactionCoordinator extends EventEmitter {
       // whose drive-message cases carried no rulesSuppliedAtGeneration.
       learnedRulesSupplied: extras.learnedRulesSupplied ?? [],
       shortlistReasons: { mandatory: 0, topicRelevant: 0, padding: 0, trimmedRelevant: 0 },
+      recencyExempt: new Set(),
       groundedNumbers: extras.groundedNumbers ?? new Set(),
       // The drive freezes its own pools because it builds its own payload; an absent map means
       // every claim validates against nothing supplied, which is exactly right for a caller that
@@ -1462,7 +1683,24 @@ export class ReactionCoordinator extends EventEmitter {
         });
         return;
       }
-      if (await this.options.history.isDuplicate(current.username, plan.message)) {
+      // A burst follow-up is a thought trailing its own first part by a couple of seconds; if the
+      // stream has meanwhile moved hard — a high-importance moment landed after this was planned —
+      // the trailing thought belongs to a conversation that is over, and silence beats a stale
+      // aside. Only follow-ups are checked: the first part is an ordinary reaction.
+      if ((plan.burstIndex ?? 0) > 0 && plan.plannedAt !== undefined) {
+        const superseding = this.options.contextStore.snapshot().recentEvents
+          .some((recent) => recent.timestamp > plan.plannedAt! && recent.id !== eventId && recent.importance >= 0.8);
+        if (superseding) {
+          this.session.participation.bursts.canceled += 1;
+          this.options.usage.recordSkipped();
+          this.recordSendFailure(eventId, plan.bot.username, 'burst_superseded');
+          this.logger.info('Burst follow-up cancelled: the stream moved on', {
+            bot: plan.bot.username, eventId, burstIndex: plan.burstIndex, text: plan.message,
+          });
+          return;
+        }
+      }
+      if (!plan.duplicateExempt && await this.options.history.isDuplicate(current.username, plan.message)) {
         this.options.usage.recordSkipped();
         this.options.usage.recordGuardRejection();
         this.recordSendFailure(eventId, plan.bot.username, 'recent_duplicate_at_send');
@@ -1498,6 +1736,22 @@ export class ReactionCoordinator extends EventEmitter {
         this.options.policy.recordSent(sentAt, plan.reservationId);
         this.options.usage.recordSentResponse();
         this.options.personaRuntime.recordSent(current.persona.id);
+        // Conversational continuity bookkeeping, measured on what actually reached Twitch: how
+        // often the same person spoke again shortly, and whether this message opens a thread of
+        // their own — a question the streamer may answer, which is exactly when the cooldown
+        // exemption above earns its keep.
+        const key = current.username.toLowerCase();
+        const previous = (await this.options.history.recent(current.username)).at(-1);
+        if (previous && (plan.burstIndex ?? 0) === 0) {
+          const gapMs = sentAt - previous.sentAt;
+          if (gapMs > 0 && gapMs <= 30_000) this.session.participation.continuity.followupWithin30s += 1;
+          if (gapMs > 0 && gapMs <= 60_000) this.session.participation.continuity.followupWithin60s += 1;
+        }
+        if (/[?？]/.test(plan.message)) {
+          const existing = this.threads.get(key);
+          if (!existing || existing.expiresAt <= sentAt) this.session.participation.continuity.threadsOpened += 1;
+          this.threads.set(key, { topicText: plan.message, expiresAt: sentAt + ACTIVE_THREAD_TTL_MS });
+        }
         await this.options.history.add(current.username, plan.message, eventId, sentAt, plan.reactionId);
         if (plan.viewerUsername) {
           await this.options.personaMemory.addConversation({

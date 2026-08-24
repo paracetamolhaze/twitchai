@@ -134,6 +134,17 @@ export interface BrainEventInput {
    */
   chatRegister?: ChatRegister;
   /**
+   * Present when the streamer explicitly invited the whole chat to answer. Several replies are
+   * then the natural shape — including identical short answers («+») for a constrained call —
+   * and maxVoices is how many the room plausibly adds given how the real audience is already
+   * answering. Still a ceiling: nobody answers without a reason of their own.
+   */
+  crowdCall?: {
+    kind: 'binary_check' | 'poll' | 'show_of_hands' | 'open_feedback' | 'general_question' | 'request_for_opinion' | 'request_for_confirmation';
+    maxVoices: number;
+    humanRepliesRecent: number;
+  };
+  /**
    * A couple of things each available account personally remembers.
    *
    * Their full profile arrives once at bootstrap, but memory is where a character's opinions

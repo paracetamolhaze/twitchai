@@ -21,6 +21,9 @@ const candidateSchema = z.object({
   directMentions: z.array(z.string().trim().min(1).max(50)).max(20).optional(),
   audience: z.enum(SPEECH_AUDIENCES).optional(),
   audienceConfidence: z.coerce.number().finite().min(0).max(1).optional(),
+  // The synthesizer's confirmed invitation to the whole chat. Listed here or the strict schema
+  // would silently reject every event that carries one — the field must survive normalization.
+  chatCall: z.enum(['binary_check', 'poll', 'show_of_hands', 'open_feedback', 'general_question', 'request_for_opinion', 'request_for_confirmation']).optional(),
 }).strict();
 
 export interface EventDetectorOptions {
@@ -97,6 +100,7 @@ export class EventDetector {
             ? { audienceConfidence: candidate.audienceConfidence }
             : {}),
         }),
+      ...(candidate.chatCall ? { chatCall: candidate.chatCall } : {}),
     };
   }
 

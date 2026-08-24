@@ -77,6 +77,9 @@ describe('what the brain is told about writing like a viewer', () => {
     // interesting because it is somebody's turn.
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Having been quiet is not a reason');
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('may break a tie');
+    // And the social-topology contract: candidates judged independently, never one-slot rivals.
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('judged INDEPENDENTLY');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('never suppressed because person A');
     expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain('weaker choice against one who has been listening');
   });
 
@@ -118,11 +121,13 @@ describe('what the brain is told about writing like a viewer', () => {
     // Measured without the interpolated style rules, which have their own cap: sharing one budget
     // meant a principle and a typing rule competed for the same room.
     const instructionOnly = BRAIN_SYSTEM_INSTRUCTION.length - REACTION_NATURALNESS_PROMPT.length;
-    // Raised from 10k once, deliberately: the v2 motive/grounding contract — honest sourceType
-    // reporting and the no-invented-specifics rule — is load-bearing after a live test where a
-    // fabricated "сигнатурный пудж" reached chat, and it earns its ~0.8k. Still a hard pin: the
-    // next addition must argue with this number the way this one did.
-    expect(instructionOnly).toBeLessThan(10_900);
+    // Raised from 10k twice, each time against live evidence. v2 (10.9k): the motive/grounding
+    // contract, after a fabricated «сигнатурный пудж» reached chat. v3 (11.4k): the social
+    // participation contract — independent judgement of candidates, crowd calls, same-person
+    // follow-ups — after 76 validated live decisions produced ZERO multi-voice answers and a
+    // «киньте плюсик» to twenty-four viewers got exactly one reply. Still a hard pin: the next
+    // addition argues with this number the same way.
+    expect(instructionOnly).toBeLessThan(11_600);
     // And it stays a set of principles rather than a growing enumeration.
     expect(BRAIN_SYSTEM_INSTRUCTION.split('\n\n').length).toBeLessThanOrEqual(22);
   });

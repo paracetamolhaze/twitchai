@@ -241,6 +241,20 @@ describe('who the speech was addressed to', () => {
     expect(named?.audience).toBe('twitch_chat');
   });
 
+  it('B: upgrades an unnamed chat invitation — the room-tour production miss', async () => {
+    const emitted = await emit('S: Если вам также понравилось, как я это всё рассказала, показала, '
+      + 'тоже расскажите, что вам было полезным, ценным, что вам вообще понравилось');
+    expect(emitted?.audience).toBe('twitch_chat');
+    expect(emitted?.audienceConfidence).toBeGreaterThanOrEqual(0.75);
+    expect(emitted?.chatCall).toBe('open_feedback');
+  });
+
+  it('keeps ordinary streamer speech unclear, with no call attached', async () => {
+    const emitted = await emit('S: поднимаемся на второй этаж, тут спальня');
+    expect(emitted?.audience).toBe('unclear');
+    expect(emitted?.chatCall).toBeUndefined();
+  });
+
   it('leaves a purely visual moment without an audience at all', async () => {
     vi.useFakeTimers();
     const { instance, emitted } = synthesizer();

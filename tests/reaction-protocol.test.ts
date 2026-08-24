@@ -1368,16 +1368,20 @@ describe('single-session reaction protocol', () => {
       reactions: [
         { username: 'bot-one', message: 'первый нормальный ответ', motive: 'react', sourceType: 'event_emotion' },
         { username: 'broken', message: 42 },
-        { username: 'bot-one', message: 'второй ответ тем же аккаунтом', motive: 'react', sourceType: 'event_emotion' },
-        { username: 'bot-two', message: 'я сейчас не подключен', motive: 'react', sourceType: 'event_emotion' },
         { username: 'bot-three', message: 'а вот этот тоже можно отправить', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-two', message: 'я сейчас не подключен', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-one', message: 'второй ответ тем же аккаунтом', motive: 'react', sourceType: 'event_emotion' },
       ],
     });
+    // The same account appearing again is no longer duplicate_username — it is a same-person burst
+    // part, subject to every OTHER limit as usual: this harness allows two global sends per 30s,
+    // so the two distinct accounts hold the slots and the trailing burst part is what the global
+    // rate limit correctly refuses. Valid items are never cancelled by their broken neighbours.
     expect(result.accepted.map((item) => item.username)).toEqual(['bot-one', 'bot-three']);
     expect(result.rejected).toEqual(expect.arrayContaining([
-      expect.objectContaining({ username: 'bot-one', reason: 'duplicate_username' }),
       expect.objectContaining({ username: 'broken', reason: 'invalid_item' }),
       expect.objectContaining({ username: 'bot-two', reason: 'not_connected' }),
+      expect.objectContaining({ username: 'bot-one', reason: 'global_rate_limit' }),
     ]));
     await vi.runAllTimersAsync();
     expect(sent.map((item) => item.username)).toEqual(['bot-one', 'bot-three']);
@@ -1699,6 +1703,179 @@ describe('durable reaction id — one generated reaction, one stable id, end to 
     const rejected = coordinator.listRejectedReactions()[0];
     expect(rejected?.reason).toBe('invalid_motive_source');
     expect(rejected?.id).toMatch(/^[0-9a-f-]{36}$/);
+    await coordinator.stop();
+  });
+});
+
+describe('social participation topology — the live fixtures', () => {
+  const hearingEvent: StreamEvent = {
+    ...event,
+    id: 'hearing-check',
+    summary: 'Стример спрашивает чат, слышно ли его',
+    speech: 'S: Так, у нас маленький битрейт. Скажите, пожалуйста, меня слышно? Если да, киньте плюсик в чат. Если нет, киньте минус.',
+    audience: 'twitch_chat',
+    audienceConfidence: 0.9,
+    importance: 0.85,
+  };
+
+  it('A/I: a hearing check opens the crowd band, and cross-account «+» answers are not duplicate spam', async () => {
+    vi.useFakeTimers();
+    const { coordinator, history, sent } = await setup();
+    // bot-one already answered a poll with a bare «+» earlier this evening — the exact shape the
+    // old normalizeMessage bug rejected unconditionally as recent_duplicate.
+    await history.add('bot-one', '+');
+    const prepared = await coordinator.prepareBrainEvent(hearingEvent, 0);
+    expect(prepared.crowdCall?.kind).toBe('binary_check');
+    // The ceiling follows the band, capped by who was actually offered (three bots here).
+    expect(prepared.constraints.maxReactions).toBe(3);
+    const result = await coordinator.submitBatch({
+      eventId: 'hearing-check',
+      reactions: [
+        { username: 'bot-one', message: '+', motive: 'reply', sourceType: 'chat_reply' },
+        { username: 'bot-three', message: '+ слышно', motive: 'reply', sourceType: 'chat_reply' },
+      ],
+    });
+    expect(result.accepted.map((item) => item.username)).toEqual(['bot-one', 'bot-three']);
+    expect(result.rejected).toEqual([]);
+    await vi.runAllTimersAsync();
+    expect(sent.map((item) => item.message)).toEqual(['+', '+ слышно']);
+    const snapshot = coordinator.participationSnapshot() as { crowd: Record<string, number> };
+    expect(snapshot.crowd['detected']).toBe(1);
+    expect(snapshot.crowd['with2PlusResponses']).toBe(1);
+    expect(snapshot.crowd['duplicateAllowedByExplicitCall']).toBeGreaterThan(0);
+    await coordinator.stop();
+  });
+
+  it('C: an ordinary event carries no crowd call and keeps the ordinary ceiling', async () => {
+    const { coordinator } = await setup();
+    const ordinary = { ...event, id: 'ordinary-floor', speech: 'S: поднимаемся на второй этаж', summary: 'поднимаемся на второй этаж' };
+    const prepared = await coordinator.prepareBrainEvent(ordinary, 0);
+    expect(prepared).not.toHaveProperty('crowdCall');
+    await coordinator.stop();
+  });
+
+  it('D: two personas with genuinely different reactions to one strong moment both pass', async () => {
+    vi.useFakeTimers();
+    const { coordinator } = await setup();
+    const price = { ...event, id: 'price-shock', importance: 0.85, speech: 'S: сутки стоят 1500 долларов', summary: 'сутки стоят 1500 долларов' };
+    await coordinator.prepareBrainEvent(price, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'price-shock',
+      reactions: [
+        { username: 'bot-one', message: 'ниче се ценник в сутки', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-three', message: 'за эти деньги отель проще снять', motive: 'react', sourceType: 'event_emotion' },
+      ],
+    });
+    expect(result.accepted.map((item) => item.username)).toEqual(['bot-one', 'bot-three']);
+    const snapshot = coordinator.participationSnapshot() as { multi: Record<string, number> };
+    expect(snapshot.multi['multiResponderEvents']).toBe(1);
+    expect(snapshot.multi['eventsWith2Responses']).toBe(1);
+    await coordinator.stop();
+  });
+
+  it('E: a same-person burst — two distinct thoughts, two reactionIds, one burstId, human gaps', async () => {
+    vi.useFakeTimers();
+    const { coordinator, motives, sent } = await setup();
+    const tour = { ...event, id: 'room-tour-e', speech: 'S: вот такой дом сняли', summary: 'вот такой дом сняли' };
+    await coordinator.prepareBrainEvent(tour, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'room-tour-e',
+      reactions: [
+        { username: 'bot-one', message: 'дом огромный конечно', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-one', message: 'сколько квадратов?', motive: 'ask', sourceType: 'event_observation' },
+      ],
+    });
+    expect(result.accepted).toHaveLength(2);
+    const [first, second] = result.accepted;
+    expect(first!.reactionId).not.toBe(second!.reactionId);
+    // The follow-up trails its own first part by a human pause, never the same instant.
+    expect(second!.delayMs).toBeGreaterThanOrEqual(first!.delayMs + 800);
+    expect(second!.delayMs).toBeLessThanOrEqual(first!.delayMs + 2_500);
+    await vi.runAllTimersAsync();
+    expect(sent.map((item) => item.message)).toEqual(['дом огромный конечно', 'сколько квадратов?']);
+    // Durable motive rows: independent ids, shared burst identity.
+    expect(motives).toHaveLength(2);
+    expect(motives[0]!.burstId).toBeDefined();
+    expect(motives[0]!.burstId).toBe(motives[1]!.burstId);
+    expect(motives.map((row) => row.burstIndex)).toEqual([0, 1]);
+    expect(motives.map((row) => row.burstSize)).toEqual([2, 2]);
+    const snapshot = coordinator.participationSnapshot() as { bursts: Record<string, number> };
+    expect(snapshot.bursts['started']).toBe(1);
+    expect(snapshot.bursts['messages']).toBe(2);
+    await coordinator.stop();
+  });
+
+  it('F-adjacent: the same line twice from one person is a stutter, not a burst', async () => {
+    const { coordinator } = await setup();
+    await coordinator.prepareBrainEvent({ ...event, id: 'stutter' }, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'stutter',
+      reactions: [
+        { username: 'bot-one', message: 'дом огромный', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-one', message: 'дом огромный', motive: 'react', sourceType: 'event_emotion' },
+      ],
+    });
+    expect(result.accepted).toHaveLength(1);
+    expect(result.rejected).toEqual([expect.objectContaining({ username: 'bot-one', reason: 'duplicate_username' })]);
+    await coordinator.stop();
+  });
+
+  it('G/H: a persona continues its own thread past cooldown, but not an unrelated event', async () => {
+    vi.useFakeTimers();
+    let currentTime = event.timestamp;
+    const { coordinator, sent, setCandidates } = await setup(true, () => currentTime);
+    const ask = { ...event, id: 'ask-price', speech: 'S: сняли жилье тут', summary: 'сняли жилье тут' };
+    await coordinator.prepareBrainEvent(ask, 0);
+    await coordinator.submitBatch({
+      eventId: 'ask-price',
+      reactions: [{ username: 'bot-one', message: 'сколько сутки стоят?', motive: 'ask', sourceType: 'event_observation' }],
+    });
+    await vi.runAllTimersAsync();
+    expect(sent.map((item) => item.message)).toEqual(['сколько сутки стоят?']);
+
+    // Ten seconds later the streamer answers. bot-one is deep inside its 30s cooldown.
+    currentTime += 10_000;
+    setCandidates([
+      { ...bot('bot-one', 0), lastReactionAt: currentTime - 10_000 },
+      bot('bot-three', 2),
+    ]);
+    const answer = { ...event, id: 'price-answer', timestamp: currentTime, speech: 'S: 1500 долларов сутки стоят', summary: '1500 долларов сутки стоят' };
+    const prepared = await coordinator.prepareBrainEvent(answer, 0);
+    // Continuation: its own question, directly answered — the cooldown yields.
+    expect(prepared.availableBots).toContain('bot-one');
+    const result = await coordinator.submitBatch({
+      eventId: 'price-answer',
+      reactions: [{ username: 'bot-one', message: 'пиздец', motive: 'react', sourceType: 'event_emotion' }],
+    });
+    expect(result.accepted.map((item) => item.username)).toEqual(['bot-one']);
+    const snapshot = coordinator.participationSnapshot() as { continuity: Record<string, number> };
+    expect(snapshot.continuity['recencyBypassedForActiveThread']).toBeGreaterThan(0);
+    expect(snapshot.continuity['threadsResolved']).toBe(1);
+
+    // An UNRELATED ordinary event three seconds after that: normal recency protection holds.
+    currentTime += 3_000;
+    setCandidates([
+      { ...bot('bot-one', 0), lastReactionAt: currentTime - 3_000 },
+      bot('bot-three', 2),
+    ]);
+    const unrelated = { ...event, id: 'sunset', timestamp: currentTime, speech: 'S: смотрите какой закат красивый', summary: 'смотрите какой закат красивый' };
+    const preparedUnrelated = await coordinator.prepareBrainEvent(unrelated, 0);
+    expect(preparedUnrelated.availableBots).not.toContain('bot-one');
+    await coordinator.stop();
+  });
+
+  it('J: the same commentary line from two different accounts stays suppressed outside a poll', async () => {
+    const { coordinator } = await setup();
+    await coordinator.prepareBrainEvent({ ...event, id: 'chorus' }, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'chorus',
+      reactions: [
+        { username: 'bot-one', message: 'дом огромный', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-three', message: 'дом огромный', motive: 'react', sourceType: 'event_emotion' },
+      ],
+    });
+    expect(result.accepted.map((item) => item.username)).toEqual(['bot-one']);
+    expect(result.rejected).toEqual([expect.objectContaining({ username: 'bot-three', reason: 'recent_duplicate' })]);
     await coordinator.stop();
   });
 });

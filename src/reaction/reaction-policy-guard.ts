@@ -29,7 +29,23 @@ export interface ValidateReactionBatchInput {
   isDuplicate: (username: string, message: string) => Promise<boolean>;
   /** Optional: whether this account was specifically marked down for a close match before. */
   isDisliked?: (username: string, message: string) => boolean;
+  /**
+   * A social ceiling replacing maxReactionsFor for this batch — set by the coordinator for a
+   * confirmed crowd call, where several voices are the natural shape. Counts UNIQUE accounts;
+   * a same-person burst never spends another account's seat.
+   */
+  maxReactionsOverride?: number;
+  /** Accounts whose per-account cooldown is waived: a direct continuation of their own active
+   *  thread. Busy-state and the global rate limit still apply — continuity is not a spam pass. */
+  recencyExempt?: ReadonlySet<string>;
+  /** Waives the recent-duplicate check for one message — an explicit constrained chat call being
+   *  answered in kind («+» after «киньте плюс»). The caller counts every use. */
+  duplicateExempt?: (username: string, message: string) => boolean;
 }
+
+/** One person may add at most two follow-up thoughts in one batch. Three consecutive messages is
+ *  already an animated human; four is a monologue nobody has in a stream chat. */
+const MAX_BURST_PARTS = 3;
 
 export interface PolicyBatchResult {
   accepted: PlannedReaction[];
@@ -99,9 +115,19 @@ export class ReactionPolicyGuard {
     }
     const directMentions = triggerDirectMentions(input.trigger);
     const current = new Map(input.currentCandidates.map((candidate) => [candidate.username.toLowerCase(), candidate]));
-    const seen = new Set<string>();
+    // Parts per account, in order. The same username appearing again is no longer an error: it is
+    // a same-person burst — a second, distinct thought sent as its own consecutive message, which
+    // is one of the most ordinary things a real chatter does and the one thing the old `seen` set
+    // made structurally impossible.
+    const partsByUsername = new Map<string, PlannedReaction[]>();
+    // Exact normalized text -> the account that already holds it in THIS batch. Two different
+    // people typing the same line at the same moment is an AI chorus unless the streamer asked
+    // for exactly that shape — the duplicateExempt carve-out below is what allows «+» «+».
+    const textOwners = new Map<string, string>();
+    const batchReservationIds = new Set<string>();
     const accepted: PlannedReaction[] = [];
     const rejected: ReactionRejection[] = [];
+    const maxVoices = input.maxReactionsOverride ?? this.maxReactionsFor(input.currentCandidates.length);
 
     for (let index = 0; index < input.reactions.length; index += 1) {
       const submitted = input.reactions[index]!;
@@ -113,9 +139,14 @@ export class ReactionPolicyGuard {
       if (!input.permittedUsernames.has(username) || !candidate || submitted.username !== candidate.username) {
         reject('unknown_candidate'); continue;
       }
-      if (seen.has(username)) { reject('duplicate_username'); continue; }
-      seen.add(username);
-      if (accepted.length >= this.maxReactionsFor(input.currentCandidates.length)) {
+      const parts = partsByUsername.get(username) ?? [];
+      if (parts.length >= MAX_BURST_PARTS) { reject('duplicate_username'); continue; }
+      // A follow-up must be a distinct thought; the same line twice is a stutter, not a burst.
+      if (parts.some((part) => part.message.toLowerCase() === message.toLowerCase())) {
+        reject('duplicate_username'); continue;
+      }
+      // Voices are counted by ACCOUNT: a burst spends its own author's seat only.
+      if (parts.length === 0 && partsByUsername.size >= maxVoices) {
         reject('too_many_reactions'); continue;
       }
       if (!candidate?.enabled || candidate.connectionState !== 'CONNECTED' || !candidate.chatConnected) {
@@ -129,23 +160,33 @@ export class ReactionPolicyGuard {
       if (/[—–]/.test(message)) { reject('typographic_dash'); continue; }
       if (hasInternalMetadataLeak(message)) { reject('internal_metadata'); continue; }
       if (Buffer.byteLength(message, 'utf8') > this.maxMessageBytes()) { reject('message_too_long'); continue; }
-      if (candidate.lastReactionAt && now - candidate.lastReactionAt < candidate.persona.behavior.minimumIntervalMs) {
+      if (!input.recencyExempt?.has(username)
+        && candidate.lastReactionAt && now - candidate.lastReactionAt < candidate.persona.behavior.minimumIntervalMs) {
         reject('account_cooldown'); continue;
       }
-      if ([...this.reservations.values()].some((reservation) => reservation.username === username)) {
+      if ([...this.reservations.entries()]
+        .some(([id, reservation]) => reservation.username === username && !batchReservationIds.has(id))) {
         reject('account_busy'); continue;
       }
       if (this.availableCapacity() <= 0) { reject('global_rate_limit'); continue; }
-      if (await input.isDuplicate(username, message)) { reject('recent_duplicate'); continue; }
+      const duplicateExempt = input.duplicateExempt?.(username, submitted.message) ?? false;
+      const textKey = message.toLowerCase();
+      if (!duplicateExempt && textOwners.has(textKey) && textOwners.get(textKey) !== username) {
+        reject('recent_duplicate'); continue;
+      }
+      if (!duplicateExempt && await input.isDuplicate(username, message)) { reject('recent_duplicate'); continue; }
       if (input.isDisliked?.(username, message)) { reject('disliked_near_duplicate'); continue; }
 
       const reservationId = randomUUID();
       // Transport spacing, not the human-typing simulation removed in b650a98: the first accepted
-      // account still answers immediately. Production logs showed two different accounts hitting
-      // Twitch 4-5ms apart, which its spam handling can silently drop with no error back to us,
-      // so each additional account in the same batch is offset by a fixed step.
-      const delayMs = accepted.length * this.batchStaggerMs;
+      // account still answers immediately; each additional ACCOUNT is offset by a fixed step so two
+      // never reach Twitch in the same instant. A burst follow-up instead trails its own previous
+      // part by a shorter human pause — a person adding a thought, not a queue slot.
+      const delayMs = parts.length === 0
+        ? (partsByUsername.size) * this.batchStaggerMs
+        : parts[parts.length - 1]!.delayMs + 800 + ((accepted.length * 977) % 1_700);
       this.reservations.set(reservationId, { username, scheduledAt: now + delayMs });
+      batchReservationIds.add(reservationId);
       accepted.push({
         // Passed through, never minted here: the coordinator assigns the id on intake so the same
         // value reaches every layer. The fallback exists only for direct callers in tests.
@@ -156,6 +197,23 @@ export class ReactionPolicyGuard {
         delayMs,
         directMention: directMentions.includes(username),
         message,
+        plannedAt: now,
+        ...(duplicateExempt ? { duplicateExempt: true } : {}),
+      });
+      parts.push(accepted[accepted.length - 1]!);
+      partsByUsername.set(username, parts);
+      if (!textOwners.has(textKey)) textOwners.set(textKey, username);
+    }
+
+    // Stamp burst identity where one account holds several seats: independent messages, one
+    // social act. burstIndex orders the thoughts; analytics joins them by burstId.
+    for (const parts of partsByUsername.values()) {
+      if (parts.length < 2) continue;
+      const burstId = randomUUID();
+      parts.forEach((part, index) => {
+        part.burstId = burstId;
+        part.burstIndex = index;
+        part.burstSize = parts.length;
       });
     }
     return { accepted, rejected };

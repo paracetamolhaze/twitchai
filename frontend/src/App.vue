@@ -644,6 +644,7 @@ async function loadDashboard(): Promise<void> {
     // Reading the rules is a plain select; only the training button ever costs a model call.
     void loadLearnedRules()
     void loadPersonaMinds()
+    void loadParticipation()
     Object.assign(overview, overviewData)
     Object.assign(usage, usageData)
     bots.value = botData
@@ -926,6 +927,34 @@ interface RejectedReaction {
   eventSummary?: string
   falsePositive?: boolean
 }
+interface ParticipationStats {
+  crowd: {
+    detected: number; byKind: Record<string, number>
+    with0Responses: number; with1Response: number; with2PlusResponses: number
+    botResponsesP50: number; botResponsesP90: number
+    humanRepliesObserved: number; duplicateAllowedByExplicitCall: number
+  }
+  multi: {
+    respondedEvents: number; multiResponderEvents: number; responsesPerRespondedEvent: number
+    eventsWith2Responses: number; eventsWith3PlusResponses: number
+  }
+  bursts: { started: number; messages: number; sizeP50: number; sizeMax: number; canceled: number; rejected: number }
+  continuity: {
+    followupWithin30s: number; followupWithin60s: number; recencyBypassedForActiveThread: number
+    threadsOpened: number; threadsResolved: number; threadsExpired: number
+  }
+  messagesBySource: Record<string, number>
+  sentThisStream: number
+  streamDurationMinutes: number
+}
+const participation = ref<ParticipationStats | undefined>()
+
+async function loadParticipation(): Promise<void> {
+  try {
+    participation.value = await api<ParticipationStats>('/api/participation')
+  } catch { /* блок опционален: без него страница живёт */ }
+}
+
 const motiveAnalytics = ref<MotiveAnalytics | undefined>()
 const rejectedReactions = ref<RejectedReaction[]>([])
 const rejectedBusy = ref(false)
@@ -1977,6 +2006,29 @@ onBeforeUnmount(() => {
             <div><span>Output + thinking</span><strong>{{ usage.currentStream.driveBrain.outputTokens + usage.currentStream.driveBrain.thinkingTokens }}</strong></div>
             <div><span>Cache hit</span><strong>{{ (usage.currentStream.driveCacheHitRatio * 100).toFixed(0) }}%</strong></div>
           </section>
+
+        <section class="panel">
+          <div class="section-heading"><div><p class="eyebrow">СОЦИАЛЬНАЯ ТОПОЛОГИЯ</p><h2>Участие · текущий стрим</h2></div><p class="muted">Кластеры вместо равномерного шума: сколько голосов собирают призывы к чату, общие моменты, серии сообщений одного человека и продолжения своих тредов.</p></div>
+          <template v-if="participation">
+            <p>
+              <strong>{{ participation.streamDurationMinutes > 0 ? (participation.sentThisStream / (participation.streamDurationMinutes / 60)).toFixed(1) : '0' }} сообщ./час</strong>
+              <span class="muted"> · отправлено {{ participation.sentThisStream }} за {{ Math.round(participation.streamDurationMinutes) }} мин</span>
+            </p>
+            <p class="muted">
+              Призывы к чату: {{ participation.crowd.detected }} (0 отв.: {{ participation.crowd.with0Responses }} · 1: {{ participation.crowd.with1Response }} · 2+: {{ participation.crowd.with2PlusResponses }} · медиана ботов {{ participation.crowd.botResponsesP50 }}) · дубликаты по призыву: {{ participation.crowd.duplicateAllowedByExplicitCall }}
+            </p>
+            <p class="muted">
+              События с ответом: {{ participation.multi.respondedEvents }} · мульти-ответы: {{ participation.multi.multiResponderEvents }} (2 голоса: {{ participation.multi.eventsWith2Responses }} · 3+: {{ participation.multi.eventsWith3PlusResponses }})
+            </p>
+            <p class="muted">
+              Серии: {{ participation.bursts.started }} (сообщений {{ participation.bursts.messages }}, макс. {{ participation.bursts.sizeMax }}, отменено {{ participation.bursts.canceled }}) · продолжения своих тредов: {{ participation.continuity.recencyBypassedForActiveThread }} · повтор того же человека ≤60с: {{ participation.continuity.followupWithin60s }}
+            </p>
+            <p class="muted">
+              Источники: <template v-for="(count, source) in participation.messagesBySource" :key="source"><template v-if="count > 0">{{ source }}: {{ count }} · </template></template>
+            </p>
+          </template>
+          <div v-else class="empty-state">Счётчики появятся после первого решения этой сессии.</div>
+        </section>
           <section class="panel metric-strip">
             <div><span>Отправлено / лимит в час</span><strong>{{ usage.currentStream.drive.messages }} / {{ usage.currentStream.drive.messagesBlockedByHourlyLimit }}</strong></div>
             <div><span>Тишина</span><strong>{{ usage.currentStream.drive.silentDecisions }}</strong></div>

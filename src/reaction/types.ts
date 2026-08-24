@@ -47,6 +47,19 @@ export interface PlannedReaction {
   directMention: boolean;
   viewerUsername?: string;
   message: string;
+  /** When the plan was accepted — the reference point burst follow-ups measure supersession from. */
+  plannedAt?: number;
+  /**
+   * Set when this message is part of a same-person burst: one Brain call returned the same
+   * username more than once because the person had a second, genuinely distinct thought. Every
+   * part stays an independent message with its own reactionId, guards and verdict; the shared
+   * burstId is what lets analytics see them as one social act.
+   */
+  burstId?: string;
+  burstIndex?: number;
+  burstSize?: number;
+  /** The duplicate check was waived for this plan (explicit constrained chat call, short answer). */
+  duplicateExempt?: boolean;
 }
 
 export interface SubmittedReaction {
@@ -151,6 +164,10 @@ export interface SentMessageMotiveRecord {
   sourceValidated: boolean;
   validatedSourceType?: string;
   learnedRuleIds: string[];
+  /** Same-person burst membership. Absent for the ordinary single-message case. */
+  burstId?: string;
+  burstIndex?: number;
+  burstSize?: number;
 }
 
 export type ReactionSendFailureReason = 'account_unavailable' | 'local_rate_limit' | 'twitch_send_failed';
