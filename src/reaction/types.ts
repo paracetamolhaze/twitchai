@@ -131,7 +131,10 @@ export interface ReactionRejection {
 
 export interface ReactionBatchResult {
   eventId: string;
-  accepted: Array<{ username: string; delayMs: number; reactionId: string }>;
+  accepted: Array<{
+    username: string; delayMs: number; reactionId: string;
+    burstId?: string; burstIndex?: number; burstSize?: number;
+  }>;
   rejected: ReactionRejection[];
   stale?: boolean;
 }

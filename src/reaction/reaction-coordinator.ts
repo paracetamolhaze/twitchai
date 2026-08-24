@@ -22,7 +22,7 @@ import { topicRelevance } from '../shared/topics';
 import { shortlistCandidates } from './candidate-shortlist';
 import { emptyProvenancePools, ProvenancePools, ProvenanceVerdict, validateMotiveProvenance } from './motive-provenance';
 import { hasTrailingLaughterTag, isEventParaphrase, NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
-import { ReactionPolicyGuard } from './reaction-policy-guard';
+import { PolicyBatchResult, ReactionPolicyGuard } from './reaction-policy-guard';
 import {
   PlannedReaction,
   ReactionBatch,
@@ -168,8 +168,10 @@ interface PendingContext {
    *  loudly the real audience is already answering. Absent means the ordinary formula applies. */
   maxReactionsOverride?: number;
   /** Accounts allowed past their own cooldown because this moment directly continues their own
-   *  active thread — their question, their open loop. Never fairness, never a general pass. */
-  recencyExempt: Set<string>;
+   *  active thread — their question, their open loop. The value says WHY the bypass fired, which
+   *  is what the next live test needs to see: a run dominated by topic_only would mean the thread
+   *  matcher is looser than the social claim it makes. Never fairness, never a general pass. */
+  recencyExempt: Map<string, RecencyBypassReason>;
   /**
    * Everything the payload actually gave each offered persona to ground a message in, keyed by
    * lowercase username and frozen at payload time. This is what a claimed motive source is checked
@@ -313,6 +315,7 @@ interface SessionDecisionStats {
     continuity: {
       followupWithin30s: number; followupWithin60s: number;
       recencyBypassedForActiveThread: number;
+      bypassByReason: Record<string, number>;
       threadsOpened: number; threadsResolved: number; threadsExpired: number;
     };
     bySource: Record<'ordinary_single' | 'crowd_response' | 'shared_moment' | 'burst_followup' | 'conversation_followup' | 'persona_drive', number>;
@@ -367,6 +370,7 @@ function emptySessionStats(): SessionDecisionStats {
       bursts: { started: 0, messages: 0, sizes: [], canceled: 0, rejected: 0 },
       continuity: {
         followupWithin30s: 0, followupWithin60s: 0, recencyBypassedForActiveThread: 0,
+        bypassByReason: {},
         threadsOpened: 0, threadsResolved: 0, threadsExpired: 0,
       },
       bySource: {
@@ -384,6 +388,18 @@ interface ActiveThread {
   topicText: string;
   expiresAt: number;
 }
+
+/**
+ * Why a cooldown was waived. Today's threads only ever open on a persona's own sent question, so
+ * own_question (strong topical match — this looks like their question being answered) and
+ * topic_only (weak match — same subject, no more) are the two reasons that can actually fire;
+ * the rest are reserved so the breakdown does not need a schema change when threads widen.
+ */
+type RecencyBypassReason = 'own_question' | 'open_loop' | 'direct_reply' | 'explicit_answer' | 'topic_only';
+
+/** Above this the continuing event reads as answering the thread's question rather than merely
+ *  sharing its subject — the canonical-topic floor, deliberately the same bar retrieval uses. */
+const THREAD_ANSWER_RELEVANCE = 0.3;
 
 const ACTIVE_THREAD_TTL_MS = 90_000;
 
@@ -649,7 +665,8 @@ export class ReactionCoordinator extends EventEmitter {
         ? (username, message) => this.options.feedbackStore!.isNearDuplicateOfDisliked(username, message)
         : undefined,
       ...(pending.maxReactionsOverride !== undefined ? { maxReactionsOverride: pending.maxReactionsOverride } : {}),
-      recencyExempt: pending.recencyExempt,
+      constrainedCall: pending.chatCall !== undefined && isConstrainedCall(pending.chatCall),
+      recencyExempt: new Set(pending.recencyExempt.keys()),
       // «+» answering «киньте плюс» is a person doing exactly what was asked; the duplicate check
       // must not read the room's most ordinary act as spam. Constrained calls only, short answers
       // only, counted every time it actually matters.
@@ -724,6 +741,7 @@ export class ReactionCoordinator extends EventEmitter {
         stats.sizes.push(size);
       }
     }
+    this.session.participation.bursts.rejected += result.planned.droppedByEventCap;
     if (pending.trigger.kind === 'stream_event') {
       if (pending.chatCall) {
         const crowd = this.session.participation.crowd;
@@ -818,10 +836,13 @@ export class ReactionCoordinator extends EventEmitter {
       silentCandidateCount: Math.max(0, pending.candidateCount - parsed.reactions.length),
     };
     this.emitDecision(decision);
-    this.logDecision(pending, decision, sentMotives);
+    this.logDecision(pending, decision, sentMotives, result.planned);
     return {
       eventId: parsed.eventId,
-      accepted: result.accepted.map((plan) => ({ username: plan.bot.username, delayMs: plan.delayMs, reactionId: plan.reactionId })),
+      accepted: result.accepted.map((plan) => ({
+        username: plan.bot.username, delayMs: plan.delayMs, reactionId: plan.reactionId,
+        ...(plan.burstId ? { burstId: plan.burstId, burstIndex: plan.burstIndex, burstSize: plan.burstSize } : {}),
+      })),
       rejected: allRejections,
     };
   }
@@ -848,6 +869,7 @@ export class ReactionCoordinator extends EventEmitter {
     pending: PendingContext,
     decision: ReactionDecisionRecord,
     sentMotives: SentMotiveEntry[] = [],
+    planned: PolicyBatchResult['planned'] = { uniqueResponders: 0, physicalMessages: 0, droppedByEventCap: 0 },
   ): void {
     const trigger = pending.trigger;
     const tally = this.session.byTrigger[trigger.kind];
@@ -879,7 +901,12 @@ export class ReactionCoordinator extends EventEmitter {
       brainSchemaVersion: BRAIN_SCHEMA_VERSION,
       shortlistReasons: pending.shortlistReasons,
       ...(pending.chatCall ? { chatCall: pending.chatCall, crowdCeiling: pending.maxReactionsOverride } : {}),
-      uniqueResponders: new Set(decision.selected.map((item) => item.username.toLowerCase())).size,
+      uniqueRespondersPlanned: planned.uniqueResponders,
+      physicalMessagesPlanned: planned.physicalMessages,
+      physicalMessagesDroppedByEventCap: planned.droppedByEventCap,
+      ...(pending.recencyExempt.size > 0
+        ? { recencyBypasses: Object.fromEntries(pending.recencyExempt) }
+        : {}),
       // The audit trail the operator asked for: not reasoning, the structured origin. Reading
       // "а сколько там аренда?" next to motive=ask source=knowledge_gap(china_rent) is the whole
       // point of the field.
@@ -1166,7 +1193,7 @@ export class ReactionCoordinator extends EventEmitter {
     // directly continues — the streamer answering their question — may pass its cooldown, because
     // «сколько стоит?» followed by silence when the price finally lands is not how a person who
     // just asked behaves. Busy-state and the global rate limit still apply.
-    const recencyExempt = new Set<string>();
+    const recencyExempt = new Map<string, RecencyBypassReason>();
     const candidates = directTargets.size > 0
       ? named
       : named.filter((candidate) => {
@@ -1181,9 +1208,13 @@ export class ReactionCoordinator extends EventEmitter {
           this.session.participation.continuity.threadsExpired += 1;
           return false;
         }
-        if (topicRelevance(eventText, thread.topicText) <= 0) return false;
-        recencyExempt.add(key);
-        this.session.participation.continuity.recencyBypassedForActiveThread += 1;
+        const relevance = topicRelevance(eventText, thread.topicText);
+        if (relevance <= 0) return false;
+        const reason: RecencyBypassReason = relevance >= THREAD_ANSWER_RELEVANCE ? 'own_question' : 'topic_only';
+        recencyExempt.set(key, reason);
+        const continuity = this.session.participation.continuity;
+        continuity.recencyBypassedForActiveThread += 1;
+        continuity.bypassByReason[reason] = (continuity.bypassByReason[reason] ?? 0) + 1;
         return true;
       });
     const directTargetUnavailable = [...directTargets]
@@ -1574,7 +1605,7 @@ export class ReactionCoordinator extends EventEmitter {
       // whose drive-message cases carried no rulesSuppliedAtGeneration.
       learnedRulesSupplied: extras.learnedRulesSupplied ?? [],
       shortlistReasons: { mandatory: 0, topicRelevant: 0, padding: 0, trimmedRelevant: 0 },
-      recencyExempt: new Set(),
+      recencyExempt: new Map(),
       groundedNumbers: extras.groundedNumbers ?? new Set(),
       // The drive freezes its own pools because it builds its own payload; an absent map means
       // every claim validates against nothing supplied, which is exactly right for a caller that

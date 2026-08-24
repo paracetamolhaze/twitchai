@@ -52,6 +52,7 @@ async function setup(
   feedbackStore?: PersonaFeedbackStore,
   learnedPolicy?: LearnedPolicyStore,
   mind?: PersonaMindStore,
+  policyOverrides: Partial<ConstructorParameters<typeof ReactionPolicyGuard>[0]> = {},
 ) {
   const sendResult = senderResult;
   // Most cases here silence the logger; the ones asserting on what a decision records need to read
@@ -100,6 +101,7 @@ async function setup(
     // accounts a crowd of three is allowed; the share itself has its own test.
     reactionShareOfCandidates: 1,
     now,
+    ...policyOverrides,
   });
   const coordinator = new ReactionCoordinator({
     policy,
@@ -1876,6 +1878,122 @@ describe('social participation topology — the live fixtures', () => {
     });
     expect(result.accepted.map((item) => item.username)).toEqual(['bot-one']);
     expect(result.rejected).toEqual([expect.objectContaining({ username: 'bot-three', reason: 'recent_duplicate' })]);
+    await coordinator.stop();
+  });
+});
+
+describe('hardening: physical message caps over the crowd/burst combination', () => {
+  const crowdEvent: StreamEvent = {
+    ...event,
+    id: 'crowd-cap',
+    summary: 'Стример просит чат кинуть плюс',
+    speech: 'S: скажите, меня слышно? киньте плюсик в чат',
+    audience: 'twitch_chat',
+    audienceConfidence: 0.9,
+    importance: 0.85,
+  };
+
+  it('A/B: a constrained call takes exactly one physical message per persona, whatever the Brain tries', async () => {
+    const { coordinator, logged } = await setup(true, () => event.timestamp, true, undefined, undefined, undefined,
+      { globalMessagesPer30Seconds: 30 });
+    await coordinator.prepareBrainEvent(crowdEvent, 0);
+    // Every offered persona tries a three-part burst — the 18-message hole this pass closes.
+    const result = await coordinator.submitBatch({
+      eventId: 'crowd-cap',
+      reactions: ['bot-one', 'bot-two', 'bot-three'].flatMap((username) => [
+        { username, message: '+', motive: 'reply', sourceType: 'chat_reply' },
+        { username, message: 'слышно', motive: 'reply', sourceType: 'chat_reply' },
+        { username, message: 'норм', motive: 'reply', sourceType: 'chat_reply' },
+      ]),
+    });
+    // bot-two is disconnected in this harness? No — all three are connected; one message each.
+    expect(result.accepted.map((item) => item.username)).toEqual(['bot-one', 'bot-two', 'bot-three']);
+    expect(result.accepted.every((item) => item.burstId === undefined)).toBe(true);
+    const capDrops = result.rejected.filter((item) => item.reason === 'too_many_reactions');
+    expect(capDrops).toHaveLength(6);
+    const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated'
+      && entry['eventId'] === 'crowd-cap');
+    expect(decision?.['uniqueRespondersPlanned']).toBe(3);
+    expect(decision?.['physicalMessagesPlanned']).toBe(3);
+    expect(decision?.['physicalMessagesDroppedByEventCap']).toBe(6);
+    await coordinator.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('C: open feedback keeps the burst — two genuinely different thoughts pass', async () => {
+    const { coordinator } = await setup(true, () => event.timestamp, false, undefined, undefined, undefined,
+      { globalMessagesPer30Seconds: 30 });
+    const feedback: StreamEvent = {
+      ...event, id: 'feedback-burst', importance: 0.8,
+      summary: 'Стример просит рассказать что понравилось',
+      speech: 'S: расскажите, что вам больше всего понравилось',
+      audience: 'twitch_chat', audienceConfidence: 0.75,
+    };
+    await coordinator.prepareBrainEvent(feedback, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'feedback-burst',
+      reactions: [
+        { username: 'bot-one', message: 'дом огромный', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-one', message: 'сколько квадратов?', motive: 'ask', sourceType: 'event_observation' },
+      ],
+    });
+    expect(result.accepted).toHaveLength(2);
+    expect(result.accepted[0]!.burstId).toBeDefined();
+    await coordinator.stop();
+  });
+
+  it('D/E/F: unique and physical caps both hold on an ordinary event, and the event cap — not the global limit — is what binds', async () => {
+    const { coordinator, logged } = await setup(true, () => event.timestamp, true, undefined, undefined, undefined,
+      // Global limit far away, so anything rejected below is the EVENT's own ceiling working.
+      { globalMessagesPer30Seconds: 30, maxReactionsPerEvent: 2 });
+    await coordinator.prepareBrainEvent({ ...event, id: 'both-caps' }, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'both-caps',
+      reactions: [
+        // bot-one: full three-part burst, third part visibly its own thought (a question).
+        { username: 'bot-one', message: 'дом огромный', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-one', message: 'сколько квадратов?', motive: 'ask', sourceType: 'event_observation' },
+        { username: 'bot-one', message: 'и цена за сутки какая?', motive: 'ask', sourceType: 'event_observation' },
+        // bot-three: second unique voice, its follow-up hits the physical ceiling (2 voices + 2).
+        { username: 'bot-three', message: 'выглядит дорого', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-three', message: 'а район какой?', motive: 'ask', sourceType: 'event_observation' },
+        // bot-two: third unique voice, over the unique cap of two.
+        { username: 'bot-two', message: 'ну такое', motive: 'react', sourceType: 'event_emotion' },
+      ],
+    });
+    expect(result.accepted.map((item) => item.username)).toEqual(['bot-one', 'bot-one', 'bot-one', 'bot-three']);
+    expect(result.rejected).toEqual(expect.arrayContaining([
+      expect.objectContaining({ username: 'bot-three', reason: 'too_many_reactions' }),
+      expect.objectContaining({ username: 'bot-two', reason: 'too_many_reactions' }),
+    ]));
+    // Nothing here was refused by the global rate limit — the per-event ceiling did the bounding.
+    expect(result.rejected.some((item) => item.reason === 'global_rate_limit')).toBe(false);
+    const decision = logged().find((entry) => entry.message === 'Gemini reaction batch validated'
+      && entry['eventId'] === 'both-caps');
+    expect(decision?.['uniqueRespondersPlanned']).toBe(2);
+    expect(decision?.['physicalMessagesPlanned']).toBe(4);
+    // Both refusals here are the EVENT ceiling: bot-three's follow-up hit the physical cap and
+    // bot-two arrived after the physical ceiling was already full.
+    expect(decision?.['physicalMessagesDroppedByEventCap']).toBe(2);
+    await coordinator.stop();
+    vi.restoreAllMocks();
+  });
+
+  it('third burst part without a fresh thought is refused even where bursts are legal', async () => {
+    const { coordinator } = await setup(true, () => event.timestamp, false, undefined, undefined, undefined,
+      { globalMessagesPer30Seconds: 30 });
+    await coordinator.prepareBrainEvent({ ...event, id: 'third-bar' }, 0);
+    const result = await coordinator.submitBatch({
+      eventId: 'third-bar',
+      reactions: [
+        { username: 'bot-one', message: 'дом огромный', motive: 'react', sourceType: 'event_emotion' },
+        { username: 'bot-one', message: 'сколько квадратов?', motive: 'ask', sourceType: 'event_observation' },
+        // No new words, no question: filler riding the burst.
+        { username: 'bot-one', message: 'дом квадратов', motive: 'react', sourceType: 'event_emotion' },
+      ],
+    });
+    expect(result.accepted).toHaveLength(2);
+    expect(result.rejected).toEqual([expect.objectContaining({ username: 'bot-one', reason: 'duplicate_username' })]);
     await coordinator.stop();
   });
 });

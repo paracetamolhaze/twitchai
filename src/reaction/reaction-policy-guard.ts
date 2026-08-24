@@ -35,6 +35,12 @@ export interface ValidateReactionBatchInput {
    * a same-person burst never spends another account's seat.
    */
   maxReactionsOverride?: number;
+  /**
+   * The crowd call, when present, asked for a constrained answer («киньте плюс»). One persona
+   * then sends exactly one physical message: «+ слышно» is a person answering a poll; «+» then
+   * «слышно» then «норм» is a machine padding one. Bursts stay legal for open conversation only.
+   */
+  constrainedCall?: boolean;
   /** Accounts whose per-account cooldown is waived: a direct continuation of their own active
    *  thread. Busy-state and the global rate limit still apply — continuity is not a spam pass. */
   recencyExempt?: ReadonlySet<string>;
@@ -43,14 +49,33 @@ export interface ValidateReactionBatchInput {
   duplicateExempt?: (username: string, message: string) => boolean;
 }
 
-/** One person may add at most two follow-up thoughts in one batch. Three consecutive messages is
- *  already an animated human; four is a monologue nobody has in a stream chat. */
+/** One person may add at most two follow-up thoughts in one batch — and the second follow-up has
+ *  its own higher bar in validateBatch (new words or a question), so the OPERATIONAL default is
+ *  two messages and three happens only for a visibly distinct third thought. Four is a monologue
+ *  nobody has in a stream chat. */
 const MAX_BURST_PARTS = 3;
 
 export interface PolicyBatchResult {
   accepted: PlannedReaction[];
   rejected: ReactionRejection[];
+  /** What this event actually planned against its own caps — the numbers the decision log reads. */
+  planned: {
+    uniqueResponders: number;
+    physicalMessages: number;
+    /** Physical messages refused by the per-event ceiling specifically — never by the global
+     *  rate limit, which is the LAST safety net, not the normal way one event gets bounded. */
+    droppedByEventCap: number;
+  };
 }
+
+/**
+ * How many physical messages past the unique-responder count one event may add through bursts.
+ * Two, because a burst is at most two follow-up thoughts and most events carry at most one burst:
+ * an ordinary single-voice moment stays at three messages worst case, an open-feedback call at
+ * six, and nothing ever again multiplies voices by burst parts into an 18-message pile the global
+ * limiter has to catch.
+ */
+const BURST_HEADROOM = 2;
 
 export class ReactionPolicyGuard {
   private readonly now: () => number;
@@ -111,6 +136,7 @@ export class ReactionPolicyGuard {
           username: reaction.username.trim().toLowerCase(),
           reason: 'account_classification' as const,
         })),
+        planned: { uniqueResponders: 0, physicalMessages: 0, droppedByEventCap: 0 },
       };
     }
     const directMentions = triggerDirectMentions(input.trigger);
@@ -128,6 +154,11 @@ export class ReactionPolicyGuard {
     const accepted: PlannedReaction[] = [];
     const rejected: ReactionRejection[] = [];
     const maxVoices = input.maxReactionsOverride ?? this.maxReactionsFor(input.currentCandidates.length);
+    // The physical ceiling is the second, separate bound: voices count PEOPLE, this counts Twitch
+    // messages. A constrained poll gets no burst headroom at all — its whole point is one short
+    // answer per person.
+    const physicalCap = input.constrainedCall ? maxVoices : maxVoices + BURST_HEADROOM;
+    let droppedByEventCap = 0;
 
     for (let index = 0; index < input.reactions.length; index += 1) {
       const submitted = input.reactions[index]!;
@@ -144,6 +175,27 @@ export class ReactionPolicyGuard {
       // A follow-up must be a distinct thought; the same line twice is a stutter, not a burst.
       if (parts.some((part) => part.message.toLowerCase() === message.toLowerCase())) {
         reject('duplicate_username'); continue;
+      }
+      // A constrained call takes one physical message per person, full stop.
+      if (input.constrainedCall && parts.length >= 1) {
+        droppedByEventCap += 1;
+        reject('too_many_reactions'); continue;
+      }
+      // The event's physical ceiling: burst parts are real Twitch messages and are bounded as
+      // such, independently of how many PEOPLE answered.
+      if (accepted.length >= physicalCap) {
+        droppedByEventCap += 1;
+        reject('too_many_reactions'); continue;
+      }
+      // A THIRD consecutive message has a higher bar than a second: it must visibly be its own
+      // thought — new words or a question — or two parts were enough. Deterministic, no dice.
+      if (parts.length === 2) {
+        const seenTokens = new Set(parts.flatMap((part) => part.message.toLowerCase().split(' ')));
+        const fresh = message.toLowerCase().split(' ').filter((token) => !seenTokens.has(token));
+        if (fresh.length < 2 && !/[?？]/.test(message)) {
+          droppedByEventCap += 1;
+          reject('duplicate_username'); continue;
+        }
       }
       // Voices are counted by ACCOUNT: a burst spends its own author's seat only.
       if (parts.length === 0 && partsByUsername.size >= maxVoices) {
@@ -216,7 +268,15 @@ export class ReactionPolicyGuard {
         part.burstSize = parts.length;
       });
     }
-    return { accepted, rejected };
+    return {
+      accepted,
+      rejected,
+      planned: {
+        uniqueResponders: partsByUsername.size,
+        physicalMessages: accepted.length,
+        droppedByEventCap,
+      },
+    };
   }
 
   recordSent(at = this.now(), reservationId?: string): void {
