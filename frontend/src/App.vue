@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { io, Socket } from 'socket.io-client'
+import DashboardOverview from './components/DashboardOverview.vue'
 
 type Page = 'overview' | 'bots' | 'brain' | 'memories' | 'chat' | 'rules' | 'minds' | 'settings'
 type PersonaTab = 'main' | 'character' | 'family' | 'biography' | 'interests' | 'opinions' | 'speech' | 'twitch' | 'memory' | 'quality'
@@ -393,6 +394,7 @@ type ReactionTraceMessage = NonNullable<ReactionTrace['reactions']>[number]
 const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3000').replace(/\/$/, '')
 const PERSONA_SIMILARITY_WARNING_THRESHOLD = 0.65
 const activePage = ref<Page>('overview')
+watch(activePage, () => window.scrollTo({ top: 0 }), { flush: 'post' })
 const draftToken = ref('')
 const authenticated = ref(false)
 const checkingSession = ref(true)
@@ -490,13 +492,13 @@ let socket: Socket | undefined
 let pollTimer: number | undefined
 
 const pages: Array<{ id: Page; label: string; glyph: string }> = [
-  { id: 'overview', label: 'Обзор', glyph: '◫' },
-  { id: 'bots', label: 'Боты', glyph: '◎' },
-  { id: 'brain', label: 'Мозг стрима', glyph: '◇' },
+  { id: 'overview', label: 'Обзор эфира', glyph: '◫' },
+  { id: 'bots', label: 'Аккаунты', glyph: '◎' },
+  { id: 'brain', label: 'Понимание эфира', glyph: '◇' },
   { id: 'memories', label: 'Память стримера', glyph: '◌' },
-  { id: 'chat', label: 'Чат', glyph: '≡' },
-  { id: 'rules', label: 'Обученные правила', glyph: '✦' },
-  { id: 'minds', label: 'Люди', glyph: '☰' },
+  { id: 'chat', label: 'Чат и оценки', glyph: '≡' },
+  { id: 'rules', label: 'Обучение', glyph: '✦' },
+  { id: 'minds', label: 'Жизнь персонажей', glyph: '☰' },
   { id: 'settings', label: 'Настройки', glyph: '⚙' },
 ]
 
@@ -602,9 +604,9 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
     credentials: 'include',
     headers: requestHeaders(options.headers, options.body !== undefined),
   })
-  if (response.status === 401 || response.status === 503) {
+  if (response.status === 401) {
     endLocalSession()
-    throw new Error(response.status === 503 ? 'На сервере не настроена авторизация панели' : 'Сессия истекла или недействительна')
+    throw new Error('Сессия истекла или недействительна')
   }
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: `HTTP ${response.status}` })) as { error?: string }
@@ -1131,6 +1133,20 @@ function deliveryVerdict(account: DeliveryAccountRecord): string {
   if (account.hidden === 0) return 'чат показывает'
   if (account.shown === 0) return 'Twitch не показывает'
   return 'показывает через раз'
+}
+
+const pauseBusy = ref(false)
+async function togglePaused(): Promise<void> {
+  if (pauseBusy.value) return
+  pauseBusy.value = true
+  errorMessage.value = ''
+  const paused = !settings.paused
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ paused }) })
+    settings.paused = paused
+    saveMessage.value = paused ? 'Боты поставлены на паузу.' : 'Боты запущены.'
+  } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
+  finally { pauseBusy.value = false }
 }
 
 async function saveSettings(): Promise<void> {
@@ -1826,18 +1842,18 @@ onBeforeUnmount(() => {
       <div class="brand-mark">TV</div>
       <p class="eyebrow">TWITCH AI VIEWERS</p>
       <h1>Панель управления</h1>
-      <p class="muted">Введите токен один раз. Сервер выдаст защищённую HttpOnly-сессию на 30 дней; сам токен не сохраняется в браузере.</p>
+      <p class="muted">Войдите, чтобы управлять ботами, следить за эфиром и оценивать ответы.</p>
       <label>Токен панели<input v-model="draftToken" type="password" autocomplete="current-password" autofocus placeholder="••••••••••••••••" /></label>
-      <button class="primary wide" type="submit" :disabled="loading">Войти безопасно</button>
+      <button class="primary wide" type="submit" :disabled="loading">Открыть панель</button>
       <p v-if="errorMessage" class="notice error">{{ errorMessage }}</p>
     </form>
   </div>
 
   <div v-else class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark small">TV</span><span>Twitch AI<br><b>Viewers</b></span></div>
-      <nav aria-label="Разделы панели">
-        <button v-for="page in pages" :key="page.id" :class="{ active: activePage === page.id }" @click="activePage = page.id">
+      <div class="brand"><span class="brand-mark small">TV</span><span>Twitch AI<b>STREAM COMPANION</b></span></div>
+      <p class="nav-caption">РАБОЧЕЕ ПРОСТРАНСТВО</p><nav aria-label="Разделы панели">
+        <button v-for="page in pages" :key="page.id" :class="{ active: activePage === page.id }" :aria-current="activePage === page.id ? 'page' : undefined" @click="activePage = page.id">
           <span class="nav-glyph">{{ page.glyph }}</span><span>{{ page.label }}</span>
         </button>
       </nav>
@@ -1850,10 +1866,10 @@ onBeforeUnmount(() => {
 
     <div class="workspace">
       <header class="topbar">
-        <div><p class="eyebrow">{{ overview.category || 'КАТЕГОРИЯ НЕИЗВЕСТНА' }}</p><h2>{{ overview.channel || 'Канал не настроен' }}</h2></div>
+        <div><p class="eyebrow">{{ pages.find(page => page.id === activePage)?.label }}</p><h2>{{ overview.channel || 'Канал не настроен' }}</h2></div>
         <div class="topbar-actions">
           <span :class="['live-pill', overview.isLive ? 'live' : '']"><i></i>{{ overview.isLive ? 'В ЭФИРЕ' : 'НЕ В ЭФИРЕ' }}</span>
-          <button class="text-button" type="button" @click="settings.paused = !settings.paused; saveSettings()">{{ settings.paused ? 'Запустить' : 'Остановить всё' }}</button>
+          <button class="secondary session-toggle" type="button" :disabled="pauseBusy || !backendOnline || !overview.channel" @click="togglePaused">{{ pauseBusy ? 'Применяем…' : settings.paused ? 'Запустить ботов' : 'Пауза' }}</button>
           <button class="icon-button" title="Обновить" :disabled="loading" @click="loadDashboard">↻</button>
         </div>
       </header>
@@ -1862,35 +1878,14 @@ onBeforeUnmount(() => {
         <p v-if="errorMessage" class="notice error">{{ errorMessage }}</p>
         <p v-if="saveMessage" class="notice success">{{ saveMessage }}</p>
 
-        <template v-if="activePage === 'overview'">
-          <div class="page-heading"><div><p class="eyebrow">ЦЕНТР УПРАВЛЕНИЯ</p><h1>Ваш эфир</h1></div><p class="muted">Состояние ботов, сообщения и расходы — всё важное сейчас.</p></div>
-          <section class="health-grid" aria-label="Состояние системы">
-            <article v-for="item in healthItems" :key="item.label" class="health-card">
-              <div><span :class="['status-light', item.tone]"></span><span>{{ item.label }}</span></div>
-              <strong>{{ item.status }}</strong><small>{{ item.detail }}</small>
-            </article>
-          </section>
-          <section class="metric-strip operator-metrics">
-            <div><span>Подключено ботов</span><strong>{{ overview.activeBots }} / {{ overview.totalBots }}</strong></div>
-            <div><span>Сообщений в чате за эфир</span><strong>{{ usage.currentStream.confirmedDeliveries }}</strong></div>
-            <div><span>Расход на эфир · оценка</span><strong>${{ usage.currentStream.totalAi.estimatedCostUsd.toFixed(3) }}</strong></div>
-            <div><span>Время работы приложения</span><strong>{{ formatDuration(usage.uptimeSeconds) }}</strong></div>
-          </section>
-          <div class="overview-grid">
-            <section class="panel timeline-panel">
-              <div class="panel-heading"><div><p class="eyebrow">ПРИЧИНА → РЕАКЦИЯ</p><h3>Общая лента</h3></div><span class="subtle-chip">сейчас</span></div>
-              <div v-if="timeline.length" class="timeline"><article v-for="item in timeline" :key="item.id" :class="['timeline-item', item.tone]"><time>{{ formatTime(item.timestamp) }}</time><span class="timeline-node"></span><div><p>{{ item.title }}</p><small>{{ item.meta }}</small></div></article></div>
-              <div v-else class="empty-state">События и чат появятся после начала стрима.</div>
-            </section>
-            <section class="panel">
-              <div class="panel-heading"><div><p class="eyebrow">АККАУНТЫ</p><h3>Боты</h3></div><button class="text-button" @click="activePage = 'bots'">Показать все</button></div>
-              <div class="compact-bots">
-                <article v-for="bot in bots.slice(0, 8)" :key="bot.username"><span class="avatar">{{ bot.username.slice(0, 2).toUpperCase() }}</span><div><strong>{{ bot.username }}</strong><small>{{ personaById.get(bot.personaId)?.name || bot.personaId }}</small></div><span :class="['state-badge', stateClass(bot.connectionState)]">{{ stateLabel(bot.connectionState) }}</span></article>
-                <div v-if="!bots.length" class="empty-state">В Railway пока не настроены аккаунты BOTn.</div>
-              </div>
-            </section>
-          </div>
-        </template>
+        <DashboardOverview v-if="activePage === 'overview'"
+          :channel="overview.channel" :live="overview.isLive" :paused="settings.paused" :online="backendOnline" :busy="pauseBusy"
+          :active-bots="overview.activeBots" :total-bots="overview.totalBots" :messages="usage.currentStream.confirmedDeliveries"
+          :cost="usage.currentStream.totalAi.estimatedCostUsd" :duration="formatDuration(usage.uptimeSeconds)"
+          :pending-feedback="teacherStatus?.pendingFeedback ?? pendingVerdictCount" :activities="timeline" :health="healthItems"
+          :bots="bots.map(bot => ({ username: bot.username, name: personaById.get(bot.personaId)?.identity.firstName || 'Личность не назначена', status: stateLabel(bot.connectionState), connected: bot.chatConnected }))"
+          @navigate="activePage = $event" @toggle="togglePaused"
+        />
 
         <template v-else-if="activePage === 'bots'">
           <div class="page-heading"><div><p class="eyebrow">ОФИЦИАЛЬНЫЙ ЧАТ TWITCH</p><h1>Аккаунты ботов</h1></div><p class="muted">Сбой одного аккаунта не останавливает остальные. Накрутка просмотров не используется.</p></div>
@@ -2172,7 +2167,7 @@ onBeforeUnmount(() => {
 
         <template v-else-if="activePage === 'rules'">
           <div class="page-heading">
-            <div><p class="eyebrow">ЧЕМУ НАУЧИЛИ ОЦЕНКИ</p><h1>Обученные правила</h1></div>
+            <div><p class="eyebrow">ЧЕМУ НАУЧИЛИ ОЦЕНКИ</p><h1>Обучение</h1></div>
             <p class="muted">Это инструкции для будущих ответов, которые ИИ составляет из ваших оценок сообщений. Саму модель мы не переобучаем.</p>
           </div>
           <section class="panel learning-guide">
@@ -2246,7 +2241,7 @@ onBeforeUnmount(() => {
 
         <template v-else-if="activePage === 'minds'">
           <div class="page-heading">
-            <div><p class="eyebrow">ЖИВЫЕ ПЕРСОНЫ</p><h1>Люди</h1></div>
+            <div><p class="eyebrow">ЖИВЫЕ ПЕРСОНЫ</p><h1>Жизнь персонажей</h1></div>
             <p class="muted">Внутреннее состояние каждого аккаунта: что он знает и чего не знает, что ему любопытно, чем занята его неделя, что он запомнил со стрима и почему написал последние сообщения. Это причина мысли, а не текст сообщений.</p>
           </div>
           <section class="panel rules-list">
