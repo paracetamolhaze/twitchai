@@ -403,6 +403,12 @@ export class Application {
           return [snapshot.channel, ...snapshot.botUsernames];
         },
         onUsage: (usage) => this.usage.recordHearingUsage(usage),
+        onUnavailable: () => {
+          if (transcriptionMode !== 'transcriber') return;
+          this.contextStore.clearSpeech();
+          this.clearTranscriptAccumulator();
+          this.queueBrainDelta({ type: 'CONTEXT_UPDATED', summary: 'Hearing is unavailable. Earlier speech is historical, not current evidence; do not claim to hear the stream until fresh speech arrives.' });
+        },
         windowMs: this.config.transcription.windowMs,
         overlapMs: this.config.transcription.overlapMs,
         streamContext: () => this.contextStore.snapshot().streamContext,

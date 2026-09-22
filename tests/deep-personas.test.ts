@@ -200,8 +200,8 @@ describe('deep persistent personas', () => {
     const karl = generatePersonaV3('karlbekner');
     karl.character.flaws = ['вымышленный сгенерированный профиль', 'слишком долго терпит неудобные процессы'];
     karl.opinions = [
-      { id: 'o1', topic: 'Прага', stance: 'до Праги я трамваи недооценивал', tags: [] },
-      { id: 'o2', topic: 'компьютеры', stance: 'надёжная скучная система лучше модной', tags: [] },
+      { id: 'o1', strength: 0.7, immutable: false, topic: 'Прага', stance: 'до Праги я трамваи недооценивал', tags: [] },
+      { id: 'o2', strength: 0.7, immutable: false, topic: 'компьютеры', stance: 'надёжная скучная система лучше модной', tags: [] },
     ];
     const serialized = JSON.stringify(builder.buildBrainSnapshot('karlbekner', karl));
 

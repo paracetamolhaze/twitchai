@@ -39,10 +39,10 @@ describe('Gemini Live perception protocol', () => {
       onTranscript: (text) => transcripts.push(text),
     });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     client.updateContext({
       channel: 'streamer', category: 'Dota 2', streamContext: 'рейтинг', isLive: true,
-      recentChat: [], recentEvents: [], botUsernames: ['bot-one'], updatedAt: Date.now(),
+      recentChat: [], recentEvents: [], recentSpeech: [], botUsernames: ['bot-one'], updatedAt: Date.now(),
     });
     client.sendAudio(Buffer.from([1, 2]));
     client.sendVideo(Buffer.from([3, 4]));
@@ -51,8 +51,7 @@ describe('Gemini Live perception protocol', () => {
       toolCall: { functionCalls: [
         { id: 'event-1', name: EMIT_STREAM_EVENT_TOOL, args: { type: 'greeting', summary: 'Стример поздоровался.', importance: .8, confidence: .99 } },
         { id: 'event-2', name: EMIT_STREAM_EVENT_TOOL, args: { type: 'visual', summary: 'Друг упал со стула.', importance: .9, confidence: .95 } },
-      ] },
-    } as LiveServerMessage);
+      ] }, text: undefined, data: undefined } as LiveServerMessage);
 
     await vi.waitFor(() => expect(sent).toHaveLength(1));
     expect(observed).toEqual(['Стример поздоровался.', 'Друг упал со стула.']);
@@ -89,7 +88,7 @@ describe('Gemini Live perception protocol', () => {
       },
     });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     expect(client.isConnected()).toBe(true);
 
     // Media keeps arriving throughout, which is what separates a deaf session from a dead stream.
@@ -102,12 +101,11 @@ describe('Gemini Live perception protocol', () => {
 
     // The replacement session is left alone for as long as it is actually transcribing.
     await vi.advanceTimersByTimeAsync(10);
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     for (let elapsed = 0; elapsed < 80_000; elapsed += 5_000) {
       client.sendAudio(Buffer.from([1, 2]));
       parameters?.callbacks?.onmessage?.({
-        serverContent: { inputTranscription: { text: 'slyshno' } },
-      } as LiveServerMessage);
+        serverContent: { inputTranscription: { text: 'slyshno' } }, text: undefined, data: undefined } as LiveServerMessage);
       await vi.advanceTimersByTimeAsync(5_000);
     }
     expect(closed).toEqual([0]);
@@ -126,7 +124,7 @@ describe('Gemini Live perception protocol', () => {
       },
     });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     await vi.advanceTimersByTimeAsync(120_000);
     expect(close).not.toHaveBeenCalled();
     expect(client.getDiagnostics().stallRecoveries).toBe(0);
@@ -145,7 +143,7 @@ describe('Gemini Live perception protocol', () => {
     const session = { sendRealtimeInput, sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
     const client = createClient({ connect: async (value) => { parameters = value; return session; } });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     sendRealtimeInput.mockClear();
     client.updateContext({
       channel: 'streamer', category: 'Dota 2', streamContext: '', isLive: true,
@@ -153,7 +151,7 @@ describe('Gemini Live perception protocol', () => {
         { id: '1', timestamp: 1, username: 'realviewer', displayName: 'realviewer', message: 'го дальше катку', kind: 'viewer' },
         { id: '2', timestamp: 2, username: 'karlbekner', displayName: 'karlbekner', message: 'кстати про драфт саппортов — так и не разобрали до конца', kind: 'bot' },
       ],
-      recentEvents: [], botUsernames: ['karlbekner'], updatedAt: Date.now(),
+      recentEvents: [], recentSpeech: [], botUsernames: ['karlbekner'], updatedAt: Date.now(),
     });
     const call = sendRealtimeInput.mock.calls.find((entry) => typeof entry[0]?.text === 'string');
     const sentText = call?.[0]?.text as string;
@@ -174,7 +172,7 @@ describe('Gemini Live perception protocol', () => {
     const client = createClient({
       connect: async (value) => {
         parameters = value;
-        value.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+        value.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
         return session;
       },
     });
@@ -198,10 +196,10 @@ describe('Gemini Live perception protocol', () => {
       onStreamEvent: async () => { throw new Error('invalid event'); },
     });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     parameters?.callbacks?.onmessage?.({ toolCall: { functionCalls: [{
       id: 'bad-event', name: EMIT_STREAM_EVENT_TOOL, args: {},
-    }] } } as LiveServerMessage);
+    }] }  , text: undefined, data: undefined } as LiveServerMessage);
     await vi.waitFor(() => expect(sent).toHaveLength(1));
     const responses = Array.isArray(sent[0]?.functionResponses) ? sent[0].functionResponses : [sent[0]?.functionResponses];
     expect(responses[0]).toMatchObject({ id: 'bad-event', response: { error: 'invalid_event' } });
@@ -218,11 +216,11 @@ describe('Gemini Live perception protocol', () => {
       reconnectMinimumMs: 1, reconnectMaximumMs: 1,
     });
     await client.start();
-    connections[0]?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    connections[0]?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     connections[0]?.callbacks?.onclose?.({ code: 1006, reason: 'network lost' } as never);
     await vi.runOnlyPendingTimersAsync();
     expect(connections).toHaveLength(2);
-    connections[1]?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    connections[1]?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     expect(client.isConnected()).toBe(true);
     client.stop();
   });
@@ -240,12 +238,12 @@ describe('Gemini Live perception protocol', () => {
       onStreamEvent: handler,
     });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     sendRealtimeInput.mockClear();
     parameters?.callbacks?.onmessage?.({ toolCall: { functionCalls: [{
       id: 'event-1', name: EMIT_STREAM_EVENT_TOOL,
       args: { type: 'visual', summary: 'момент', importance: .8, confidence: .9 },
-    }] } } as LiveServerMessage);
+    }] }  , text: undefined, data: undefined } as LiveServerMessage);
     await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
     client.sendAudio(Buffer.from([1, 2]));
     expect(sendRealtimeInput).not.toHaveBeenCalled();
@@ -297,13 +295,13 @@ describe('Gemini Live perception protocol', () => {
       minFramesBeforeEvents: 3,
     });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
 
     const emit = (summary: string): void => {
       parameters?.callbacks?.onmessage?.({ toolCall: { functionCalls: [{
         id: `e-${summary}`, name: EMIT_STREAM_EVENT_TOOL,
         args: { type: 'visual', summary, importance: 0.6, confidence: 0.8 },
-      }] } } as LiveServerMessage);
+      }] }  , text: undefined, data: undefined } as LiveServerMessage);
     };
 
     client.sendVideo(Buffer.from([1]));
@@ -380,7 +378,7 @@ describe('Gemini Live perception protocol', () => {
     });
     await client.start();
     // Setup completed, so the service accepted this configuration.
-    connections[0]?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    connections[0]?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     connections[0]?.callbacks?.onclose?.({ code: 1007, reason: 'Request contains an invalid argument', wasClean: true } as never);
     await vi.advanceTimersByTimeAsync(1);
 
@@ -418,10 +416,10 @@ describe('Gemini Live perception protocol', () => {
     const session = { sendRealtimeInput, sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
     const client = createClient({ connect: async (value) => { parameters = value; return session; } });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     const snapshot = {
       channel: 'streamer', category: 'Dota 2', streamContext: '', isLive: true,
-      recentChat: [], recentEvents: [], botUsernames: ['bot-one'], updatedAt: 1,
+      recentChat: [], recentEvents: [], recentSpeech: [], botUsernames: ['bot-one'], updatedAt: 1,
     };
 
     sendRealtimeInput.mockClear();
@@ -450,7 +448,7 @@ describe('Gemini Live perception protocol', () => {
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const parameters = connections[attempt];
       if (!parameters) break;
-      parameters.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+      parameters.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
       parameters.callbacks?.onclose?.({ code: 1007, reason: 'Request contains an invalid argument', wasClean: true } as never);
       await vi.advanceTimersByTimeAsync(1);
     }
@@ -471,7 +469,7 @@ describe('Gemini Live perception protocol', () => {
       usage,
     });
     await client.start();
-    connections[0]?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    connections[0]?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     connections[0]?.callbacks?.onclose?.({ code: 1006, reason: 'network lost' } as never);
     client.stop();
     await vi.advanceTimersByTimeAsync(60_000);
@@ -484,10 +482,10 @@ describe('Gemini Live perception protocol', () => {
     const session = { sendRealtimeInput: vi.fn(), sendToolResponse: vi.fn(), close: vi.fn() } as unknown as Session;
     const client = createClient({ connect: async (value) => { parameters = value; return session; } });
     await client.start();
-    parameters?.callbacks?.onmessage?.({ setupComplete: {} } as LiveServerMessage);
+    parameters?.callbacks?.onmessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     parameters?.callbacks?.onmessage?.({ toolCall: { functionCalls: [{
       name: EMIT_STREAM_EVENT_TOOL, args: {},
-    }] } } as LiveServerMessage);
+    }] }  , text: undefined, data: undefined } as LiveServerMessage);
     await vi.waitFor(() => expect(session.close).toHaveBeenCalledTimes(1));
     expect(session.sendToolResponse).not.toHaveBeenCalled();
     expect(client.getDiagnostics()).toMatchObject({ state: 'ERROR', lastCloseCode: 1007 });

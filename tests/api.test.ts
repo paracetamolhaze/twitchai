@@ -1,4 +1,5 @@
 import request from 'supertest';
+import { UsageTracker } from '../src/usage/usage-tracker';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createApiServer, ApiServer } from '../src/api/server';
 import { Logger } from '../src/logger';
@@ -34,8 +35,9 @@ function server(twitchOAuth?: {
   let streamerMemories = [structuredClone(streamerMemory)];
   const api = createApiServer({
     port: 0, frontendUrls: ['http://localhost:5173'], dashboardToken: token, logger: new Logger('TEST', 'error'),
-    health: () => ({ status: 'ok', twitch: true, streamBrain: true, gemini: true, database: true }),
+    health: () => ({ status: 'ok', twitch: true, streamBrain: true, gemini: true, brain: true, database: true }),
     overview: () => ({ channel: 'channel', category: 'Dota 2', isLive: true, twitchConnected: true,
+      geminiBrain: { state: 'READY', model: 'test', thinkingLevel: 'low', interactions: 0, decisions: 0, silentDecisions: 0, generatedReactions: 0, averageLatencyMs: 0, rebuiltSessions: 0, rollovers: 0, contextTokens: 0, bootstrapChars: 0, bootstrapInputTokens: 0 },
       streamBrain: {
         state: 'CONNECTED', mediaState: 'STREAMING', geminiState: 'CONNECTED',
         mediaConnected: true, geminiConnected: true, geminiStable: true,
@@ -46,13 +48,13 @@ function server(twitchOAuth?: {
     assignBotPersona: async () => 'updated',
     events: async () => [event],
     chat: () => [],
-    usage: () => ({ startedAt: 0, uptimeSeconds: 1, streamMinutes: 0, audioMinutes: 0, videoMinutes: 0,
+    usage: () => ({ ...new UsageTracker().snapshot(), startedAt: 0, uptimeSeconds: 1, streamMinutes: 0, audioMinutes: 0, videoMinutes: 0,
       capturedAudioMinutes: 0, capturedVideoMinutes: 0, geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0,
       geminiReconnects: 0, geminiInputTokens: 0, geminiOutputTokens: 0, geminiToolCalls: 0,
       preparedReactionContexts: 0, reactionBatches: 0, emptyReactionBatches: 0, guardRejections: 0,
       eventsDetected: 0, generatedResponses: 0, sentResponses: 0, skippedResponses: 0,
       memoryToolCalls: 0, memoriesCreated: 0, memoriesMerged: 0, memoriesSuperseded: 0, memoryRetrievals: 0,
-      currentStream: {
+      currentStream: { ...new UsageTracker().snapshot().currentStream,
         active: true, startedAt: 0, durationMinutes: 0, capturedAudioMinutes: 0, capturedVideoMinutes: 0,
         geminiAudioSentMinutes: 0, geminiVideoSentMinutes: 0, geminiReconnects: 0,
         geminiInputTokens: 0, geminiOutputTokens: 0, sentResponses: 0,
@@ -118,7 +120,7 @@ afterEach(async () => { await Promise.all(servers.map((api) => api.stop())); ser
 describe('dashboard API', () => {
   it('exposes a secret-free public health payload', async () => {
     const response = await request(server().app).get('/health').expect(200);
-    expect(response.body).toEqual({ status: 'ok', twitch: true, streamBrain: true, gemini: true, database: true });
+    expect(response.body).toEqual({ status: 'ok', twitch: true, streamBrain: true, gemini: true, brain: true, database: true });
     expect(JSON.stringify(response.body)).not.toContain(token);
   });
 
@@ -263,7 +265,7 @@ describe('dashboard API', () => {
       .get('/api/twitch/oauth/callback?error=access_denied&state=browser-bound-state')
       .set('Cookie', oauthCookie!)
       .expect(302);
-    const deniedRedirect = new URL(denied.headers.location);
+    const deniedRedirect = new URL(denied.headers.location!);
     expect(deniedRedirect.origin + deniedRedirect.pathname).toBe('http://localhost:5173/');
     expect(Object.fromEntries(deniedRedirect.searchParams)).toEqual({
       twitchOAuth: 'error',
@@ -284,6 +286,8 @@ describe('motive analytics and rejected reactions', () => {
     const app = server(undefined, {
       motiveAnalytics: async () => ({
         totalSent: 3, totalJudged: 2,
+        includingLegacy: { totalJudged: 2, personalSourceApprovalRate: 1, genericEventOnlyApprovalRate: null },
+        linkQuality: { exactIdMatches: 2, legacyFallbackMatches: 0, legacyAmbiguous: 0, unmatchedVerdicts: 0, lostIdVerdicts: 0 },
         bySourceType: [{ sourceType: 'curiosity', sent: 2, judged: 2, approved: 2, approvalRate: 1 }],
         personalSourceApprovalRate: 1, genericEventOnlyApprovalRate: null,
       }),

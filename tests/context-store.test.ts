@@ -111,3 +111,21 @@ describe('ContextStore chat retention', () => {
     expect(kept).toEqual(['m2', 'm3', 'm4']);
   });
 });
+
+it('does not carry speech or events into a different channel or a new session', () => {
+  const now = 1_000_000;
+  const store = new ContextStore({ chatWindowMs: 120000, maxChatMessages: 100, maxEvents: 10, now: () => now });
+  store.configure({ channel: 'old' });
+  store.addSpeech('old stream', now - 1000);
+  store.addEvent({ id: 'old-event', timestamp: now - 1000, type: 'question', summary: 'old', importance: .5, confidence: .9, source: 'gemini-live', directMentions: [] });
+  store.beginSession(now);
+  expect(store.snapshot().recentSpeech).toEqual([]);
+  expect(store.snapshot().recentEvents).toEqual([]);
+  store.addSpeech('new session');
+  store.configure({ channel: 'old' });
+  expect(store.snapshot().recentSpeech).toHaveLength(1);
+  store.addChat(chat(now));
+  store.configure({ channel: 'other' });
+  expect(store.snapshot().recentSpeech).toEqual([]);
+  expect(store.snapshot().recentChat).toEqual([]);
+});

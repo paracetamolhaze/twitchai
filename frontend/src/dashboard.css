@@ -170,3 +170,6 @@ label { font-size: 14px; }
 .settings-grid { grid-template-columns: 1fr; max-width: 900px; }
 .streamer-memory-layout { grid-template-columns: 1fr; }
 .streamer-memory-card details { margin: 12px 0; color: var(--muted); }
+
+.stream-hero-warning { background: #713a24; }
+.stream-hero-warning .hero-action { background: #ffe3b4; color: #43291b; }

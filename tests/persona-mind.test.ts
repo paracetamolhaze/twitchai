@@ -524,7 +524,7 @@ describe('finding 7 — a heard world fact is not domain knowledge', () => {
 describe('life pool draws from the biography, not one shared mold', () => {
   it('thirty seeded personas do not collapse onto a handful of identical concerns', () => {
     const personas = Object.keys(PERSONA_BLUEPRINTS).map((username) => generatePersonaV3(username));
-    const concerns = personas.flatMap((persona) => seedMind(persona, persona.generatedFromUsername, NOW).life)
+    const concerns = personas.flatMap((persona) => seedMind(persona, persona.generatedFromUsername!, NOW).life)
       .map((concern) => concern.concern);
     const distinct = new Set(concerns);
     // At least half of all seeded concerns are distinct strings — occupation and interests are

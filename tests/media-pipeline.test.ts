@@ -1,5 +1,4 @@
 import { EventEmitter } from 'node:events';
-import { ChildProcess } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { Logger } from '../src/logger';
@@ -61,8 +60,12 @@ describe('MediaPipeline', () => {
   });
 });
 
-function fakeChildProcess(withMediaPipes = false): ChildProcess {
-  const child = new EventEmitter() as ChildProcess;
+function fakeChildProcess(withMediaPipes = false) {
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(),
+    stdio: [] as Array<PassThrough | null>, exitCode: null as number | null,
+    killed: false, kill: (): boolean => true,
+  });
   const stdout = new PassThrough();
   const stderr = new PassThrough();
   const stdin = new PassThrough();

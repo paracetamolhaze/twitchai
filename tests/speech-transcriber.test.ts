@@ -94,11 +94,13 @@ describe('withoutRepeatedTail', () => {
 describe('SpeechTranscriber', () => {
   it('stops uploading new audio after the Railway 402 billing failure', async () => {
     const backend = { name: 'test', transcribe: vi.fn(async () => { throw new Error('402 This request requires at least $0.50 in balance for audio'); }) };
-    const { instance } = transcriber({ backend, windowMs: 1000 });
+    const onUnavailable = vi.fn();
+    const { instance } = transcriber({ backend, windowMs: 1000, onUnavailable });
     instance.acceptPcm(pcm(1000, 0.2));
     await vi.waitFor(() => expect(instance.getStats().failures).toBe(1));
     instance.acceptPcm(pcm(10000, 0.2));
     expect(backend.transcribe).toHaveBeenCalledTimes(1);
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
   });
 
   it('sends nothing while the stream is dead silent', async () => {

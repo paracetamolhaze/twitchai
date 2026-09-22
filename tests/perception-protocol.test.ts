@@ -69,7 +69,7 @@ describe('Gemini Live perception-only protocol', () => {
     });
 
     await client.start();
-    onMessage?.({ setupComplete: {} } as LiveServerMessage);
+    onMessage?.({ setupComplete: {}  , text: undefined, data: undefined } as LiveServerMessage);
     onMessage?.({ toolCall: { functionCalls: [{
       id: 'event-call-1',
       name: EMIT_STREAM_EVENT_TOOL,
@@ -81,7 +81,7 @@ describe('Gemini Live perception-only protocol', () => {
         importance: 0.95,
         confidence: 0.99,
       },
-    }] } } as LiveServerMessage);
+    }] }  , text: undefined, data: undefined } as LiveServerMessage);
 
     await vi.waitFor(() => expect(sent).toHaveLength(1));
     expect(observed).toEqual([expect.objectContaining({

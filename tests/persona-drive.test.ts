@@ -4,7 +4,6 @@ import { BrainDecision, BrainDriveOpportunityInput } from '../src/brain/types';
 import { Logger } from '../src/logger';
 import { BotHistory } from '../src/personas/bot-history';
 import { generatePersonaV3 } from '../src/personas/generator-v3';
-import { PersonaContextBuilder } from '../src/personas/persona-context-builder';
 import { PersonaDriveService, PersonaDriveServiceOptions } from '../src/personas/persona-drive.service';
 import { PersonaMemory } from '../src/personas/persona-memory';
 import { PersonaRuntimeStore } from '../src/personas/persona-runtime-store';
@@ -28,7 +27,6 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
   contextStore.configure({ channel: 'streamer', category: 'Dota 2', streamContext: '', isLive: true });
   const personaMemory = new PersonaMemory(repository);
   const personaRuntime = new PersonaRuntimeStore();
-  const personaContext = new PersonaContextBuilder(personaMemory, personaRuntime);
   const history = new BotHistory(repository, 50);
 
   const personaA = generatePersonaV3('karlbekner');
@@ -61,7 +59,6 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
     contextStore,
     personaMemory,
     personaRuntime,
-    personaContext,
     history,
     evaluateOpportunity,
     prepareCandidates,
@@ -86,8 +83,8 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
     contextStore,
     candidatesList,
     history,
-    evaluateOpportunity: options.evaluateOpportunity,
-    prepareCandidates: options.prepareCandidates,
+    evaluateOpportunity: vi.mocked(options.evaluateOpportunity),
+    prepareCandidates: vi.mocked(options.prepareCandidates),
     submitReaction: options.submitReaction,
     applyMemoryUpdates: options.applyMemoryUpdates,
   };
@@ -228,7 +225,7 @@ describe('PersonaDriveService', () => {
       maxMessagesPerHour: 1,
       globalCooldownMs: 0,
       evaluateOpportunity: vi.fn(async () => ({ reactions: [{ username: 'karlbekner', message: 'привет' }], memoryUpdates: [] })),
-      submitReaction: vi.fn(async () => ({ eventId: 'x', accepted: [{ username: 'karlbekner', delayMs: 0 }], rejected: [] })),
+      submitReaction: vi.fn(async () => ({ eventId: 'x', accepted: [{ username: 'karlbekner', reactionId: 'reaction-test', delayMs: 0 }], rejected: [] })),
     });
     service.start();
     await vi.advanceTimersByTimeAsync(1_000);
@@ -552,7 +549,7 @@ describe('PersonaDriveService', () => {
       const { service, candidatesList, prepareCandidates } = await harness({
         maxCandidates: 1, personaCooldownMs: 10 * 60_000,
         evaluateOpportunity: vi.fn(async () => ({ reactions: [{ username: 'karlbekner', message: 'привет' }], memoryUpdates: [] })),
-        submitReaction: vi.fn(async () => ({ eventId: 'x', accepted: [{ username: 'karlbekner', delayMs: 0 }], rejected: [] })),
+        submitReaction: vi.fn(async () => ({ eventId: 'x', accepted: [{ username: 'karlbekner', reactionId: 'reaction-test', delayMs: 0 }], rejected: [] })),
       });
       candidatesList.length = 1; // only karlbekner, so a cooldown on it means zero candidates next tick
       service.start();

@@ -35,7 +35,11 @@ export class ContextStore {
   }
 
   configure(input: Partial<Pick<StreamContextSnapshot, 'channel' | 'category' | 'streamContext' | 'isLive' | 'botUsernames'>>): void {
-    if (input.channel !== undefined) this.channel = input.channel;
+    if (input.channel !== undefined && input.channel !== this.channel) {
+      this.channel = input.channel;
+      this.chat = []; this.events = []; this.speech = [];
+      this.sessionStartedAt = undefined;
+    }
     if (input.category !== undefined) this.category = input.category;
     if (input.streamContext !== undefined) this.streamContext = input.streamContext;
     if (input.isLive !== undefined) this.isLive = input.isLive;
@@ -57,6 +61,8 @@ export class ContextStore {
    */
   beginSession(startedAt = this.now()): void {
     this.sessionStartedAt = startedAt;
+    this.speech = this.speech.filter(line => line.timestamp >= startedAt);
+    this.events = this.events.filter(event => event.timestamp >= startedAt);
     // Pruning is what drops the previous evening, rather than an unconditional clear: everything
     // older than the boundary goes, everything at or after it stays. The two differ only when
     // `startedAt` is in the past, and there the prune is the answer that does not throw away
@@ -75,6 +81,8 @@ export class ContextStore {
     this.speech.push({ timestamp, text: line });
     if (this.speech.length > this.maxSpeechLines) this.speech.splice(0, this.speech.length - this.maxSpeechLines);
   }
+
+  clearSpeech(): void { this.speech = []; }
 
   addEvent(event: StreamEvent): void {
     const existing = this.events.findIndex((candidate) => candidate.id === event.id);

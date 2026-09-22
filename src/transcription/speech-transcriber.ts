@@ -20,6 +20,7 @@ export interface SpeechTranscriberOptions {
   streamContext?: () => string;
   /** What the watching layer last described, so a heard word can be matched to a seen thing. */
   currentScene?: () => string | undefined;
+  onUnavailable?: () => void;
   onTranscript: (text: string, meta: { audioMs: number; latencyMs: number }) => void | Promise<void>;
   /** Every attempt, transcript or not, so the bill is counted where it is actually incurred. */
   onUsage?: (usage: { costUsd?: number; audioSeconds: number; failed: boolean }) => void;
@@ -287,6 +288,7 @@ export class SpeechTranscriber {
         this.stats.lastError = 'Недостаточно средств для распознавания речи. Проверяем восстановление раз в 5 минут.';
         delete this.stats.lastTranscript;
         this.recentTranscripts.length = 0;
+        this.options.onUnavailable?.();
         this.reset();
       }
       this.stats.failures += 1;

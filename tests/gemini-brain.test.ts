@@ -54,7 +54,7 @@ describe('Gemini 3.8 stateful Brain', () => {
     const service = new GeminiBrainService({
       client: { create: async request => ({ id: 'turn', status: 'completed', outputText: request.kind === 'bootstrap' ? '{"ready":true}' : JSON.stringify({ reactions: [], memoryUpdates: [update] }), usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 0, totalTokens: 105 } }) },
       model: 'gemini-3.8-flash', thinkingLevel: 'low', bootstrap: async () => bootstrap(),
-      prepareEvent: async event => ({ event, availableBots: ['bot-1'], recentChatDelta: [], targetedPersonaContext: [], reactionExamples: [], deltas: [], constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 } }),
+      prepareEvent: async event => ({ event, triggerKind: 'external_stream_event', availableBots: ['bot-1'], recentChatDelta: [], targetedPersonaContext: [], reactionExamples: [], deltas: [], constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 } }),
       onDecision: async (_event, decision) => { delivered.push(decision); },
       usage: new UsageTracker(), logger: new Logger('TEST', 'error'), eventMergeWindowMs: 0, contextRolloverTokens: 800000, momentFreshnessMs: 0,
     });
@@ -93,7 +93,7 @@ describe('Gemini 3.8 stateful Brain', () => {
       thinkingLevel: 'low',
       bootstrap: async () => bootstrap(),
       prepareEvent: async (event) => ({
-        event,
+        event, triggerKind: 'external_stream_event',
         availableBots: bootstrap().availableBots,
         recentChatDelta: [],
         targetedPersonaContext: [],
@@ -452,7 +452,7 @@ describe('Gemini 3.8 stateful Brain', () => {
       prepareEvent: async (event) => {
         now += 300;
         return {
-          event, availableBots: bootstrap().availableBots, recentChatDelta: [],
+          event, triggerKind: 'external_stream_event', availableBots: bootstrap().availableBots, recentChatDelta: [],
           targetedPersonaContext: [], reactionExamples: [], deltas: [],
           constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 },
         };

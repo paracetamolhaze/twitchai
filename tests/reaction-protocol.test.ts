@@ -16,7 +16,7 @@ import { SHORTLIST_TARGET_SIZE } from '../src/reaction/candidate-shortlist';
 import { NaturalnessGuard } from '../src/reaction/naturalness-guard';
 import { ReactionCoordinator } from '../src/reaction/reaction-coordinator';
 import { ReactionPolicyGuard } from '../src/reaction/reaction-policy-guard';
-import { ReactionBotCandidate, ReactionTraceRecord } from '../src/reaction/types';
+import { SentMessageMotiveRecord, ReactionBotCandidate, ReactionTraceRecord } from '../src/reaction/types';
 import { ContextStore } from '../src/stream-brain/context-store';
 import { ColdStartStatus, StreamSession } from '../src/stream-brain/stream-session';
 import { StreamEvent } from '../src/stream-brain/types';
@@ -626,7 +626,7 @@ describe('single-session reaction protocol', () => {
     const persona = candidatesFor('bot-two');
     await personaMemory.remember({
       personaId: persona.persona.id,
-      type: 'preference',
+      type: 'self',
       summary: 'Терпеть не может, когда в такси громко играет музыка.',
       importance: 0.8,
       tags: ['такси'],
@@ -2028,6 +2028,22 @@ describe('hardening: physical message caps over the crowd/burst combination', ()
     });
     expect(result.accepted).toHaveLength(2);
     expect(result.rejected).toEqual([expect.objectContaining({ username: 'bot-one', reason: 'duplicate_username' })]);
+    await coordinator.stop();
+  });
+});
+
+describe('real 3.8 Flash quality probe regressions', () => {
+  it('blocks both fabricated audience claims before scheduling', async () => {
+    const { coordinator, sent } = await setup();
+    const question = { ...event, id: 'probe-audience', type: 'question' as const, summary: '10% зрителей это русские, нет?', speech: '10% зрителей это русские, нет?' };
+    const prepared = await coordinator.prepareBrainEvent(question, 0);
+    const result = await coordinator.submitBatch({ eventId: prepared.event.id, reactions: [
+      { username: 'bot-one', message: 'да не больше намного', motive: 'reply', sourceType: 'chat_reply' },
+      { username: 'bot-two', message: 'в дашборде твича глянь, там точно больше', motive: 'answer', sourceType: 'chat_reply' },
+    ] });
+    expect(result.accepted).toHaveLength(0);
+    expect(result.rejected.map(r => r.reason)).toEqual(['unsupported_specificity', 'unsupported_specificity']);
+    expect(sent).toHaveLength(0);
     await coordinator.stop();
   });
 });

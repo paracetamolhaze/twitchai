@@ -545,11 +545,11 @@ const timeline = computed(() => [
 
 const healthItems = computed(() => [
   { label: 'Сервер', tone: backendOnline.value ? 'ok' : 'error', status: backendOnline.value ? 'Работает' : 'Требует внимания', detail: backendOnline.value ? 'Интерфейс сервера доступен' : 'Нет соединения' },
-  { label: 'Чат Twitch', tone: overview.twitchConnected ? 'ok' : 'error', status: overview.twitchConnected ? 'Работает' : 'Требует внимания', detail: `${overview.activeBots} из ${overview.totalBots} ботов в чате` },
+  { label: 'Чат Twitch', tone: settings.paused || !overview.isLive ? 'idle' : overview.twitchConnected ? 'ok' : 'error', status: settings.paused ? 'На паузе' : overview.twitchConnected ? 'Работает' : overview.isLive ? 'Требует внимания' : 'Ожидает эфир', detail: `${overview.activeBots} из ${overview.totalBots} ботов в чате` },
   {
     label: 'Медиапоток',
-    tone: overview.streamBrain.mediaConnected ? 'ok' : overview.streamBrain.mediaState === 'ERROR' ? 'error' : overview.streamBrain.mediaState === 'CONNECTING' ? 'pending' : 'idle',
-    status: overview.streamBrain.mediaConnected ? 'Идёт стрим' : overview.streamBrain.mediaState === 'ERROR' ? 'Требует внимания' : overview.streamBrain.mediaState === 'CONNECTING' ? 'Поиск медиапотока…' : 'Стрим офлайн — норма',
+    tone: overview.streamBrain.mediaConnected ? 'ok' : overview.streamBrain.mediaState === 'ERROR' ? 'error' : overview.streamBrain.mediaState === 'CONNECTING' ? 'pending' : overview.isLive && !settings.paused ? 'error' : 'idle',
+    status: overview.streamBrain.mediaConnected ? 'Идёт стрим' : overview.streamBrain.mediaState === 'ERROR' ? 'Требует внимания' : overview.streamBrain.mediaState === 'CONNECTING' ? 'Поиск медиапотока…' : settings.paused ? 'На паузе' : overview.isLive ? 'Медиапоток не подключён' : 'Стрим офлайн',
     detail: overview.streamBrain.mediaConnected
       ? 'Аудио и выбранные видеокадры'
       : overview.streamBrain.mediaState === 'ERROR' && overview.streamBrain.lastError
@@ -582,8 +582,8 @@ const healthItems = computed(() => [
   },
   {
     label: 'Brain',
-    tone: ['READY', 'THINKING'].includes(overview.geminiBrain.state) ? 'ok' : overview.geminiBrain.state === 'ERROR' ? 'error' : 'idle',
-    status: overview.geminiBrain.state === 'READY' ? 'Готов' : overview.geminiBrain.state === 'THINKING' ? 'Принимает решение…' : overview.geminiBrain.state === 'STARTING' ? 'Загружает контекст…' : overview.geminiBrain.state === 'ERROR' ? 'Требует внимания' : 'Остановлен вместе со стримом',
+    tone: overview.geminiBrain.lastError ? 'error' : ['READY', 'THINKING'].includes(overview.geminiBrain.state) ? 'ok' : overview.geminiBrain.state === 'ERROR' ? 'error' : overview.isLive && !settings.paused ? 'pending' : 'idle',
+    status: overview.geminiBrain.lastError ? 'Требует внимания' : overview.geminiBrain.state === 'READY' ? 'Готов' : overview.geminiBrain.state === 'THINKING' ? 'Принимает решение…' : overview.geminiBrain.state === 'STARTING' ? 'Загружает контекст…' : overview.geminiBrain.state === 'ERROR' ? 'Требует внимания' : 'Остановлен вместе со стримом',
     detail: overview.geminiBrain.lastError
       ? operatorErrorLabel(overview.geminiBrain.lastError)
       : `${overview.geminiBrain.decisions} решений · среднее ${formatMilliseconds(overview.geminiBrain.averageLatencyMs)}`,
@@ -1898,34 +1898,11 @@ onBeforeUnmount(() => {
           :cost="usage.currentStream.totalAi.estimatedCostUsd" :duration="formatDuration(usage.uptimeSeconds)"
           :pending-feedback="teacherStatus?.pendingFeedback ?? pendingVerdictCount" :activities="timeline" :health="healthItems"
           :bots="bots.map(bot => ({ username: bot.username, name: personaById.get(bot.personaId)?.identity.firstName || 'Личность не назначена', status: stateLabel(bot.connectionState), connected: bot.chatConnected }))"
-          @navigate="activePage = $event" @toggle="togglePaused"
+          @navigate="activePage = $event" @toggle="togglePaused" @refresh="loadDashboard"
         />
 
         <template v-else-if="activePage === 'bots'">
-          <div class="page-heading"><div><p class="eyebrow">ОФИЦИАЛЬНЫЙ ЧАТ TWITCH</p><h1>Аккаунты ботов</h1></div><p class="muted">Сбой одного аккаунта не останавливает остальные. Накрутка просмотров не используется.</p></div>
-          <section class="panel">
-            <div class="panel-heading">
-              <div><p class="eyebrow">ДИАГНОСТИКА</p><h3>Доставка по аккаунтам</h3></div>
-              <button class="text-button" type="button" @click="loadDeliveryRecord()">Обновить</button>
-            </div>
-            <p class="muted">Считается по живым сообщениям: Twitch не подтверждает отправку, поэтому доставка определяется по тому, вернулась ли реплика обратно через читающий аккаунт. Отдельные проверочные сообщения больше не отправляются — тридцать аккаунтов, пишущих подряд по цифре, Twitch воспринимает как спам-рейд и закрывает их примерно на сутки.</p>
-            <template v-if="deliveryRecord">
-              <p v-if="!deliveryRecord.observing" class="notice error">Ни один аккаунт не читает чат, поэтому доставку сейчас определить нельзя.</p>
-              <div class="metric-strip">
-                <div><span>Чат показывает</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown > 0 && item.hidden === 0).length }}</strong></div>
-                <div><span>Не показывает</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown === 0 && item.hidden > 0).length }}</strong></div>
-                <div><span>Через раз</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown > 0 && item.hidden > 0).length }}</strong></div>
-                <div><span>Ещё не писали</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown === 0 && item.hidden === 0).length }}</strong></div>
-              </div>
-              <div class="bulk-preview-list">
-                <article v-for="item in deliveryRecord.accounts" :key="item.username">
-                  <strong>{{ item.username }}</strong>
-                  <span>{{ deliveryVerdict(item) }}</span>
-                  <small>показано {{ item.shown }} из {{ item.sent }}<template v-if="item.refused"> · отказов {{ item.refused }}</template></small>
-                </article>
-              </div>
-            </template>
-          </section>
+          <div class="page-heading"><div><p class="eyebrow">ОФИЦИАЛЬНЫЙ ЧАТ TWITCH</p><h1>Аккаунты ботов</h1></div><p class="muted">Подключайте аккаунты и выбирайте, какие из них участвуют в чате.</p></div>
           <section class="panel oauth-panel">
             <div class="panel-heading">
               <div><p class="eyebrow">АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ</p><h3>Подключение через Twitch</h3></div>
@@ -1933,14 +1910,14 @@ onBeforeUnmount(() => {
             </div>
             <div class="oauth-layout">
               <div>
-                <p class="muted">Войдите в нужную учётную запись бота Twitch и подтвердите только чтение и отправку сообщений. Токены доступа и обновления сохраняются в PostgreSQL в зашифрованном виде и не попадают в клиентскую часть.</p>
+                <p class="muted">Чтобы добавить аккаунт или восстановить доступ, войдите в него через Twitch. Существующие подключения повторять не нужно.</p>
                 <button class="primary" type="button" :disabled="!twitchOAuth.configured || oauthConnecting" @click="connectTwitchAccount">
                   {{ oauthConnecting ? 'Переходим в Twitch…' : 'Подключить или обновить аккаунт' }}
                 </button>
               </div>
               <div class="oauth-summary">
                 <span>С автообновлением</span><strong>{{ twitchOAuth.accounts.filter((account) => account.refreshable).length }} из {{ bots.length }}</strong>
-                <small v-if="twitchOAuth.callbackUrl">Адрес возврата для панели разработчика Twitch:<br><code>{{ twitchOAuth.callbackUrl }}</code></small>
+                <details v-if="twitchOAuth.callbackUrl"><summary>Для настройки приложения Twitch</summary><small>Адрес возврата:<br><code>{{ twitchOAuth.callbackUrl }}</code></small></details>
               </div>
             </div>
             <div v-if="twitchOAuth.accounts.length" class="oauth-accounts">
@@ -1958,6 +1935,31 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="!bots.length" class="empty-state">Подключите первую учётную запись кнопкой выше — логин и обновляемые токены сервер сохранит сам.</div>
           </section>
+          <details class="operator-details"><summary>Проверить доставку сообщений</summary>
+          <section class="panel">
+            <div class="panel-heading">
+              <div><p class="eyebrow">ДИАГНОСТИКА</p><h3>Доставка по аккаунтам</h3></div>
+              <button class="text-button" type="button" @click="loadDeliveryRecord()">Обновить</button>
+            </div>
+            <p class="muted">Доставка подтверждается, когда другой подключённый аккаунт видит сообщение в чате. Отсутствие подтверждения само по себе не доказывает блокировку.</p>
+            <template v-if="deliveryRecord">
+              <p v-if="!deliveryRecord.observing" class="notice error">Ни один аккаунт не читает чат, поэтому доставку сейчас определить нельзя.</p>
+              <div class="metric-strip">
+                <div><span>Чат показывает</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown > 0 && item.hidden === 0).length }}</strong></div>
+                <div><span>Нет подтверждения</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown === 0 && item.hidden > 0).length }}</strong></div>
+                <div><span>Часть подтверждена</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown > 0 && item.hidden > 0).length }}</strong></div>
+                <div><span>Ещё не писали</span><strong>{{ deliveryRecord.accounts.filter((item) => item.shown === 0 && item.hidden === 0).length }}</strong></div>
+              </div>
+              <div class="bulk-preview-list">
+                <article v-for="item in deliveryRecord.accounts" :key="item.username">
+                  <strong>{{ item.username }}</strong>
+                  <span>{{ deliveryVerdict(item) }}</span>
+                  <small>показано {{ item.shown }} из {{ item.sent }}<template v-if="item.refused"> · отказов {{ item.refused }}</template></small>
+                </article>
+              </div>
+            </template>
+          </section>
+          </details>
         </template>
 
         <template v-else-if="activePage === 'brain'">
@@ -2145,6 +2147,7 @@ onBeforeUnmount(() => {
 
                 <template v-else>
                   <div class="streamer-memory-card-top"><div><p class="eyebrow">{{ streamerMemoryTypeLabel(memory.type) }}</p><h3>{{ memory.summary }}</h3></div><span :class="['streamer-memory-status', `is-${memory.status}`]">{{ streamerMemoryStatusLabel(memory.status) }}</span></div>
+                  <p v-if="memory.details?.reviewReason" class="muted">Причина архива: {{ memory.details.reviewReason }}</p>
                   <details><summary>Подробности записи</summary>
                   <div class="streamer-memory-chip-row"><span v-for="entity in memory.entities" :key="`entity-${entity}`" class="memory-chip entity">{{ entity }}</span><span v-for="tag in memory.tags" :key="`tag-${tag}`" class="memory-chip">#{{ tag }}</span><span v-if="!memory.entities.length && !memory.tags.length" class="memory-chip muted-chip">без сущностей и тегов</span></div>
                   <div class="streamer-memory-scores"><label>важность <meter min="0" max="1" :value="memory.importance"></meter><b>{{ memory.importance.toFixed(2) }}</b></label><label>уверенность <meter min="0" max="1" :value="memory.confidence"></meter><b>{{ memory.confidence.toFixed(2) }}</b></label></div>
@@ -2153,7 +2156,7 @@ onBeforeUnmount(() => {
                   <div class="streamer-memory-actions"><button class="text-button" type="button" :disabled="memoryBusy" @click="startStreamerMemoryEdit(memory)">Изменить</button><button v-if="memory.status === 'active'" class="text-button" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'resolved')">Завершить</button><button v-if="memory.status === 'active'" class="text-button warning" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'expired')">Устарела</button><button v-if="memory.status === 'resolved' || memory.status === 'expired'" class="text-button" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'active')">Вернуть в актуальные</button><button class="danger-button compact" type="button" :disabled="memoryBusy" @click="deleteStreamerMemory(memory)">Удалить</button></div>
                 </template>
               </article>
-              <div v-if="!visibleStreamerMemories.length" class="empty-state panel">Записей с такими фильтрами пока нет. Во время эфира Gemini сохраняет только важные и безопасные факты, планы, людей и повторяющиеся контексты.</div>
+              <div v-if="!visibleStreamerMemories.length" class="empty-state panel">Записей с такими фильтрами пока нет. Во время эфира здесь появляются факты и планы, предложенные ИИ. Ошибочную запись можно исправить или убрать в архив.</div>
             </div>
 
             <details class="panel streamer-memory-preview"><summary>Проверить подбор памяти · диагностика</summary>
@@ -2167,7 +2170,7 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="activePage === 'chat'">
-          <div class="page-heading"><div><p class="eyebrow">КОНТЕКСТ В РЕАЛЬНОМ ВРЕМЕНИ</p><h1>Чат Twitch</h1></div><p class="muted">Сообщения зрителей, ботов и системы отмечены отдельно.</p></div>
+          <div class="page-heading"><div><p class="eyebrow">КОНТЕКСТ В РЕАЛЬНОМ ВРЕМЕНИ</p><h1>Чат Twitch</h1></div><p class="muted">Оценивайте ответы ботов: 👍 — удачный, 👎 — неудачный. В комментарии укажите, что стоит исправить. Правила из ваших оценок появятся в разделе «Обучение».</p></div>
           <p class="muted">Оценка сохраняется как обратная связь для этого аккаунта: удачное сообщение может стать примером стиля наравне с авторскими, неудачное исключается из примеров и помогает отклонять похожие ответы позже. Комментарий сохраняется и разбирается обучением, а не пересказывается модели напрямую. Накопив несколько оценок, обучение выводит из них общие правила — их видно на вкладке «Обучение».</p>
           <section class="panel chat-feed"><article v-for="message in [...chat].reverse()" :key="message.id" :class="['chat-line', message.kind]"><time>{{ formatTime(message.timestamp) }}</time><span class="kind-chip">{{ kindLabel(message.kind) }}</span><strong>{{ message.displayName }}</strong><p>{{ message.message }}</p><span v-if="message.kind === 'bot'" class="verdict-actions"><button type="button" :class="['text-button', verdictFor(message) === 'good' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'good')">нравится</button><button type="button" :class="['text-button', verdictFor(message) === 'bad' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'bad')">не нравится</button><small v-if="verdictStatusLabel(message)" class="verdict-status">{{ verdictStatusLabel(message) }}</small></span></article><div v-if="!chat.length" class="empty-state">Сообщения появятся, когда хотя бы один бот войдёт в канал.</div></section>
         </template>

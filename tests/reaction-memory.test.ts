@@ -14,7 +14,7 @@ describe('ReactionMemory', () => {
     };
     const snapshot: StreamContextSnapshot = {
       channel: 'channel', category: 'Dota 2', streamContext: 'ranked with friends', isLive: true,
-      recentChat: [], recentEvents: [], botUsernames: [], updatedAt: now,
+      recentChat: [], recentEvents: [], recentSpeech: [], botUsernames: [], updatedAt: now,
     };
     memory.recordEvent(event, snapshot);
     memory.recordChat({ id: 'chat-1', timestamp: now + 200, username: 'viewer', displayName: 'viewer', message: 'зачем туда полез', kind: 'viewer' });
@@ -41,7 +41,7 @@ describe('ReactionMemory', () => {
         id: 'prior-classification', timestamp: now - 100, username: 'viewer', displayName: 'viewer',
         message: '@bot-one ты бот?', kind: 'viewer',
       }],
-      recentEvents: [], botUsernames: ['bot-one'], updatedAt: now,
+      recentEvents: [], recentSpeech: [], botUsernames: ['bot-one'], updatedAt: now,
     };
 
     memory.recordEvent(ordinaryEvent, snapshot);
