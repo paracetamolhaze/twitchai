@@ -392,7 +392,9 @@ interface ReactionTrace {
 }
 type ReactionTraceMessage = NonNullable<ReactionTrace['reactions']>[number]
 
-const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3000').replace(/\/$/, '')
+const API_SERVER_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3000').replace(/\/$/, '')
+const usesApiProxy = import.meta.env.PROD && window.location.hostname.endsWith('.vercel.app')
+const API_URL = usesApiProxy ? window.location.origin : API_SERVER_URL
 const PERSONA_SIMILARITY_WARNING_THRESHOLD = 0.65
 const activePage = ref<Page>('overview')
 watch(activePage, () => window.scrollTo({ top: 0 }), { flush: 'post' })
@@ -684,7 +686,7 @@ async function loadDashboard(): Promise<void> {
 
 function connectRealtime(): void {
   socket?.disconnect()
-  socket = io(API_URL, { withCredentials: true, transports: ['websocket', 'polling'] })
+  socket = io(API_URL, { withCredentials: true, transports: usesApiProxy ? ['polling'] : ['websocket', 'polling'] })
   socket.on('connect', () => { realtimeOnline.value = true })
   socket.on('disconnect', () => { realtimeOnline.value = false })
   socket.on('connect_error', () => { realtimeOnline.value = false })
@@ -760,9 +762,10 @@ async function connectTwitchAccount(): Promise<void> {
   try {
     const result = await api<{ authorizationUrl: string }>('/api/twitch/oauth/start', { method: 'POST' })
     const authorizationUrl = new URL(result.authorizationUrl)
-    if (authorizationUrl.origin !== new URL(API_URL).origin || authorizationUrl.pathname !== '/api/twitch/oauth/launch') {
+    if (![new URL(API_URL).origin, new URL(API_SERVER_URL).origin].includes(authorizationUrl.origin) || authorizationUrl.pathname !== '/api/twitch/oauth/launch') {
       throw new Error('Сервер вернул недопустимый адрес авторизации Twitch')
     }
+    // OAuth launch and callback share the backend host for their state cookie.
     window.location.assign(authorizationUrl.toString())
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
