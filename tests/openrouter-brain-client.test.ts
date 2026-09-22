@@ -53,6 +53,13 @@ function completion(id: string, content: string, usage: Record<string, unknown> 
 }
 
 describe('OpenRouterBrainClient', () => {
+  it('does not send another paid request after a 402 balance failure', async () => {
+    const { instance, fetchImpl } = client(() => ({ error: { code: 402, message: '402 Prompt tokens limit exceeded: 45063 > 44632. Add more credits' } }));
+    await expect(instance.create(bootstrap)).rejects.toThrow('402');
+    await expect(instance.create(bootstrap)).rejects.toThrow();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it('continues the exact conversation an id refers to, the way the stateful API did', async () => {
     // Everything above this client passes an opaque id around and never sees a message array.
     // Chat Completions has no server-side conversation, so the id has to mean the same thing here.

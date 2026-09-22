@@ -1,3 +1,4 @@
+import { BillingBackoff, isBillingFailure } from '../billing-backoff';
 import { Logger } from '../logger';
 import { TranscriptionBackend } from './transcription-backend';
 
@@ -55,6 +56,8 @@ export interface SpeechTranscriberStats {
   failures: number;
   lastTranscript?: string;
   lastLatencyMs?: number;
+  billingRetryAt?: number;
+  lastError?: string;
 }
 
 /**
@@ -89,6 +92,7 @@ export class SpeechTranscriber {
   private trailingQuietMs = 0;
   private carry = Buffer.alloc(0);
   private inFlight = 0;
+  private readonly billing = new BillingBackoff();
   private readonly stats: SpeechTranscriberStats = {
     segmentsSent: 0,
     transcriptsReceived: 0,
@@ -112,6 +116,7 @@ export class SpeechTranscriber {
   getStats(): SpeechTranscriberStats { return { ...this.stats }; }
 
   acceptPcm(pcm: Buffer): void {
+    if (this.billing.retryAt > Date.now()) { this.reset(); return; }
     const buffer = this.carry.length > 0 ? Buffer.concat([this.carry, pcm]) : pcm;
     let offset = 0;
     while (offset + FRAME_BYTES <= buffer.length) {
@@ -218,18 +223,24 @@ export class SpeechTranscriber {
   }
 
   private async transcribe(pcm: Buffer, audioMs: number): Promise<void> {
+    if (!this.billing.acquire()) return;
+    const billingRevision = this.billing.revision;
     this.inFlight += 1;
     this.stats.segmentsSent += 1;
     this.stats.audioSecondsSent += audioMs / 1000;
     const startedAt = Date.now();
     try {
       const result = await this.options.backend.transcribe(wav(pcm), this.buildHint());
+      this.billing.success(billingRevision);
       const latencyMs = Date.now() - startedAt;
       this.options.onUsage?.({
         ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
         audioSeconds: audioMs / 1000,
         failed: false,
       });
+      if (this.billing.retryAt) return;
+      delete this.stats.billingRetryAt;
+      delete this.stats.lastError;
       if (result.text !== undefined && looksLikeModelMeta(result.text)) {
         // A transcription model occasionally answers ABOUT the task instead of doing it —
         // production once returned "thought The user wants transcription of the speech in the
@@ -270,6 +281,14 @@ export class SpeechTranscriber {
       this.stats.lastLatencyMs = latencyMs;
       await this.options.onTranscript(text, { audioMs, latencyMs });
     } catch (cause) {
+      this.billing.failure(cause);
+      if (isBillingFailure(cause)) {
+        this.stats.billingRetryAt = this.billing.retryAt;
+        this.stats.lastError = 'Недостаточно средств для распознавания речи. Проверяем восстановление раз в 5 минут.';
+        delete this.stats.lastTranscript;
+        this.recentTranscripts.length = 0;
+        this.reset();
+      }
       this.stats.failures += 1;
       this.options.onUsage?.({ audioSeconds: audioMs / 1000, failed: true });
       this.logger.warn('Speech transcription failed', { audioMs, cause });

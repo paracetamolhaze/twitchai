@@ -9,7 +9,9 @@ const KNOWN_SECRETS = Object.entries(process.env)
   .map(([, value]) => value as string);
 
 function redact(value: unknown, key = ''): unknown {
-  if (SENSITIVE_KEY.test(key)) return '[REDACTED]';
+  const numericUsage = /^(?:inputTokens|cachedInputTokens|outputTokens|thinkingTokens|contextTokens|bootstrapInputTokens)$/u.test(key)
+    && typeof value === 'number' && Number.isFinite(value);
+  if (SENSITIVE_KEY.test(key) && !numericUsage) return '[REDACTED]';
   if (typeof value === 'string') {
     let safe = value.replace(SECRET_VALUE, '[REDACTED]');
     for (const secret of KNOWN_SECRETS) safe = safe.replaceAll(secret, '[REDACTED]');

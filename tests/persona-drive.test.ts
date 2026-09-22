@@ -45,6 +45,7 @@ async function harness(overrides: Partial<PersonaDriveServiceOptions> = {}) {
 
   const options: PersonaDriveServiceOptions = {
     enabled: true,
+    silentBackoffMs: 0,
     minIntervalMs: 1_000,
     maxIntervalMs: 1_000,
     minQuietMs: 0,
@@ -111,6 +112,19 @@ function chat(kind: ChatMessage['kind'], username: string, timestamp: number, me
 }
 
 describe('PersonaDriveService', () => {
+  it('backs off after silent decisions instead of paying again every tick', async () => {
+    vi.useFakeTimers();
+    const { service, evaluateOpportunity } = await harness({ silentBackoffMs: 30_000 });
+    service.start();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(evaluateOpportunity).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(evaluateOpportunity).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(evaluateOpportunity).toHaveBeenCalledTimes(2);
+    service.stop();
+  });
+
   it('has no dependency on GeminiLiveClient or StreamEvent persistence, by construction', async () => {
     const source = await readFile('src/personas/persona-drive.service.ts', 'utf8');
     expect(source).not.toMatch(/GeminiLiveClient|sendAudio|sendVideo|updateContext\(/);

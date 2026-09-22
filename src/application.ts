@@ -858,7 +858,7 @@ export class Application {
       this.queueBrainDelta({
         type: 'MEMORY_ADDED',
         summary: memory.summary,
-        payload: { memoryId: memory.id, memoryType: memory.type, status: memory.status },
+        payload: { memoryId: memory.id, memoryType: memory.type, status: memory.status, expiresAt: memory.expiresAt },
       });
     });
     this.coordinator.on('decision', (decision: ReactionDecisionRecord) => {
@@ -940,6 +940,8 @@ export class Application {
       availableBots: availableCandidates.map((candidate) => candidate.username),
       personas: availableCandidates.map((candidate) => this.personaContext.buildBrainSnapshot(candidate.username, candidate.persona)),
       globalMemories: globalMemories.map((memory) => ({
+        id: memory.id,
+        expiresAt: memory.expiresAt,
         type: memory.type,
         summary: memory.summary,
         importance: memory.importance,
@@ -1012,6 +1014,9 @@ export class Application {
       const result = await this.globalMemory.recordFromBrain({
         memories: globalUpdates.map((update) => ({
           type: update.type,
+          expiresInHours: update.expiresInHours,
+          supersedesMemoryId: update.supersedesMemoryId,
+          resolvesMemoryId: update.resolvesMemoryId,
           summary: update.summary,
           importance: update.importance,
           confidence: update.confidence,

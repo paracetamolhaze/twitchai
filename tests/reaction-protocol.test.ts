@@ -153,6 +153,30 @@ async function setup(
 afterEach(() => vi.useRealTimers());
 
 describe('single-session reaction protocol', () => {
+  it('does not send an accepted message after its event expires in the scheduler', async () => {
+    vi.useFakeTimers();
+    let now = event.timestamp;
+    const { coordinator, sent } = await setup(true, () => now);
+    await coordinator.prepareBrainEvent(event, 0);
+    const result = await coordinator.submitBatch({ eventId: event.id, reactions: [{ username: 'bot-one', message: 'ну теперь без ульты', motive: 'reaction', sourceType: 'event_emotion' }] });
+    expect(result.accepted).toHaveLength(1);
+    now += 61000;
+    await vi.runAllTimersAsync();
+    expect(sent).toHaveLength(0);
+    await coordinator.stop();
+  });
+
+  it('expires answers to an audio check after fifteen seconds, including model time', async () => {
+    let now = event.timestamp;
+    const { coordinator } = await setup(true, () => now);
+    await coordinator.prepareBrainEvent({ ...event, type: 'question', summary: 'Ребят, слышно?', speech: 'Ребят, слышно?' }, 0);
+    now += 16000;
+    const result = await coordinator.submitBatch({ eventId: event.id, reactions: [{ username: 'bot-one', message: '+ слышно' }] });
+    expect(result.stale).toBe(true);
+    expect(result.accepted).toHaveLength(0);
+    await coordinator.stop();
+  });
+
   it('keeps ordinary Brain turns small and does not resend global memory or persona profiles', async () => {
     const { coordinator, globalMemory } = await setup();
     await globalMemory.recordFromBrain({
@@ -963,6 +987,16 @@ describe('single-session reaction protocol', () => {
       await coordinator.stop();
     });
 
+    it('blocks commentary laughter under the active operator rule', async () => {
+      const learnedPolicy = await policyStoreWith([{ id: 'r1', rule: 'Do not append formulaic laughter tags to commentary.' }]);
+      const { coordinator } = await setup(true, () => event.timestamp, false, undefined, learnedPolicy);
+      await coordinator.prepareBrainEvent(event, 0);
+      const result = await coordinator.submitBatch({ eventId: event.id, reactions: [{ username: 'bot-one', message: 'лучше не проверять ахах', motive: 'reaction', sourceType: 'event_observation' }] });
+      expect(result.accepted).toHaveLength(0);
+      expect(result.rejected).toContainEqual({ username: 'bot-one', reason: 'learned_rule_violation' });
+      await coordinator.stop();
+    });
+
     it('records which rules a decision was given as supplied, never as applied', async () => {
       // A live run logged three rules "applied" on a decision that broke one of them. The backend
       // knows what it put in the payload and cannot see whether the model honoured it, so the name
@@ -1561,7 +1595,7 @@ describe('cold-start bookkeeping against a real StreamSession clock', () => {
 
     // Past the window: an ordinary decision, no longer under the bar.
     clock += 45_000; // total age now 65s
-    await coordinator.prepareBrainEvent({ ...event, id: 'warm-1' }, 0);
+    await coordinator.prepareBrainEvent({ ...event, id: 'warm-1', timestamp: clock }, 0);
     await coordinator.submitBatch({ eventId: 'warm-1', reactions: [] });
 
     coordinator.logSessionSummary('test');

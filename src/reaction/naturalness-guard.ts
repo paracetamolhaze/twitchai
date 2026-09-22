@@ -417,9 +417,7 @@ export function isEventParaphrase(message: string, event: NonNullable<Naturalnes
 
 /**
  * A message wearing a decorative laugh: at least one real word, with a laugh token tacked on the
- * end. Observability for the learned laughter rule, never a rejection by itself — genuine emotional
- * laughter attached to a real thought is ordinary chat, and only the echo classes above can say the
- * thought was not the account's own.
+ * end. The coordinator rejects this only when an applicable learned rule forbids it.
  */
 export function hasTrailingLaughterTag(message: string): boolean {
   const tokens = message.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
@@ -427,6 +425,13 @@ export function hasTrailingLaughterTag(message: string): boolean {
   const last = tokens[tokens.length - 1]!;
   if (!LAUGH_TOKEN.test(last)) return false;
   return tokens.some((token) => !LAUGH_TOKEN.test(token));
+}
+
+/** Used only when the operator has an active rule against decorative laughter. */
+export function hasLaughterDecoration(message: string): boolean {
+  const tokens = message.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  return tokens.length > 1 && tokens.some(token => !LAUGH_TOKEN.test(token))
+    && (LAUGH_TOKEN.test(tokens[0]!) || hasTrailingLaughterTag(message));
 }
 
 function matchesLoosely(key: string, heard: Set<string>): boolean {

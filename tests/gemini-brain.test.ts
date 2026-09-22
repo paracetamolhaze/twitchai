@@ -48,6 +48,22 @@ function bootstrap(): BrainBootstrap {
 }
 
 describe('Gemini 3.8 stateful Brain', () => {
+  it('preserves global memory expiry and replacement references through the response parser', async () => {
+    const update = { scope: 'global', type: 'plan', summary: 'Розыгрыш завтра', importance: .8, confidence: .9, expiresInHours: 48, supersedesMemoryId: 'old-plan' };
+    const delivered: BrainDecision[] = [];
+    const service = new GeminiBrainService({
+      client: { create: async request => ({ id: 'turn', status: 'completed', outputText: request.kind === 'bootstrap' ? '{"ready":true}' : JSON.stringify({ reactions: [], memoryUpdates: [update] }), usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 0, totalTokens: 105 } }) },
+      model: 'gemini-3.8-flash', thinkingLevel: 'low', bootstrap: async () => bootstrap(),
+      prepareEvent: async event => ({ event, availableBots: ['bot-1'], recentChatDelta: [], targetedPersonaContext: [], reactionExamples: [], deltas: [], constraints: { maxReactions: 3, maxMessageBytes: 500, globalSlotsAvailable: 3, expiresAt: 9e15 } }),
+      onDecision: async (_event, decision) => { delivered.push(decision); },
+      usage: new UsageTracker(), logger: new Logger('TEST', 'error'), eventMergeWindowMs: 0, contextRolloverTokens: 800000, momentFreshnessMs: 0,
+    });
+    await service.startStream();
+    await service.enqueueEvent(firstEvent);
+    expect(delivered[0]?.memoryUpdates).toEqual([update]);
+    await service.stopStream();
+  });
+
   it('bootstraps once and chains small event turns through previous_interaction_id', async () => {
     const requests: BrainInteractionRequest[] = [];
     const decisions: Array<{ event: StreamEvent; decision: BrainDecision }> = [];

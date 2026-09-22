@@ -59,6 +59,8 @@ export interface BrainBootstrap {
   availableBots: string[];
   personas: BrainPersonaSnapshot[];
   globalMemories: Array<{
+    id?: string;
+    expiresAt?: number;
     type: StreamerMemoryType;
     summary: string;
     importance: number;
@@ -382,6 +384,9 @@ export interface BrainReaction {
 export type BrainMemoryUpdate =
   | {
       scope: 'global';
+      expiresInHours?: number;
+      supersedesMemoryId?: string;
+      resolvesMemoryId?: string;
       type: StreamerMemoryType;
       summary: string;
       importance: number;

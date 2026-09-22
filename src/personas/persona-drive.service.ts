@@ -17,6 +17,8 @@ import { PersonaMemory } from './persona-memory';
 import { PersonaRuntimeStore } from './persona-runtime-store';
 
 export interface PersonaDriveServiceOptions {
+  /** Minimum pause after an empty decision; repeated silence backs off up to five minutes. */
+  silentBackoffMs?: number;
   enabled: boolean;
   minIntervalMs: number;
   maxIntervalMs: number;
@@ -117,6 +119,8 @@ export class PersonaDriveService {
   private running = false;
   private timer?: NodeJS.Timeout;
   private lastExternalEventAt = 0;
+  private silentStreak = 0;
+  private nextOpportunityAt = 0;
   private lastAnyAutonomousMessageAt = 0;
   private readonly lastAutonomousMessageByPersona = new Map<string, number>();
   private brainCallTimestamps: number[] = [];
@@ -182,6 +186,10 @@ export class PersonaDriveService {
       return;
     }
     const now = this.now();
+    if (now < this.nextOpportunityAt) {
+      o.usage.recordDriveLocalSkip();
+      return;
+    }
     if (now - this.lastExternalEventAt < o.minQuietMs) {
       o.usage.recordDriveLocalSkip();
       this.logger.info('PERSONA_DRIVE_SKIPPED', { reason: 'not_quiet' });
@@ -378,6 +386,8 @@ export class PersonaDriveService {
     if (!decision) {
       await o.submitReaction(requestId, []);
       o.usage.recordDriveSilentDecision();
+      this.silentStreak += 1;
+      this.nextOpportunityAt = this.now() + Math.min(300_000, (o.silentBackoffMs ?? 30_000) * 2 ** Math.min(this.silentStreak - 1, 4));
       this.logger.info('PERSONA_DRIVE_SILENT', { requestId, reason: 'no_decision' });
       return;
     }
@@ -387,6 +397,8 @@ export class PersonaDriveService {
     if (decision.reactions.length === 0) {
       await o.submitReaction(requestId, []);
       o.usage.recordDriveSilentDecision();
+      this.silentStreak += 1;
+      this.nextOpportunityAt = this.now() + Math.min(300_000, (o.silentBackoffMs ?? 30_000) * 2 ** Math.min(this.silentStreak - 1, 4));
       // Not a failure and not rare: the backend offers the floor, and nobody having a reason to
       // take it is the ordinary outcome of a quiet minute.
       this.logger.info('PERSONA_DRIVE_SILENT', { requestId, candidates: candidateUsernames.length });
@@ -441,6 +453,8 @@ export class PersonaDriveService {
     }]);
     if (result.accepted.length > 0) {
       const sentAt = this.now();
+      this.silentStreak = 0;
+      this.nextOpportunityAt = 0;
       this.lastAnyAutonomousMessageAt = sentAt;
       this.lastAutonomousMessageByPersona.set(reaction.username.toLowerCase(), sentAt);
       this.messageTimestamps.push(sentAt);

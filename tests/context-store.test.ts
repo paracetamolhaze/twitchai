@@ -7,6 +7,15 @@ function chat(timestamp: number, message = 'привет'): ChatMessage {
 }
 
 describe('ContextStore chat retention', () => {
+  it('does not present old speech as fresh when hearing goes unavailable', () => {
+    let now = 1000000;
+    const store = new ContextStore({ chatWindowMs: 120000, maxChatMessages: 10, maxEvents: 10, now: () => now });
+    store.addSpeech('видно?', now);
+    now += 91000;
+    expect(store.snapshot().recentSpeech).toEqual([]);
+    store.addSpeech('снова слышно', now);
+    expect(store.snapshot().recentSpeech.map(x => x.text)).toEqual(['снова слышно']);
+  });
   it('prunes by the rolling window when no session has begun — the previous, unchanged behavior', () => {
     let now = 1_000_000;
     const store = new ContextStore({ chatWindowMs: 120_000, maxChatMessages: 200, maxEvents: 10, now: () => now });

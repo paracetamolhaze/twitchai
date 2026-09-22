@@ -213,6 +213,8 @@ export interface StreamBrainStatus {
     failures: number;
     lastTranscript?: string;
     lastLatencyMs?: number;
+    billingRetryAt?: number;
+    lastError?: string;
   };
   spokenMentionsDetected?: number;
   eligibleBots?: number;

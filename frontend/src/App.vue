@@ -42,7 +42,7 @@ interface BrainStatus {
     mode: string; model: string
     segmentsSent: number; transcriptsReceived: number
     audioSecondsSent: number; silenceSecondsSkipped: number
-    failures: number; lastTranscript?: string; lastLatencyMs?: number
+    failures: number; lastTranscript?: string; lastLatencyMs?: number; billingRetryAt?: number; lastError?: string
   }
   vision?: {
     model: string; everySeconds: number
@@ -559,12 +559,14 @@ const healthItems = computed(() => [
   {
     label: 'Слух',
     tone: !overview.streamBrain.transcription ? 'idle'
+      : overview.streamBrain.transcription.lastError ? 'error'
       : overview.streamBrain.transcription.failures > 0 && overview.streamBrain.transcription.transcriptsReceived === 0 ? 'error'
         : overview.streamBrain.transcription.transcriptsReceived > 0 ? 'ok' : 'pending',
     status: !overview.streamBrain.transcription ? 'Выключен'
+      : overview.streamBrain.transcription.lastError ? 'Не слышит — проверьте баланс'
       : overview.streamBrain.transcription.transcriptsReceived > 0 ? 'Слышит' : 'Ждёт речи',
     detail: overview.streamBrain.transcription
-      ? `${overview.streamBrain.transcription.transcriptsReceived} реплик · тишины срезано ${((overview.streamBrain.transcription.silenceSecondsSkipped) / 60).toFixed(0)} мин`
+      ? overview.streamBrain.transcription.lastError || `${overview.streamBrain.transcription.transcriptsReceived} реплик · тишины срезано ${((overview.streamBrain.transcription.silenceSecondsSkipped) / 60).toFixed(0)} мин`
       : 'Речь не распознаётся',
   },
   {
@@ -1599,8 +1601,8 @@ function operatorErrorLabel(message?: string): string {
   if (/permission denied|forbidden|\b403\b/u.test(normalized)) return 'У ключа Gemini недостаточно прав для этой модели.'
   // Depleted prepaid credits and a per-minute rate limit both arrive as 429, and only one of them
   // recovers on its own. Told to wait for a limit that never lifts, the operator waits.
-  if (/prepayment|credits are depleted|billing|insufficient|balance/u.test(normalized)) {
-    return 'У Gemini закончились предоплаченные кредиты. Само не восстановится — пополните баланс в AI Studio.'
+  if (/\b402\b|prepayment|credits are depleted|billing|insufficient|balance/u.test(normalized)) {
+    return 'Провайдер ИИ отклонил запрос из-за баланса. Проверьте средства у используемого провайдера; повторные запросы ограничены.'
   }
   if (/quota|resource exhausted|rate.?limit|\b429\b/u.test(normalized)) return 'Достигнут лимит Gemini. Подключение возобновится после восстановления лимита.'
   if (/\b1007\b|invalid argument|malformed|protocol/u.test(normalized)) return 'Gemini отклонила формат данных или настройки сессии.'
@@ -1888,6 +1890,7 @@ onBeforeUnmount(() => {
       <main>
         <p v-if="errorMessage" class="notice error">{{ errorMessage }}</p>
         <p v-if="saveMessage" class="notice success">{{ saveMessage }}</p>
+        <p v-if="activePage === 'overview' && overview.streamBrain.transcription?.lastError" class="notice error" role="status">{{ overview.streamBrain.transcription.lastError }}</p>
 
         <DashboardOverview v-if="activePage === 'overview'"
           :channel="overview.channel" :live="overview.isLive" :paused="settings.paused" :online="backendOnline" :busy="pauseBusy"
@@ -1969,6 +1972,7 @@ onBeforeUnmount(() => {
             <div><p class="eyebrow">ЧТО УСЛЫШАЛ</p><p>{{ overview.streamBrain.transcription?.lastTranscript || 'Распознанной речи пока нет.' }}</p></div>
             <div><p class="eyebrow">ЧТО УВИДЕЛ</p><p>{{ overview.streamBrain.vision?.lastDescription || 'Описания сцены пока нет.' }}</p></div>
           </section>
+          <p v-if="overview.streamBrain.transcription?.lastError" class="notice error">{{ overview.streamBrain.transcription.lastError }}</p>
           <p v-if="overview.geminiBrain.lastError" class="notice error">{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</p>
           <p v-if="overview.streamBrain.lastError" class="notice error">{{ operatorErrorLabel(overview.streamBrain.lastError) }}</p>
           <details class="operator-details">

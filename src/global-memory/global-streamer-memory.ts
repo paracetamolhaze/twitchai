@@ -585,6 +585,10 @@ function parseExpiry(candidate: StreamerMemoryCandidate, now: number): { value?:
     }
     return { value: now + candidate.expiresInHours * HOUR_MS };
   }
+  // Undated temporary material must not silently become a permanent fact.
+  const relative = /(?:сегодня|завтра|послезавтра|сейчас|пока|этот эфир)/iu.test(candidate.summary);
+  if (relative) return { value: now + 48 * HOUR_MS };
+  if (['plan', 'promise', 'trip'].includes(candidate.type)) return { value: now + 7 * DAY_MS };
   return {};
 }
 

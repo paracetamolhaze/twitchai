@@ -49,6 +49,7 @@ export interface PlannedReaction {
   message: string;
   /** When the plan was accepted — the reference point burst follow-ups measure supersession from. */
   plannedAt?: number;
+  expiresAt?: number;
   /**
    * Set when this message is part of a same-person burst: one Brain call returned the same
    * username more than once because the person had a second, genuinely distinct thought. Every
@@ -118,6 +119,7 @@ export type ReactionRejectionReason =
   // The message introduced a number that appears nowhere in the event, the chat, the speech, the
   // supplied personal material or the account's own recent messages — confident specificity with
   // no ground under it, the most human-noticeable kind of hallucination.
+  | 'learned_rule_violation'
   | 'unsupported_specificity'
   // Self-declared event_observation whose content is entirely the event's own words plus filler:
   // a caption of the stream restated back at it, with no stance, question or correction in it.

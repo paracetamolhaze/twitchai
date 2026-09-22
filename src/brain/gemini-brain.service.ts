@@ -78,6 +78,9 @@ export interface GeminiBrainServiceOptions {
 const memoryUpdateSchema = z.discriminatedUnion('scope', [
   z.object({
     scope: z.literal('global'),
+    expiresInHours: z.number().positive().max(24 * 366).optional(),
+    supersedesMemoryId: z.string().min(1).max(100).optional(),
+    resolvesMemoryId: z.string().min(1).max(100).optional(),
     type: z.enum(STREAMER_MEMORY_TYPES),
     summary: z.string().trim().min(1).max(800),
     importance: z.number().min(0).max(1),
@@ -163,6 +166,9 @@ export const BRAIN_DECISION_RESPONSE_SCHEMA = {
           entities: { type: 'array', maxItems: 16, items: { type: 'string' } },
           tags: { type: 'array', maxItems: 16, items: { type: 'string' } },
           viewerUsername: { type: 'string' },
+          expiresInHours: { type: 'number', minimum: 0.01, maximum: 8784, description: 'Global memory only: expiry for temporary plans and situations.' },
+          supersedesMemoryId: { type: 'string', description: 'Global memory only: supplied id of a plan/fact replaced by this more precise version.' },
+          resolvesMemoryId: { type: 'string', description: 'Global memory only: supplied id of a plan confirmed completed by this result.' },
         },
       },
     },
@@ -228,7 +234,7 @@ recalledMemories is what an account personally remembers, and memory is where op
 
 Use only the selected account's own profile, canon, memory and the public context for its message, and never move private facts between accounts. preferredName and shortIdentity keep a character coherent about itself; state them only when asked directly about that same character. Every reaction.username must be copied byte-for-byte from the supplied list.
 
-Only propose durable global memory for something that will still matter later: a fact, a person, a plan, a promise, a result, a place, a recurring joke, an important event. Important does not mean rare — an ordinary hour supplies several, and a stream that produces one has been unrecorded rather than quiet. Repeats are merged for you, so a known fact need not be avoided, only never invented. Propose private character memory only after a personal interaction, a continued conversation, an important fact, a promise or a personal story.
+Store only lasting facts in global memory, not commentary. Attribute each fact to a verified person: S/O are clip roles, not proof of channel ownership; omit uncertain guest attribution. Use expiresInHours for temporary situations. Use a supplied supersedesMemoryId when refining the same plan, resolvesMemoryId only when completion was observed; discussion is not completion. Keep explicit future dates and never invent a past action. Reconfirmed facts can merge. Private character memory requires a personal interaction, continued conversation, important fact, promise or personal story.
 
 Every reaction names its origin honestly: motive is the social act it performs, sourceType is where it came from. Claim a personal source only when that exact material was supplied for that account — the backend checks the claim, and a reference matching nothing gets the message dropped. Answering something said to the chat is chat_reply; a pure feeling is event_emotion; a message merely about what is on stream is event_observation, never dressed up as personal. And about the real people on this stream, write only what this session established: never introduce a specific hero, item, rank, place, number, past action or quote unless it was said, shown, or in that account's own supplied memory — "13к ммр" on stream licenses reacting to 13k, not inventing which hero earned it. A specific detail nobody established is asked about, guessed at openly, or left out.
 
@@ -620,7 +626,7 @@ export class GeminiBrainService extends EventEmitter {
     try {
       response = await this.createDecisionInteraction(requestInput, previousInteractionId);
     } catch (cause) {
-      if (generation === this.sessionGeneration) this.patchStatus({ state: 'READY', interactionStartedAt: undefined });
+      if (generation === this.sessionGeneration) this.patchStatus({ state: 'READY', interactionStartedAt: undefined, lastError: safeError(cause) });
       this.logger.warn('persona_drive_brain_call_failed', { cause });
       return undefined;
     }
@@ -832,7 +838,7 @@ function isBlockedPromptError(cause: unknown): boolean {
 
 /** A 429 that describes an empty balance rather than a speed limit: retrying cannot fix it. */
 function isBillingExhaustedError(cause: unknown): boolean {
-  return /prepayment|credits are depleted|billing|insufficient (?:funds|balance|credit)/iu.test(safeError(cause));
+  return /\b402\b|prepayment|credits are depleted|billing|insufficient (?:funds|balance|credit)/iu.test(safeError(cause));
 }
 
 function isTransientBrainError(cause: unknown): boolean {

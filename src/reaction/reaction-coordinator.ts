@@ -1,3 +1,4 @@
+import { sameBatchClaim, unsupportedAudienceClaim } from './grounded-claims';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { z } from 'zod';
@@ -21,7 +22,7 @@ import { computeChatRegister } from '../stream-brain/chat-register';
 import { topicRelevance } from '../shared/topics';
 import { shortlistCandidates } from './candidate-shortlist';
 import { emptyProvenancePools, ProvenancePools, ProvenanceVerdict, validateMotiveProvenance } from './motive-provenance';
-import { hasTrailingLaughterTag, isEventParaphrase, NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
+import { hasLaughterDecoration, isEventParaphrase, NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
 import { PolicyBatchResult, ReactionPolicyGuard } from './reaction-policy-guard';
 import {
   PlannedReaction,
@@ -628,8 +629,31 @@ export class ReactionCoordinator extends EventEmitter {
     // event's own words restated is a caption, not a message: the motive contract is what finally
     // makes this decidable, because the model itself declared "nothing personal in this".
     const contentRejections: ReactionRejection[] = [];
+    const batchClaims: Array<{ username: string; text: string }> = [];
     const substantive = grounded.filter((reaction) => {
       const username = reaction.username.trim().toLowerCase();
+      if (hasLaughterDecoration(reaction.message)
+        && pending.learnedRulesSupplied.some((rule) => rule.enforcementClass === 'formulaic_laughter_tag'
+          && (rule.scope !== 'persona' || rule.scopeKey === username))) {
+        this.session.motives.formulaicLaughterTagged += 1;
+        contentRejections.push({ username, reason: 'learned_rule_violation' });
+        this.options.usage.recordGuardRejection();
+        this.recordRejectedReaction(pending, parsed.eventId, reaction, 'learned_rule_violation');
+        return false;
+      }
+      if (pending.naturalnessEvent && unsupportedAudienceClaim(reaction.message,
+        [pending.naturalnessEvent.speech, pending.naturalnessEvent.summary].filter(Boolean).join(' '))) {
+        contentRejections.push({ username, reason: 'unsupported_specificity' });
+        this.options.usage.recordGuardRejection();
+        this.recordRejectedReaction(pending, parsed.eventId, reaction, 'unsupported_specificity');
+        return false;
+      }
+      if (!pending.chatCall && batchClaims.some((claim) => claim.username !== username && sameBatchClaim(claim.text, reaction.message))) {
+        contentRejections.push({ username, reason: 'recent_duplicate' });
+        this.options.usage.recordGuardRejection();
+        this.recordRejectedReaction(pending, parsed.eventId, reaction, 'recent_duplicate');
+        return false;
+      }
       const fabricated = ungroundedNumbers(reaction.message, pending.groundedNumbers);
       if (fabricated.length > 0) {
         contentRejections.push({ username, reason: 'unsupported_specificity' });
@@ -652,6 +676,7 @@ export class ReactionCoordinator extends EventEmitter {
         });
         return false;
       }
+      batchClaims.push({ username, text: reaction.message });
       return true;
     });
 
@@ -719,6 +744,7 @@ export class ReactionCoordinator extends EventEmitter {
     for (const plan of result.accepted) {
       const viewerUsername = pending.viewerByUsername.get(plan.bot.username.toLowerCase());
       if (viewerUsername) plan.viewerUsername = viewerUsername;
+      plan.expiresAt = pending.expiresAt;
       this.schedule(plan);
     }
     if (result.accepted.length === 0) this.options.usage.recordSkipped();
@@ -786,17 +812,6 @@ export class ReactionCoordinator extends EventEmitter {
       const effectiveSource = sourceValidated && validatedSourceType ? validatedSourceType : sourceType;
       if (effectiveSource === 'chat_reply' || effectiveSource === 'chat') this.session.motives.chatReply += 1;
       if (effectiveSource === 'event_observation') this.session.motives.eventObservation += 1;
-      // The learned laughter rule, machine-observed: a decorative trailing laugh on a sent message
-      // while that exact rule was in the prompt. Counted, never rejected here — the echo classes
-      // already drop the subset where the laugh was hiding somebody else's words, and hard-banning
-      // the rest would take genuine laughing agreement with it.
-      if (hasTrailingLaughterTag(plan.message)
-        && pending.learnedRulesSupplied.some((rule) => rule.enforcementClass === 'formulaic_laughter_tag')) {
-        this.session.motives.formulaicLaughterTagged += 1;
-        this.logger.info('FORMULAIC_LAUGHTER_TAGGED', {
-          eventId: parsed.eventId, bot: plan.bot.username, reactionId: plan.reactionId, text: plan.message,
-        });
-      }
       sentMotives.push({
         username: plan.bot.username, motive, sourceType, sourceValidated,
         ...(sourceRef ? { sourceRef } : {}),
@@ -1357,7 +1372,10 @@ export class ReactionCoordinator extends EventEmitter {
       };
     }));
     const contextReadyAt = this.now();
-    const expiresAt = contextReadyAt + this.contextTtlMs;
+    const transientCheck = /(?:видно|слышно|лагает|звук|картинк|битрейт)/iu.test(event.speech ?? event.summary)
+      && (event.type === 'question' || /[?]/u.test(event.speech ?? event.summary));
+    const expiresAt = Math.min(contextReadyAt + this.contextTtlMs,
+      event.timestamp + (transientCheck ? 15_000 : this.contextTtlMs));
     const coldStartActive = this.options.coldStart?.()?.active ?? false;
     // How loudly the real audience is already answering, so bot participation saturates instead
     // of stacking a second wave on top of fifteen human plus-signs.
@@ -1696,6 +1714,11 @@ export class ReactionCoordinator extends EventEmitter {
     const eventId = triggerId(plan.trigger);
     this.logger.info('Reaction scheduler fired', { bot: plan.bot.username, eventId });
     try {
+      if (plan.expiresAt !== undefined && this.now() >= plan.expiresAt) {
+        this.options.usage.recordSkipped();
+        this.recordSendFailure(eventId, plan.bot.username, 'reaction_expired_at_send');
+        return;
+      }
       const current = this.options.candidates().find((candidate) => candidate.username === plan.bot.username);
       if (!current?.enabled || current.connectionState !== 'CONNECTED' || !current.chatConnected) {
         this.options.usage.recordSkipped();

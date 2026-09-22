@@ -42,6 +42,17 @@ class DelayedStartRepository extends MemoryRepository {
 }
 
 describe('GlobalStreamerMemory', () => {
+  it('does not make an undated temporary plan permanent', async () => {
+    let now = 1_700_000_000_000;
+    const repository = new MemoryRepository();
+    await repository.initialize();
+    const memory = new GlobalStreamerMemory({ repository, usage: new UsageTracker(), now: () => now });
+    await memory.startOrResumeSession({ channel: 'streamer' });
+    await memory.recordFromBrain({ memories: [{ type: 'plan', summary: 'Стример сегодня планирует розыгрыш', entities: [], tags: [], importance: .8, confidence: .9 }] });
+    now += 49 * 60 * 60_000;
+    expect(await memory.startupSnapshot('streamer')).toHaveLength(0);
+  });
+
   it('keeps an important plan across sessions even when no bot reacts', async () => {
     let now = Date.UTC(2026, 7, 14, 18, 0, 0);
     const repository = new MemoryRepository();

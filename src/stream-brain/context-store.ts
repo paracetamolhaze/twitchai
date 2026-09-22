@@ -92,7 +92,7 @@ export class ContextStore {
       isLive: this.isLive,
       recentChat: [...this.chat],
       recentEvents: [...this.events],
-      recentSpeech: [...this.speech],
+      recentSpeech: this.speech.filter((line) => this.now() - line.timestamp <= 90_000),
       botUsernames: [...this.botUsernames],
       updatedAt: this.now(),
     };

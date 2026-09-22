@@ -1,3 +1,4 @@
+import { BillingBackoff } from '../billing-backoff';
 import { Logger } from '../logger';
 import {
   BrainInteractionClient,
@@ -54,6 +55,7 @@ export class OpenRouterBrainClient implements BrainInteractionClient {
   private readonly fetchImpl: typeof fetch;
   private readonly maxRetainedChains: number;
   /** Conversation as it stood after the interaction of that id. */
+  private readonly billing = new BillingBackoff();
   private readonly chains = new Map<string, ChatMessage[]>();
 
   constructor(private readonly options: OpenRouterBrainClientOptions) {
@@ -63,64 +65,72 @@ export class OpenRouterBrainClient implements BrainInteractionClient {
   }
 
   async create(request: BrainInteractionRequest): Promise<BrainInteractionResponse> {
-    const messages = this.buildMessages(request);
-    const response = await this.fetchImpl(ENDPOINT, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.options.apiKey}`,
-        'Content-Type': 'application/json',
-        ...(this.options.appUrl ? { 'HTTP-Referer': this.options.appUrl } : {}),
-        ...(this.options.appName ? { 'X-Title': this.options.appName } : {}),
-      },
-      body: JSON.stringify({
-        model: request.model,
-        messages,
-        response_format: {
-          type: 'json_schema',
-          json_schema: { name: request.kind, strict: true, schema: request.responseSchema },
+    if (!this.billing.acquire()) throw new Error('402 billing_paused: недостаточно средств; повторная проверка не чаще раза в 5 минут');
+    const billingRevision = this.billing.revision;
+    try {
+      const messages = this.buildMessages(request);
+      const response = await this.fetchImpl(ENDPOINT, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.options.apiKey}`,
+          'Content-Type': 'application/json',
+          ...(this.options.appUrl ? { 'HTTP-Referer': this.options.appUrl } : {}),
+          ...(this.options.appName ? { 'X-Title': this.options.appName } : {}),
         },
-        reasoning: { effort: request.thinkingLevel },
-        max_tokens: request.maxOutputTokens,
-        // Routing only to endpoints that actually enforce the schema. Without this the request can
-        // land somewhere that treats it as a suggestion, and a decision that does not parse is a
-        // decision lost after it was paid for.
-        provider: { require_parameters: true },
-      }),
-    });
+        body: JSON.stringify({
+          model: request.model,
+          messages,
+          response_format: {
+            type: 'json_schema',
+            json_schema: { name: request.kind, strict: true, schema: request.responseSchema },
+          },
+          reasoning: { effort: request.thinkingLevel },
+          max_tokens: request.maxOutputTokens,
+          // Routing only to endpoints that actually enforce the schema. Without this the request can
+          // land somewhere that treats it as a suggestion, and a decision that does not parse is a
+          // decision lost after it was paid for.
+          provider: { require_parameters: true },
+        }),
+      });
 
-    const body = await response.json() as ChatCompletionResponse;
-    if (!response.ok || body.error) {
-      // Kept in the shape the service already recognises: it tells a rate limit, an empty balance
-      // and a refused prompt apart by reading the message, and each has its own handling. The
-      // provider's own words are appended because the gateway's are generic to the point of
-      // useless — "400 Provider returned error" was the only thing reported while every decision
-      // on a live stream failed, and the reason it hid was a single unsupported keyword.
-      throw new Error(`${response.status} ${body.error?.message ?? response.statusText}${providerDetail(body)}`);
+      const body = await response.json() as ChatCompletionResponse;
+      if (!response.ok || body.error) {
+        // Kept in the shape the service already recognises: it tells a rate limit, an empty balance
+        // and a refused prompt apart by reading the message, and each has its own handling. The
+        // provider's own words are appended because the gateway's are generic to the point of
+        // useless — "400 Provider returned error" was the only thing reported while every decision
+        // on a live stream failed, and the reason it hid was a single unsupported keyword.
+        throw new Error(`${body.error?.code ?? response.status} ${body.error?.message ?? response.statusText}${providerDetail(body)}`);
+      }
+      this.billing.success(billingRevision);
+      const choice = body.choices?.[0];
+      const outputText = choice?.message?.content ?? undefined;
+      const id = body.id ?? `local-${Date.now()}`;
+      if (outputText) this.remember(id, messages, outputText);
+
+      const usage = body.usage;
+      const cached = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+      const reasoning = usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+      return {
+        id,
+        // The service treats anything other than 'completed' as unusable, and a truncated answer is
+        // exactly that: valid JSON is impossible once the model was cut off mid-object.
+        status: choice?.finish_reason === 'length' ? 'incomplete' : 'completed',
+        ...(choice?.finish_reason ? { finishReason: choice.finish_reason } : {}),
+        ...(outputText !== undefined ? { outputText } : {}),
+        usage: {
+          inputTokens: usage?.prompt_tokens ?? 0,
+          cachedInputTokens: cached,
+          outputTokens: Math.max(0, (usage?.completion_tokens ?? 0) - reasoning),
+          thoughtTokens: reasoning,
+          totalTokens: usage?.total_tokens ?? 0,
+          ...(typeof usage?.cost === 'number' ? { costUsd: usage.cost } : {}),
+        },
+      };
+    } catch (cause) {
+      this.billing.failure(cause);
+      throw cause;
     }
-    const choice = body.choices?.[0];
-    const outputText = choice?.message?.content ?? undefined;
-    const id = body.id ?? `local-${Date.now()}`;
-    if (outputText) this.remember(id, messages, outputText);
-
-    const usage = body.usage;
-    const cached = usage?.prompt_tokens_details?.cached_tokens ?? 0;
-    const reasoning = usage?.completion_tokens_details?.reasoning_tokens ?? 0;
-    return {
-      id,
-      // The service treats anything other than 'completed' as unusable, and a truncated answer is
-      // exactly that: valid JSON is impossible once the model was cut off mid-object.
-      status: choice?.finish_reason === 'length' ? 'incomplete' : 'completed',
-      ...(choice?.finish_reason ? { finishReason: choice.finish_reason } : {}),
-      ...(outputText !== undefined ? { outputText } : {}),
-      usage: {
-        inputTokens: usage?.prompt_tokens ?? 0,
-        cachedInputTokens: cached,
-        outputTokens: Math.max(0, (usage?.completion_tokens ?? 0) - reasoning),
-        thoughtTokens: reasoning,
-        totalTokens: usage?.total_tokens ?? 0,
-        ...(typeof usage?.cost === 'number' ? { costUsd: usage.cost } : {}),
-      },
-    };
   }
 
   private buildMessages(request: BrainInteractionRequest): ChatMessage[] {
