@@ -487,6 +487,24 @@ describe('single-session reaction protocol', () => {
     // the socket, so a message dropped by spam handling, followers-only mode or AutoMod is
     // indistinguishable from a delivered one. The reader account seeing it come back is the only
     // real evidence, and without that the dashboard reported sends that chat never showed.
+    it('confirms a remote echo arriving before the send promise resolves', async () => {
+      vi.useFakeTimers();
+      const { coordinator, usage, setObservesChat } = await setup((_username, message) => {
+        observe('bot-three', message);
+        return true;
+      });
+      const observe = (username: string, message: string) => { coordinator.confirmDelivery(username, message); };
+      usage.startStream();
+      setObservesChat(true);
+      await coordinator.prepareBrainEvent(event, 0);
+      await coordinator.submitBatch({ eventId: event.id, reactions: [{ username: 'bot-three', message: 'это был ульт в параллельную вселенную', motive: 'react', sourceType: 'event_emotion' }] });
+      await vi.runOnlyPendingTimersAsync();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(usage.snapshot().currentStream.confirmedDeliveries).toBe(1);
+      expect(usage.snapshot().currentStream.undeliveredMessages).toBe(0);
+      await coordinator.stop();
+    });
+
     it('marks a reaction undelivered when it never comes back through the reader account', async () => {
       vi.useFakeTimers();
       const { coordinator, usage, setObservesChat } = await setup();
@@ -1709,7 +1727,8 @@ describe('durable reaction id — one generated reaction, one stable id, end to 
 
   it('attributes an echo that arrives after the delivery window, once, through the bounded recent-sends memory', async () => {
     vi.useFakeTimers();
-    const { coordinator, setObservesChat } = await setup();
+    const { coordinator, usage, setObservesChat } = await setup();
+    usage.startStream();
     setObservesChat(true);
     await coordinator.prepareBrainEvent(event, 0);
     const result = await coordinator.submitBatch({
@@ -1722,6 +1741,8 @@ describe('durable reaction id — one generated reaction, one stable id, end to 
     // ...yet the late echo still names the sending it was — exactly once.
     expect(coordinator.confirmDelivery('bot-three', 'это был ульт в параллельную вселенную')).toBe(result.accepted[0]!.reactionId);
     expect(coordinator.confirmDelivery('bot-three', 'это был ульт в параллельную вселенную')).toBeUndefined();
+    expect(usage.snapshot().currentStream.confirmedDeliveries).toBe(1);
+    expect(usage.snapshot().currentStream.undeliveredMessages).toBe(0);
     await coordinator.stop();
   });
 

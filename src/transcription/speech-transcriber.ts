@@ -54,6 +54,7 @@ export interface SpeechTranscriberStats {
   transcriptsReceived: number;
   audioSecondsSent: number;
   silenceSecondsSkipped: number;
+  droppedAudioSeconds?: number;
   failures: number;
   lastTranscript?: string;
   lastLatencyMs?: number;
@@ -93,6 +94,8 @@ export class SpeechTranscriber {
   private trailingQuietMs = 0;
   private carry = Buffer.alloc(0);
   private inFlight = 0;
+  private generation = 0;
+  private pendingAudio?: { pcm: Buffer; audioMs: number; at: number };
   private readonly billing = new BillingBackoff();
   private readonly stats: SpeechTranscriberStats = {
     segmentsSent: 0,
@@ -133,6 +136,8 @@ export class SpeechTranscriber {
   }
 
   reset(): void {
+    this.generation += 1;
+    this.pendingAudio = undefined;
     this.overlap = [];
     this.window = [];
     this.windowMsFilled = 0;
@@ -173,13 +178,11 @@ export class SpeechTranscriber {
       this.stats.silenceSecondsSkipped += windowMsFilled / 1000;
       return;
     }
-    // Two at a time absorbs a slow answer without letting a backlog build: the model runs far
-    // faster than real time, and a third window means the stream is outrunning transcription.
+    // Two active requests plus one waiting window absorb a short provider stall without an
+    // unbounded backlog. Replaced or expired speech is loss, never silence.
     if (this.inFlight >= 2) {
-      this.logger.warn('Dropped an audio window because transcription was still busy', {
-        windowMs: windowMsFilled, inFlight: this.inFlight,
-      });
-      this.stats.silenceSecondsSkipped += windowMsFilled / 1000;
+      if (this.pendingAudio) this.recordDroppedAudio(this.pendingAudio.audioMs);
+      this.pendingAudio = { pcm, audioMs: windowMsFilled, at: Date.now() };
       return;
     }
     void this.transcribe(pcm, windowMsFilled);
@@ -223,7 +226,13 @@ export class SpeechTranscriber {
       .map(([word]) => word);
   }
 
+  private recordDroppedAudio(audioMs: number): void {
+    this.stats.droppedAudioSeconds = (this.stats.droppedAudioSeconds ?? 0) + audioMs / 1000;
+    this.logger.warn('Dropped stale audio while transcription was busy', { audioMs });
+  }
+
   private async transcribe(pcm: Buffer, audioMs: number): Promise<void> {
+    const generation = this.generation;
     if (!this.billing.acquire()) return;
     const billingRevision = this.billing.revision;
     this.inFlight += 1;
@@ -239,7 +248,7 @@ export class SpeechTranscriber {
         audioSeconds: audioMs / 1000,
         failed: false,
       });
-      if (this.billing.retryAt) return;
+      if (this.billing.retryAt || generation !== this.generation) return;
       delete this.stats.billingRetryAt;
       delete this.stats.lastError;
       if (result.text !== undefined && looksLikeModelMeta(result.text)) {
@@ -296,6 +305,12 @@ export class SpeechTranscriber {
       this.logger.warn('Speech transcription failed', { audioMs, cause });
     } finally {
       this.inFlight -= 1;
+      const pending = this.pendingAudio;
+      this.pendingAudio = undefined;
+      if (pending) {
+        if (Date.now() - pending.at <= 5_000) void this.transcribe(pending.pcm, pending.audioMs);
+        else this.recordDroppedAudio(pending.audioMs);
+      }
     }
   }
 }

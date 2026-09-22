@@ -345,10 +345,15 @@ export class UsageTracker {
     this.confirmedDeliveries += 1;
     if (this.streamStartedAt !== undefined) this.currentConfirmedDeliveries += 1;
   }
-  /** Written to Twitch without error but never echoed back — silently dropped on their side. */
+  /** No echo was observed before the deadline; delivery remains unconfirmed. */
   recordUndeliveredMessage(): void {
     this.undeliveredMessages += 1;
     if (this.streamStartedAt !== undefined) this.currentUndeliveredMessages += 1;
+  }
+  recordLateDelivery(): void {
+    this.undeliveredMessages = Math.max(0, this.undeliveredMessages - 1);
+    if (this.streamStartedAt !== undefined) this.currentUndeliveredMessages = Math.max(0, this.currentUndeliveredMessages - 1);
+    this.recordConfirmedDelivery();
   }
   recordSkipped(): void { this.skippedResponses += 1; }
   recordMemoryToolCall(): void { this.memoryToolCalls += 1; }

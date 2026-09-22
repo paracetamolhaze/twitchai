@@ -4,7 +4,7 @@ export interface AccountDeliveryRecord {
   sent: number;
   /** Of those, how many the reader account saw come back, so the channel really showed them. */
   shown: number;
-  /** Accepted without error and never shown — Twitch dropped them silently. */
+  /** Submitted without error, but no remote echo was observed before the deadline. */
   hidden: number;
   /** Refused outright, with the reason Twitch gave on that account's own connection. */
   refused: number;
@@ -41,8 +41,9 @@ export class DeliveryRecord {
     this.entry(username).sent += 1;
   }
 
-  recordShown(username: string): void {
+  recordShown(username: string, late = false): void {
     const entry = this.entry(username);
+    if (late) entry.hidden = Math.max(0, entry.hidden - 1);
     entry.shown += 1;
     entry.lastShownAt = this.now();
   }

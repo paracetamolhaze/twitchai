@@ -17,6 +17,15 @@ function synthesizer(overrides: Partial<ConstructorParameters<typeof SpeechEvent
 }
 
 describe('SpeechEventSynthesizer', () => {
+  it('passes a lone short remark to Brain within twelve seconds', async () => {
+    vi.useFakeTimers();
+    const { instance, emitted } = synthesizer();
+    instance.accept('S: Ебать, как я выжил.');
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(emitted).toHaveLength(1);
+    instance.stop();
+  });
+
   it('carries the words themselves rather than a description of them', async () => {
     // The layer this replaces handed the decision layer "the streamer proposes some sort of plan"
     // where the words were "we are dragging him out for drinks".
@@ -37,7 +46,7 @@ describe('SpeechEventSynthesizer', () => {
     vi.useFakeTimers();
     const { instance, emitted } = synthesizer({ maxMomentCharacters: 120 });
     instance.accept('ага');
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(12_000);
     expect(emitted).toHaveLength(1);
 
     // Three lines gathered inside one pacing interval, so they arrive as a single moment.

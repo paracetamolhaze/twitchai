@@ -230,9 +230,9 @@ export class Application {
       onMessageSent: () => this.streamSession.markMessageSent(),
       policy: this.policy,
 
-      onDelivery: ({ username, result, reason }) => {
+      onDelivery: ({ username, result, reason, late }) => {
         if (result === 'sent') this.deliveryRecord.recordSent(username);
-        else if (result === 'shown') this.deliveryRecord.recordShown(username);
+        else if (result === 'shown') this.deliveryRecord.recordShown(username, late);
         else this.deliveryRecord.recordHidden(username, reason);
       },
       sender: this.botManager,

@@ -92,6 +92,49 @@ describe('withoutRepeatedTail', () => {
 });
 
 describe('SpeechTranscriber', () => {
+  it('holds one fresh window while both transcription slots are busy', async () => {
+    const release: Array<(result: {text: string}) => void> = [];
+    const backend = { name: 'test', transcribe: vi.fn(() => new Promise<{text: string}>(resolve => release.push(resolve))) };
+    const { instance } = transcriber({ backend, windowMs: 1000, overlapMs: 0 });
+    instance.acceptPcm(pcm(3000, .2));
+    expect(backend.transcribe).toHaveBeenCalledTimes(2);
+    release[0]!({text: 'S: первая фраза'});
+    await vi.waitFor(() => expect(backend.transcribe).toHaveBeenCalledTimes(3));
+    expect(instance.getStats().silenceSecondsSkipped).toBe(0);
+    release[1]!({text: 'S: вторая фраза'});
+    release[2]!({text: 'S: третья фраза'});
+    await vi.waitFor(() => expect(instance.getStats().transcriptsReceived).toBe(3));
+  });
+
+  it('does not submit queued audio or publish old results after reset', async () => {
+    const release: Array<(result: {text: string}) => void> = [];
+    const backend = { name: 'test', transcribe: vi.fn(() => new Promise<{text: string}>(resolve => release.push(resolve))) };
+    const { instance, heard } = transcriber({ backend, windowMs: 1000, overlapMs: 0 });
+    instance.acceptPcm(pcm(3000, .2));
+    instance.reset();
+    release[0]!({text: 'S: old speech'});
+    release[1]!({text: 'S: more old speech'});
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(backend.transcribe).toHaveBeenCalledTimes(2);
+    expect(heard).toEqual([]);
+  });
+
+  it('discards a waiting window after five seconds and does not count it as silence', async () => {
+    vi.useFakeTimers();
+    try {
+      const release: Array<(result: {text: string}) => void> = [];
+      const backend = { name: 'test', transcribe: vi.fn(() => new Promise<{text: string}>(resolve => release.push(resolve))) };
+      const { instance } = transcriber({ backend, windowMs: 1000, overlapMs: 0 });
+      instance.acceptPcm(pcm(3000, .2));
+      await vi.advanceTimersByTimeAsync(6000);
+      release[0]!({text: 'S: first speech'});
+      release[1]!({text: 'S: second speech'});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(backend.transcribe).toHaveBeenCalledTimes(2);
+      expect(instance.getStats()).toMatchObject({ droppedAudioSeconds: 1, silenceSecondsSkipped: 0 });
+    } finally { vi.useRealTimers(); }
+  });
+
   it('stops uploading new audio after the Railway 402 billing failure', async () => {
     const backend = { name: 'test', transcribe: vi.fn(async () => { throw new Error('402 This request requires at least $0.50 in balance for audio'); }) };
     const onUnavailable = vi.fn();
@@ -179,9 +222,8 @@ describe('SpeechTranscriber', () => {
   it('cuts a speaker who never pauses at the window length', async () => {
     const { instance, created } = transcriber({ windowMs: 5_000 });
     instance.acceptPcm(pcm(16_000, 0.2));
-    // Two go out and the rest is dropped on purpose: a third window in flight means the stream is
-    // outrunning transcription, and a backlog of stale audio is worth less than nothing.
-    await vi.waitFor(() => expect(created.mock.calls.length).toBe(2));
+    // Two go out immediately; one fresh window waits for a slot.
+    await vi.waitFor(() => expect(created.mock.calls.length).toBe(3));
   });
 
   it('drops a window holding nothing but a cough', async () => {

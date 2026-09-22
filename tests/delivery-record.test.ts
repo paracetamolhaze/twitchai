@@ -2,6 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { DeliveryRecord } from '../src/twitch/delivery-record';
 
 describe('DeliveryRecord', () => {
+  it('reconciles a timeout when a remote observation eventually arrives', () => {
+    const record = new DeliveryRecord();
+    record.recordSent('aaaarrtyom');
+    record.recordHidden('aaaarrtyom');
+    record.recordShown('aaaarrtyom', true);
+    expect(record.snapshot().accounts[0]).toMatchObject({ sent: 1, shown: 1, hidden: 0, refused: 0 });
+  });
+
   it('learns which accounts the channel shows from traffic that was being sent anyway', () => {
     // The active check this replaces had all thirty accounts post a bare number two seconds apart,
     // and measuring cost the thing measured: nineteen delivered at 11:55 on 17 August, the check

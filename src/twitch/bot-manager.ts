@@ -399,8 +399,14 @@ export class TwitchBotManager extends EventEmitter {
         this.emit('sendRejected', { username: bot.config.username, msgid, notice });
       });
       client.on('message', (_channel, tags, message, self) => {
-        if (this.readerUsername !== bot.config.username) return;
+        if (self || _channel.replace(/^#/, '').toLowerCase() !== this.channel) return;
         const username = (tags.username ?? tags['display-name'] ?? 'unknown').toLowerCase();
+        if (this.readerUsername !== bot.config.username) {
+          // tmi.js emits the sender's own message locally. Only another connection can witness it.
+          const witness = [...this.bots.values()].find(candidate => candidate.config.username !== this.readerUsername
+            && candidate.status.connectionState === 'CONNECTED' && candidate.status.chatConnected);
+          if (username !== this.readerUsername || witness?.config.username !== bot.config.username) return;
+        }
         const chat: ChatMessage = {
           id: tags.id ?? randomUUID(),
           timestamp: Number(tags['tmi-sent-ts'] ?? Date.now()),

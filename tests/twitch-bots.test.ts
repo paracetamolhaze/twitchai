@@ -81,6 +81,22 @@ describe('TwitchBotManager isolation', () => {
     return { manager, clients, personas };
   }
 
+  it('ignores local self echoes and observes the reader through another connected account', async () => {
+    const { manager, clients } = await setup([
+      { username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true },
+      { username: 'aaaarrtyom', oauthToken: 'aaaarrtyom', enabled: true },
+    ]);
+    const reader = manager.getChatReader()!;
+    const witness = [...clients.keys()].find(name => name !== reader)!;
+    const messages: unknown[] = [];
+    manager.on('chat', message => messages.push(message));
+    clients.get(reader)!.emit('message', '#channel', { username: reader }, 'test', true);
+    expect(messages).toHaveLength(0);
+    clients.get(witness)!.emit('message', '#channel', { username: reader, id: 'server-id' }, 'test', false);
+    expect(messages).toHaveLength(1);
+    await manager.stop();
+  });
+
   it('keeps every account out of chat while the operator has the system stopped', async () => {
     // Connecting has three entry points besides start(): enabling an account, adding one, and
     // refreshing its OAuth credential. That last one runs on a timer, and production showed three

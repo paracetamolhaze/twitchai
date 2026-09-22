@@ -1136,8 +1136,8 @@ function deliveryVerdict(account: DeliveryAccountRecord): string {
   if (account.refused > 0) return reactionTraceReasonLabel(account.lastReason ?? 'не принято')
   if (account.shown === 0 && account.hidden === 0) return 'пока не писал'
   if (account.hidden === 0) return 'чат показывает'
-  if (account.shown === 0) return 'Twitch не показывает'
-  return 'показывает через раз'
+  if (account.shown === 0) return 'нет подтверждения'
+  return 'часть подтверждена'
 }
 
 const pauseBusy = ref(false)
@@ -1639,7 +1639,7 @@ function reactionTraceOutcomeLabel(outcome: ReactionTrace['outcome']): string {
 function reactionTraceMessageStatusLabel(status: ReactionTraceMessage['status']): string {
   return ({
     ACCEPTED: 'принято защитой', SCHEDULED: 'ожидает отправки', SENT: 'отправлено', FAILED: 'не отправлено',
-    UNDELIVERED: 'Twitch не показал',
+    UNDELIVERED: 'Доставка не подтверждена',
   })[status]
 }
 function formatMilliseconds(value?: number): string {

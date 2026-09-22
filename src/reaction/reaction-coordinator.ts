@@ -82,7 +82,7 @@ export interface ReactionCoordinatorOptions {
   candidates: () => ReactionBotCandidate[];
   contextTtlMs?: number;
   /** Per-account record of what the channel actually shows, kept from real traffic. */
-  onDelivery?: (outcome: { username: string; result: 'sent' | 'shown' | 'hidden'; reason?: string }) => void;
+  onDelivery?: (outcome: { username: string; result: 'sent' | 'shown' | 'hidden'; reason?: string; late?: boolean }) => void;
   /**
    * The strict first-message quality bar's current state. While `active` is true the decision
    * payload carries an extra condition, because the first thing these accounts say is the one line
@@ -119,6 +119,8 @@ interface PendingDelivery {
  * same text: attributing the wrong one would be worse than attributing none.
  */
 interface RecentSend {
+  eventId: string;
+  timedOut?: boolean;
   reactionId: string;
   key: string;
   sentAt: number;
@@ -466,7 +468,7 @@ export class ReactionCoordinator extends EventEmitter {
   private session = emptySessionStats();
   /** Ring buffer of quality-filtered reactions, newest last. Session-scoped, capped, in-memory. */
   private readonly rejectedLog: RejectedReactionRecord[] = [];
-  private readonly recentSends: RecentSend[] = [];
+  private recentSends: RecentSend[] = [];
   /** Lowercase username -> that persona's live thread. See ActiveThread. */
   private readonly threads = new Map<string, ActiveThread>();
   private stopped = false;
@@ -1759,8 +1761,10 @@ export class ReactionCoordinator extends EventEmitter {
         this.recordSendFailure(eventId, plan.bot.username, 'recent_duplicate_at_send');
         return;
       }
+      this.rememberSend(eventId, plan.reactionId, current.username, plan.message, this.now());
       const sendResult = await this.options.sender.send(current.username, plan.message);
       if (!sendResult.submitted) {
+        this.recentSends = this.recentSends.filter(send => send.reactionId !== plan.reactionId);
         this.options.usage.recordSkipped();
         this.recordSendFailure(eventId, plan.bot.username, sendResult.reason);
         return;
@@ -1780,7 +1784,6 @@ export class ReactionCoordinator extends EventEmitter {
         this.session.coldStart.firstAiMessageAgeMs = coldStartBeforeSend.ageMs;
       }
       this.recordSendSuccess(eventId, current.username, sentAt);
-      this.rememberSend(plan.reactionId, current.username, plan.message, sentAt);
       this.awaitDeliveryEcho(eventId, current.username, plan.reactionId, plan.message, sentAt);
       this.logger.info('Bot reaction submitted to Twitch', {
         bot: current.username, eventId, reactionId: plan.reactionId, text: plan.message,
@@ -1823,6 +1826,7 @@ export class ReactionCoordinator extends EventEmitter {
       }
     } catch (cause) {
       this.options.usage.recordSkipped();
+      this.recentSends = this.recentSends.filter(send => send.reactionId !== plan.reactionId);
       this.recordSendFailure(eventId, plan.bot.username, safeErrorReason(cause));
       this.logger.warn('Queued bot reaction failed', { bot: plan.bot.username, eventId, cause });
     } finally {
@@ -1835,32 +1839,39 @@ export class ReactionCoordinator extends EventEmitter {
    * socket — so a message dropped by spam handling, followers-only mode, an unverified account or
    * AutoMod looks exactly like a delivered one. The reader account does receive every message the
    * channel actually shows, including the other bots', so an echo arriving back is the only real
-   * delivery evidence available. Anything still unmatched when the window closes was not shown.
+   * delivery evidence available. An unmatched timeout is missing evidence, not proof that Twitch hid the message.
    *
-   * Known blind spot: for the reader account's own messages tmi.js emits the echo locally rather
-   * than receiving it from Twitch, so those confirm even if Twitch dropped them.
+   * The bot manager ignores local self echoes and uses a second connected account to witness
+   * messages sent by the main reader.
    */
   private awaitDeliveryEcho(eventId: string, username: string, reactionId: string, message: string, sentAt: number): void {
     if (!this.options.observesChat?.()) return;
     const key = deliveryKey(username, message);
+    this.options.onDelivery?.({ username, result: 'sent' });
+    const remembered = this.recentSends.find(send => send.reactionId === reactionId);
+    if (remembered?.attributed) {
+      this.options.usage.recordConfirmedDelivery();
+      this.options.onDelivery?.({ username, result: 'shown' });
+      return;
+    }
     const existing = this.pendingDeliveries.get(key);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => {
       this.pendingDeliveries.delete(key);
+      if (remembered) remembered.timedOut = true;
       this.options.usage.recordUndeliveredMessage();
       this.options.onDelivery?.({ username, result: 'hidden' });
       this.markReactionUndelivered(eventId, username);
-      this.logger.warn('Reaction never appeared in Twitch chat', {
+      this.logger.warn('Reaction delivery not confirmed within observation window', {
         bot: username, eventId, text: message, waitedMs: this.deliveryEchoTimeoutMs,
       });
     }, this.deliveryEchoTimeoutMs);
     timer.unref?.();
-    this.options.onDelivery?.({ username, result: 'sent' });
     this.pendingDeliveries.set(key, { eventId, username, reactionId, timer, sentAt });
   }
 
-  private rememberSend(reactionId: string, username: string, message: string, sentAt: number): void {
-    this.recentSends.push({ reactionId, key: deliveryKey(username, message), sentAt, attributed: false });
+  private rememberSend(eventId: string, reactionId: string, username: string, message: string, sentAt: number): void {
+    this.recentSends.push({ eventId, reactionId, key: deliveryKey(username, message), sentAt, attributed: false });
     if (this.recentSends.length > RECENT_SEND_LIMIT) {
       this.recentSends.splice(0, this.recentSends.length - RECENT_SEND_LIMIT);
     }
@@ -1897,6 +1908,15 @@ export class ReactionCoordinator extends EventEmitter {
     if (candidates.length === 1) {
       const late = candidates[0]!;
       late.attributed = true;
+      if (late.timedOut) {
+        this.options.usage.recordLateDelivery();
+        this.options.onDelivery?.({ username, result: 'shown', late: true });
+        const trace = this.traces.get(late.eventId);
+        if (trace) this.updateTrace(late.eventId, {
+          reactions: trace.reactions.map(reaction => reaction.reactionId === late.reactionId
+            ? { ...reaction, status: 'SENT' as const, failureReason: undefined } : reaction),
+        });
+      }
       this.logger.info('Late chat echo attributed to its reaction', {
         bot: username, reactionId: late.reactionId, lateByMs: now - late.sentAt,
       });

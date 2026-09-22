@@ -69,7 +69,7 @@ export class SpeechEventSynthesizer {
     // eighteen of twenty-seven moments came through it, because casual speech is full of question
     // marks — and events outran the decisions they were asking for.
     this.quickIntervalMs = options.quickIntervalMs ?? 12_000;
-    this.maxWaitMs = options.maxWaitMs ?? 40_000;
+    this.maxWaitMs = options.maxWaitMs ?? 12_000;
     this.minCharacters = options.minCharacters ?? 90;
     this.maxMomentCharacters = options.maxMomentCharacters ?? 200;
     this.quietBeforeVisualMs = options.quietBeforeVisualMs ?? 40_000;
