@@ -301,7 +301,8 @@ export class StreamBrainService extends EventEmitter {
     this.stopContextUpdates();
     this.options.gemini?.stop();
     this.clearPendingEventEmissions();
-    this.options.contextStore.configure({ channel });
+    // Empty channel stops media on pause; it does not disconnect the configured channel.
+    if (channel) this.options.contextStore.configure({ channel });
     await this.options.media?.reconfigure(channel, visionFps);
     if (this.running && channel) this.options.media?.start();
   }

@@ -10,6 +10,23 @@ import { UsageTracker } from '../src/usage/usage-tracker';
 afterEach(() => vi.useRealTimers());
 
 describe('StreamBrain paid-session lifecycle', () => {
+  it('preserves the configured channel when media is paused', async () => {
+    const contextStore = new ContextStore({ chatWindowMs: 1000, maxChatMessages: 10, maxEvents: 10 });
+    contextStore.configure({ channel: 'configured-channel' });
+    const media = { reconfigure: vi.fn(async () => undefined) } as unknown as MediaPipeline;
+    const brain = new StreamBrainService({
+      channel: 'configured-channel', contextStore, media,
+      eventDetector: new EventDetector({ minimumConfidence: 0.4 }),
+      usage: new UsageTracker(), logger: new Logger('TEST', 'error'),
+      contextRefreshMs: 1000, enabled: false,
+    });
+    await brain.reconfigureMedia('', 1);
+    expect(media.reconfigure).toHaveBeenCalledWith('', 1);
+    expect(contextStore.snapshot().channel).toBe('configured-channel');
+    await brain.reconfigureMedia('new-channel', 1);
+    expect(contextStore.snapshot().channel).toBe('new-channel');
+  });
+
   it('keeps Gemini completely stopped while Twitch stays offline for ten minutes', async () => {
     vi.useFakeTimers();
     const contextStore = new ContextStore({ chatWindowMs: 1_000, maxChatMessages: 10, maxEvents: 10 });

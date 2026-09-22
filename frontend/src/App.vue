@@ -470,7 +470,7 @@ const streamerMemoryStats = reactive<StreamerMemoryStats>({
   duplicateMerges: 0, averageImportance: 0, averageConfidence: 0,
 })
 const memoryTypeFilter = ref<'all' | StreamerMemoryType>('all')
-const memoryStatusFilter = ref<'all' | StreamerMemoryStatus>('all')
+const memoryStatusFilter = ref<'all' | StreamerMemoryStatus>('active')
 const memorySearch = ref('')
 const memoryPreviewQuery = ref('')
 const memoryContextPreview = ref<StreamerMemory[] | null>(null)
@@ -498,7 +498,6 @@ const pages: Array<{ id: Page; label: string; glyph: string }> = [
   { id: 'memories', label: 'Память стримера', glyph: '◌' },
   { id: 'chat', label: 'Чат и оценки', glyph: '≡' },
   { id: 'rules', label: 'Обучение', glyph: '✦' },
-  { id: 'minds', label: 'Жизнь персонажей', glyph: '☰' },
   { id: 'settings', label: 'Настройки', glyph: '⚙' },
 ]
 
@@ -527,7 +526,7 @@ const visibleStreamerMemories = computed(() => {
     if (memoryStatusFilter.value !== 'all' && memory.status !== memoryStatusFilter.value) return false
     if (!query) return true
     return [memory.summary, ...memory.entities, ...memory.tags].join(' ').toLowerCase().includes(query)
-  })
+  }).sort((a, b) => Number(b.status === 'active') - Number(a.status === 'active') || b.createdAt - a.createdAt)
 })
 
 const timeline = computed(() => [
@@ -700,7 +699,7 @@ function connectRealtime(): void {
   })
   socket.on('streamer-memories:init', (value: StreamerMemory[]) => { streamerMemories.value = value })
   socket.on('streamer-memory', (value: StreamerMemory) => {
-    streamerMemories.value = [value, ...streamerMemories.value.filter((memory) => memory.id !== value.id)]
+    upsertStreamerMemory(value)
   })
   socket.on('streamer-memory-stats', (value: StreamerMemoryStats) => Object.assign(streamerMemoryStats, value))
 }
@@ -1153,7 +1152,8 @@ async function saveSettings(): Promise<void> {
   saveMessage.value = ''
   try {
     await api('/api/settings', { method: 'PATCH', body: JSON.stringify(settings) })
-    saveMessage.value = 'Настройки применены. Канал и медиапоток переключены без ручного рестарта.'
+    Object.assign(overview, await api<Overview>('/api/overview'))
+    saveMessage.value = 'Настройки сохранены и применены.'
   } catch (error) { errorMessage.value = error instanceof Error ? error.message : String(error) }
 }
 
@@ -1347,8 +1347,19 @@ async function refreshStreamerMemoryStats(): Promise<void> {
   Object.assign(streamerMemoryStats, stats)
 }
 
+function readableRule(rule: string): string {
+  const translations: Record<string, string> = {
+    'Do not append formulaic laughter tags to commentary or open messages with theatrical scoffing interjections.': 'Не добавляй шаблонное «ахаха» и наигранные возгласы ради реакции.',
+    "Do not post generic meta-commentary that merely labels the stream's vibe, mood, or attitude.": 'Не пиши пустые комментарии про атмосферу и настроение стрима.',
+    'Do not assume streamers have already moved or completed an action when they have only talked about doing so.': 'Не выдавай планы стримеров за уже произошедшие события.',
+  }
+  return translations[rule] ?? rule
+}
+
 function upsertStreamerMemory(memory: StreamerMemory): void {
-  streamerMemories.value = [memory, ...streamerMemories.value.filter((candidate) => candidate.id !== memory.id)]
+  const index = streamerMemories.value.findIndex((candidate) => candidate.id === memory.id)
+  if (index >= 0) streamerMemories.value.splice(index, 1, memory)
+  else streamerMemories.value.unshift(memory)
 }
 
 async function refreshPersonaSummaries(): Promise<void> {
@@ -2106,17 +2117,7 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="activePage === 'memories'">
-          <div class="page-heading"><div><p class="eyebrow">ДОЛГОСРОЧНЫЙ КОНТЕКСТ КАНАЛА</p><h1>Память стримера</h1></div><p class="muted">PostgreSQL хранит истину между эфирами; Brain получает компактный снимок один раз при bootstrap и предлагает только важные обновления.</p></div>
-
-          <section class="memory-stat-grid" aria-label="Статистика памяти стримера">
-            <article><span>Всего записей</span><strong>{{ streamerMemoryStats.total }}</strong><small>канал: {{ streamerMemoryStats.channel || overview.channel || 'не выбран' }}</small></article>
-            <article><span>Актуальны</span><strong>{{ streamerMemoryStats.active }}</strong><small>доступны для подбора контекста</small></article>
-            <article><span>Подтверждения</span><strong>{{ streamerMemoryStats.duplicateMerges }}</strong><small>повторных наблюдений объединено</small></article>
-            <article><span>Средняя уверенность</span><strong>{{ streamerMemoryStats.averageConfidence.toFixed(2) }}</strong><small>важность {{ streamerMemoryStats.averageImportance.toFixed(2) }}</small></article>
-            <article><span>Завершены</span><strong>{{ streamerMemoryStats.resolved }}</strong><small>факты и планы закрыты</small></article>
-            <article><span>Заменены</span><strong>{{ streamerMemoryStats.superseded }}</strong><small>уступили более свежему факту</small></article>
-            <article><span>Устарели</span><strong>{{ streamerMemoryStats.expired }}</strong><small>вышел срок действия</small></article>
-          </section>
+          <div class="page-heading"><div><p class="eyebrow">ДОЛГОСРОЧНЫЙ КОНТЕКСТ КАНАЛА</p><h1>Память стримера</h1></div><p class="muted">Факты и планы, которые боты запомнили о стримере. «Устарела» убирает запись в архив, «Удалить» удаляет её. Архив можно открыть через фильтр состояния.</p></div>
 
           <section class="panel streamer-memory-controls">
             <label>Поиск по памяти<input v-model="memorySearch" autocomplete="off" placeholder="Например: поездка, Таиланд, турнир" /></label>
@@ -2140,28 +2141,30 @@ onBeforeUnmount(() => {
 
                 <template v-else>
                   <div class="streamer-memory-card-top"><div><p class="eyebrow">{{ streamerMemoryTypeLabel(memory.type) }}</p><h3>{{ memory.summary }}</h3></div><span :class="['streamer-memory-status', `is-${memory.status}`]">{{ streamerMemoryStatusLabel(memory.status) }}</span></div>
+                  <details><summary>Подробности записи</summary>
                   <div class="streamer-memory-chip-row"><span v-for="entity in memory.entities" :key="`entity-${entity}`" class="memory-chip entity">{{ entity }}</span><span v-for="tag in memory.tags" :key="`tag-${tag}`" class="memory-chip">#{{ tag }}</span><span v-if="!memory.entities.length && !memory.tags.length" class="memory-chip muted-chip">без сущностей и тегов</span></div>
                   <div class="streamer-memory-scores"><label>важность <meter min="0" max="1" :value="memory.importance"></meter><b>{{ memory.importance.toFixed(2) }}</b></label><label>уверенность <meter min="0" max="1" :value="memory.confidence"></meter><b>{{ memory.confidence.toFixed(2) }}</b></label></div>
                   <dl class="streamer-memory-meta"><div><dt>Создана</dt><dd>{{ formatDate(memory.createdAt) }}</dd></div><div><dt>Произошла</dt><dd>{{ memory.occurredAt ? formatDate(memory.occurredAt) : 'время не указано' }}</dd></div><div><dt>Подтверждена</dt><dd>{{ formatDate(memory.lastSeenAt) }} · ×{{ memory.confirmationCount }}</dd></div><div><dt>Источник эфира</dt><dd>{{ memory.sourceSessionId ? `эфир ${shortMemoryId(memory.sourceSessionId)}` : 'без привязки к эфиру' }}</dd></div><div><dt>Источник события</dt><dd>{{ memory.sourceEventId ? shortMemoryId(memory.sourceEventId) : 'не указан' }}</dd></div><div><dt>Срок действия</dt><dd>{{ memory.expiresAt ? formatDate(memory.expiresAt) : 'без срока' }}</dd></div><div v-if="memory.supersededBy"><dt>Заменена</dt><dd>{{ shortMemoryId(memory.supersededBy) }}</dd></div></dl>
+                  </details>
                   <div class="streamer-memory-actions"><button class="text-button" type="button" :disabled="memoryBusy" @click="startStreamerMemoryEdit(memory)">Изменить</button><button v-if="memory.status === 'active'" class="text-button" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'resolved')">Завершить</button><button v-if="memory.status === 'active'" class="text-button warning" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'expired')">Устарела</button><button v-if="memory.status === 'resolved' || memory.status === 'expired'" class="text-button" type="button" :disabled="memoryBusy" @click="setStreamerMemoryStatus(memory, 'active')">Вернуть в актуальные</button><button class="danger-button compact" type="button" :disabled="memoryBusy" @click="deleteStreamerMemory(memory)">Удалить</button></div>
                 </template>
               </article>
               <div v-if="!visibleStreamerMemories.length" class="empty-state panel">Записей с такими фильтрами пока нет. Во время эфира Gemini сохраняет только важные и безопасные факты, планы, людей и повторяющиеся контексты.</div>
             </div>
 
-            <aside class="panel streamer-memory-preview">
+            <details class="panel streamer-memory-preview"><summary>Проверить подбор памяти · диагностика</summary>
               <div class="panel-heading"><div><p class="eyebrow">ОТЛАДКА ПОДБОРА</p><h3>Контекст для Gemini</h3></div></div>
               <p class="muted">Проверяет только серверный детерминированный поиск. Этот запрос не создаёт память, не запускает новую модель и показывает лишь безопасные поля записей.</p>
               <form class="streamer-memory-preview-form" @submit.prevent="previewStreamerMemoryContext"><label>Событие или вопрос<input v-model="memoryPreviewQuery" autocomplete="off" placeholder="Стример опять говорит о поездке" /></label><button class="primary" type="submit" :disabled="memoryBusy || !memoryPreviewQuery.trim()">{{ memoryBusy ? 'Ищем…' : 'Проверить контекст' }}</button></form>
               <div v-if="memoryContextPreview" class="streamer-memory-preview-results"><p class="preview-result-count">Найдено: {{ memoryContextPreview.length }}</p><article v-for="memory in memoryContextPreview" :key="memory.id"><div><span>{{ streamerMemoryTypeLabel(memory.type) }}</span><strong>{{ memory.summary }}</strong></div><small>{{ memory.entities.join(', ') || 'без сущностей' }} · важность {{ memory.importance.toFixed(2) }} · уверенность {{ memory.confidence.toFixed(2) }}</small></article><p v-if="!memoryContextPreview.length" class="empty-state">Релевантных активных записей нет — старый контекст не будет добавлен просто из-за давности или важности.</p></div>
               <p v-else class="empty-state">Введите текущую тему, чтобы увидеть, какие записи реально могут попасть в общий контекст.</p>
-            </aside>
+            </details>
           </section>
         </template>
 
         <template v-else-if="activePage === 'chat'">
           <div class="page-heading"><div><p class="eyebrow">КОНТЕКСТ В РЕАЛЬНОМ ВРЕМЕНИ</p><h1>Чат Twitch</h1></div><p class="muted">Сообщения зрителей, ботов и системы отмечены отдельно.</p></div>
-          <p class="muted">Оценка сохраняется как обратная связь для этого аккаунта: удачное сообщение может стать примером стиля наравне с авторскими, неудачное исключается из примеров и помогает отклонять похожие ответы позже. Комментарий сохраняется и разбирается обучением, а не пересказывается модели напрямую. Накопив несколько оценок, обучение выводит из них общие правила — их видно на вкладке «Обученные правила».</p>
+          <p class="muted">Оценка сохраняется как обратная связь для этого аккаунта: удачное сообщение может стать примером стиля наравне с авторскими, неудачное исключается из примеров и помогает отклонять похожие ответы позже. Комментарий сохраняется и разбирается обучением, а не пересказывается модели напрямую. Накопив несколько оценок, обучение выводит из них общие правила — их видно на вкладке «Обучение».</p>
           <section class="panel chat-feed"><article v-for="message in [...chat].reverse()" :key="message.id" :class="['chat-line', message.kind]"><time>{{ formatTime(message.timestamp) }}</time><span class="kind-chip">{{ kindLabel(message.kind) }}</span><strong>{{ message.displayName }}</strong><p>{{ message.message }}</p><span v-if="message.kind === 'bot'" class="verdict-actions"><button type="button" :class="['text-button', verdictFor(message) === 'good' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'good')">нравится</button><button type="button" :class="['text-button', verdictFor(message) === 'bad' ? 'chosen' : '']" :disabled="verdictBusy" @click="rateMessage(message, 'bad')">не нравится</button><small v-if="verdictStatusLabel(message)" class="verdict-status">{{ verdictStatusLabel(message) }}</small></span></article><div v-if="!chat.length" class="empty-state">Сообщения появятся, когда хотя бы один бот войдёт в канал.</div></section>
         </template>
 
@@ -2170,18 +2173,13 @@ onBeforeUnmount(() => {
             <div><p class="eyebrow">ЧЕМУ НАУЧИЛИ ОЦЕНКИ</p><h1>Обучение</h1></div>
             <p class="muted">Это инструкции для будущих ответов, которые ИИ составляет из ваших оценок сообщений. Саму модель мы не переобучаем.</p>
           </div>
-          <section class="panel learning-guide">
-            <div><span class="step-number">1</span><h3>Оцените ответ</h3><p class="muted">В чате поставьте 👍 или 👎. В комментарии объясните, что понравилось или что исправить.</p></div>
-            <div><span class="step-number">2</span><h3>ИИ найдёт закономерность</h3><p class="muted">Автоматический разбор начинается от 5 новых оценок, не чаще раза в 10 минут. Он может не создать правило, если примеров недостаточно.</p></div>
-            <div><span class="step-number">3</span><h3>Правило учтётся в ответах</h3><p class="muted">Общие правила относятся ко всем, личные — к одному боту, тематические подбираются по теме и ключевым словам. Неудачное правило можно выключить.</p></div>
-          </section>
-          <p class="muted">Не все активные правила используются одновременно: на одно решение выбирается до 3 общих, 1 тематического и 3 личных. Правила с уверенностью ниже 50% пока не используются. Уверенность — оценка ИИ, а не измеренная точность.</p>
+          <p class="muted">Оценивайте сообщения в разделе «Чат и оценки». Из повторяющихся замечаний бот сам составляет правила. Здесь можно отключить неудачное правило.</p>
           <section class="panel rules-controls">
             <div>
               <div><strong>{{ teacherStatus?.pendingFeedback ?? pendingVerdictCount }}</strong><span class="muted"> оценок ждут обучения. Обучение запускается само, когда их накопится достаточно.</span></div>
               <p v-if="teacherStatusLine" :class="['muted', teacherStatus?.lastRun?.result === 'failed' ? 'teacher-failed' : '']">{{ teacherStatusLine }}</p>
             </div>
-            <button type="button" class="primary" :disabled="rulesBusy" @click="trainNow">Разобрать оценки сейчас</button>
+            <button type="button" class="primary" :disabled="rulesBusy || !(teacherStatus?.pendingFeedback ?? pendingVerdictCount)" @click="trainNow">Разобрать оценки сейчас</button>
           </section>
           <p v-if="trainingResult" class="muted">{{ trainingResult }}</p>
           <section class="panel rules-list">
@@ -2189,10 +2187,10 @@ onBeforeUnmount(() => {
               <div class="rule-head">
                 <span class="kind-chip">{{ scopeLabel(rule) }}</span>
                 <span class="kind-chip">{{ ruleStatusLabel(rule) }}</span>
-                <span class="muted">уверенность {{ Math.round(rule.confidence * 100) }}% · подтверждений {{ rule.supportCount }} (👍 {{ rule.positiveEvidence }} / 👎 {{ rule.negativeEvidence }}) · обновлено {{ formatTime(rule.updatedAt) }}</span>
+
               </div>
-              <p class="rule-text">{{ rule.rule }}</p>
-              <p class="muted">{{ rule.rationale }}</p>
+              <p class="rule-text">{{ readableRule(rule.rule) }}</p>
+              <details><summary>Почему появилось правило</summary><p class="muted">{{ rule.rationale }}</p></details>
               <div class="rule-actions">
                 <button v-if="rule.status === 'active'" type="button" class="text-button" :disabled="rulesBusy" @click="setRuleStatus(rule, 'disabled')">выключить</button>
                 <button v-else type="button" class="text-button" :disabled="rulesBusy" @click="setRuleStatus(rule, 'active')">включить</button>
@@ -2201,6 +2199,7 @@ onBeforeUnmount(() => {
             </article>
             <div v-if="!learnedRules.length" class="empty-state">Правил пока нет. Оцените несколько сообщений в чате, и обучение выведет из них общие принципы.</div>
           </section>
+          <details class="panel advanced-settings"><summary>Диагностика обучения</summary>
           <section v-if="motiveAnalytics" class="panel">
             <div class="section-heading"><div><p class="eyebrow">ОЦЕНКИ × МОТИВЫ</p><h2>Откуда берутся удачные сообщения</h2></div></div>
             <p class="muted">Каждое отправленное сообщение записано вместе с проверенным источником. Здесь ваши оценки соединяются с этими записями: подтверждают ли цифры, что сообщения из собственной жизни персонажа нравятся чаще, чем комментарии «по поводу момента».</p>
@@ -2237,6 +2236,7 @@ onBeforeUnmount(() => {
             </article>
             <div v-if="!rejectedReactions.length" class="empty-state">За эту сессию фильтры ничего не отклонили — либо стрим ещё не шёл.</div>
           </section>
+          </details>
         </template>
 
         <template v-else-if="activePage === 'minds'">
@@ -2282,15 +2282,16 @@ onBeforeUnmount(() => {
             <form class="panel settings-form" @submit.prevent="saveSettings">
               <div class="panel-heading"><div><p class="eyebrow">СТРИМ</p><h3>Источник и контекст</h3></div></div>
               <label>Канал Twitch<input v-model="settings.channel" autocomplete="off" placeholder="gudini_younger" /></label>
-              <label>Контекст стрима<textarea v-model="settings.streamContext" rows="4" placeholder="Стример играет рейтинговую Dota 2 с друзьями"></textarea></label>
+              <label>Подсказка для ботов · необязательно<textarea v-model="settings.streamContext" rows="3" placeholder="Сегодня первое прохождение. Не подсказывать сюжет. Слева в кадре — друг стримера Миша."></textarea></label><p class="muted">Напишите то, что сложно понять из видео и речи: кто в кадре, правила сегодняшнего эфира, важные пояснения. Название стрима и поминутный пересказ не нужны. Можно оставить пустым; после смены темы удалите неактуальную подсказку.</p><details class="advanced-settings"><summary>Дополнительные настройки стрима</summary>
               <label>Частота видеокадров <span>{{ settings.visionFps }} FPS</span><input v-model.number="settings.visionFps" type="range" min="0.05" max="1" step="0.05" /></label>
               <label>Канал, для которого копится память<input v-model="settings.memoryChannel" autocomplete="off" placeholder="gudini_younger" /></label>
               <small class="muted">Стримы на других каналах ничего не запоминают: сессия памяти не открывается, факты о стримере не пишутся. Пусто — копится на любом канале.</small>
-              <button class="primary" type="submit">Сохранить и применить</button>
-              <small class="muted">Канал хранится в PostgreSQL и переключается сразу. В Railway переменную TWITCH_CHANNEL можно оставить пустой.</small>
+              </details><button class="primary" type="submit">Сохранить и применить</button>
+
             </form>
-            <section class="panel security-panel"><div class="panel-heading"><div><p class="eyebrow">БЕЗОПАСНОСТЬ</p><h3>Границы развертывания</h3></div></div><ul><li><span>Ключ Gemini</span><b>Только Railway</b></li><li><span>OAuth Twitch</span><b>Только Railway</b></li><li><span>Авторизация панели</span><b>HttpOnly-сессия</b></li><li><span>CORS</span><b>Список FRONTEND_URL</b></li></ul></section>
+
           </section>
+          <details class="panel advanced-settings"><summary>Редактор личностей · для ручной настройки характера</summary><p class="muted">Для обычной работы не нужен: у аккаунтов уже есть личности. Открывайте, только если хотите изменить характер или манеру речи конкретного бота.</p>
           <div class="section-heading"><div><p class="eyebrow">УСТОЙЧИВЫЕ ВЫМЫШЛЕННЫЕ ЛЮДИ</p><h2>Редактор личностей</h2></div><p class="muted">Канон меняется только здесь. Память стрима не может переписать имя, семью или биографию.</p></div>
           <section class="panel persona-toolbar">
             <label>Выбранная личность<select :value="selectedPersonaId" @change="selectPersona(($event.target as HTMLSelectElement).value)"><option v-for="persona in personas" :key="persona.id" :value="persona.id">{{ persona.name }} · {{ persona.id }}</option></select></label>
@@ -2389,6 +2390,7 @@ onBeforeUnmount(() => {
             <div class="persona-editor-footer"><p class="muted">Сохранение изменяет канон. Обычный чат и Gemini не имеют доступа к этой операции.</p><button class="primary" type="submit" :disabled="personaBusy">{{ personaBusy ? 'Сохраняем…' : 'Сохранить личность' }}</button></div>
           </form>
           <div v-else class="empty-state panel">Создайте первую личность вручную или из уникального шаблона.</div>
+          </details>
         </template>
       </main>
     </div>
