@@ -98,8 +98,8 @@ export class ReactionPolicyGuard {
    * on a small one, where two of four accounts answered the same event a second apart with two
    * wordings of one thought. And a crowd share alone still allowed a whole group to answer an
    * ordinary remark, which no real chat does: several people reply at once when something lands
-   * that way, not because several were available. So an ordinary moment allows one voice however
-   * large the crowd, and only a moment carrying real weight opens up to the full share.
+   * that way, not because several were available. An ordinary moment allows up to two voices in a larger group,
+   * while small groups stay at one and strong moments open up to the full share.
    */
   maxReactionsFor(availableCandidates: number, salience = 1): number {
     if (availableCandidates <= 0) return 0;
@@ -107,7 +107,7 @@ export class ReactionPolicyGuard {
     const ceiling = Math.min(this.options.maxReactionsPerEvent, share);
     if (salience >= 0.8) return ceiling;
     if (salience >= 0.6) return Math.min(2, ceiling);
-    return 1;
+    return Math.min(availableCandidates >= 10 ? 2 : 1, ceiling);
   }
   maxMessageBytes(): number { return this.options.maxMessageBytes ?? 450; }
 

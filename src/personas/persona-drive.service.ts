@@ -475,11 +475,15 @@ export class PersonaDriveService {
    * to stop is an autonomous message drawing an autonomous answer with nothing on stream between.
    */
   private async aiChainDepth(): Promise<number> {
-    const chat = this.options.contextStore.snapshot().recentChat;
+    const snapshot = this.options.contextStore.snapshot();
+    const chat = snapshot.recentChat;
+    // Speech is a new external conversational turn even when nobody typed in Twitch chat.
+    // Static vision refreshes do not reset this guard: they must not sustain an AI-only loop.
+    const lastSpeechAt = snapshot.recentSpeech.at(-1)?.timestamp ?? 0;
     const trailing: typeof chat = [];
     for (let index = chat.length - 1; index >= 0; index -= 1) {
       const message = chat[index]!;
-      if (message.kind !== 'bot') break;
+      if (message.kind !== 'bot' || message.timestamp < lastSpeechAt) break;
       trailing.unshift(message);
       if (trailing.length >= MAX_TRAILING_BOT_MESSAGES_INSPECTED) break;
     }

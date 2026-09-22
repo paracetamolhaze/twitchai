@@ -432,7 +432,7 @@ export interface RejectedReactionRecord {
 const INSPECTABLE_REJECTION_REASONS: ReadonlySet<string> = new Set([
   'semantic_echo', 'borrowed_opinion', 'generic_evaluator', 'majority_echo', 'transcript_echo',
   'short_question_echo', 'disliked_near_duplicate', 'invalid_motive_source', 'schema_incomplete',
-  'unsupported_specificity', 'event_paraphrase_no_delta',
+  'unsupported_specificity', 'event_paraphrase_no_delta', 'learned_rule_violation',
   // Added after a live «киньте плюсик» poll: the one rejected answer left no text anywhere, and
   // diagnosing WHY a duplicate fired required guessing. A duplicate is a quality judgement too.
   'recent_duplicate',
@@ -1572,9 +1572,8 @@ export class ReactionCoordinator extends EventEmitter {
       ...(coldStartActive ? { firstMessageGate: FIRST_MESSAGE_GATE } : {}),
       deltas: [],
       constraints: {
-        // The ceiling follows the moment, not just the crowd: an ordinary remark is one voice at
-        // most however many accounts are watching — and an explicit invitation to the room opens
-        // the social band the call kind deserves.
+        // Ordinary remarks allow a small number of distinct voices; explicit crowd invitations
+        // use their own ceiling. The same policy also validates the submitted batch.
         maxReactions: maxReactionsOverride ?? this.options.policy.maxReactionsFor(candidates.length, event.importance),
         maxMessageBytes: this.options.policy.maxMessageBytes(),
         globalSlotsAvailable: this.options.policy.globalSlotsAvailable(),

@@ -368,6 +368,19 @@ describe('PersonaDriveService', () => {
     // ContextStore.addChat() prunes anything older than chatWindowMs against its own now(), which
     // defaults to Date.now() same as fake-timer Date — timestamps must stay relative to that, not
     // small fixed constants, or they get pruned before aiChainDepth() ever sees them.
+    it('starts a new conversation opportunity after fresh streamer speech despite two earlier bot messages', async () => {
+      vi.useFakeTimers();
+      const now = Date.now();
+      const { service, contextStore, evaluateOpportunity } = await harness();
+      contextStore.addChat(chat('bot', 'karlbekner', now - 30_000, 'good morning'));
+      contextStore.addChat(chat('bot', 'gigantiuz', now - 20_000, 'hello'));
+      contextStore.addSpeech('S: Ебать, как я выжил.', now - 5_000);
+      service.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(evaluateOpportunity).toHaveBeenCalledTimes(1);
+      service.stop();
+    });
+
     it('a single trailing AI message does not block a drive attempt (A → B is allowed)', async () => {
       vi.useFakeTimers();
       const now = Date.now();

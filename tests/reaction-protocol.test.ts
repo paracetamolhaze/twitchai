@@ -872,6 +872,8 @@ describe('single-session reaction protocol', () => {
     expect(policy.maxReactionsFor(10)).toBe(2);
     expect(policy.maxReactionsFor(20)).toBe(3);
     expect(policy.maxReactionsFor(30)).toBe(5);
+    expect(policy.maxReactionsFor(30, .4)).toBe(2);
+    expect(policy.maxReactionsFor(4, .4)).toBe(1);
     // Never above the configured ceiling, whatever the crowd.
     expect(policy.maxReactionsFor(200)).toBe(5);
   });
@@ -994,6 +996,7 @@ describe('single-session reaction protocol', () => {
       const result = await coordinator.submitBatch({ eventId: event.id, reactions: [{ username: 'bot-one', message: 'лучше не проверять ахах', motive: 'reaction', sourceType: 'event_observation' }] });
       expect(result.accepted).toHaveLength(0);
       expect(result.rejected).toContainEqual({ username: 'bot-one', reason: 'learned_rule_violation' });
+      expect(coordinator.listRejectedReactions()).toEqual([expect.objectContaining({ reason: 'learned_rule_violation', message: 'лучше не проверять ахах' })]);
       await coordinator.stop();
     });
 

@@ -40,9 +40,9 @@ describe('what the brain is told about writing like a viewer', () => {
     expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain('earns its place only by adding something');
   });
 
-  it('treats silence as the ordinary outcome for every account, including on a quiet chat', () => {
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('reactions: [] is a complete answer');
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('silence here is frequent and correct');
+  it('allows silence for missing evidence without making it the default for ordinary speech', () => {
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('reactions: [] is appropriate for unclear, stale or uneventful context');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Silence is for missing, stale, already answered or unintelligible context');
     // The framing that produced filler: a supplied opportunity read as an obligation.
     for (const removed of ['turn to speak, not a question of whether to', 'quiet is the failure', 'never as the safe default']) {
       expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain(removed);
@@ -356,14 +356,14 @@ describe('what the third live run showed', () => {
   it('asks Persona Drive for a specific reason without demanding a unique one', () => {
     // Six calls, no messages. One rule said a message another account could also have sent was not
     // worth sending, which is a demand that every line prove a personality.
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('The reason must be specific. It does not have to be unique');
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('not disqualified because another account could also have sent it');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('fresh concrete reason');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('It need not be unique or clever');
     expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain('could have come from any of the other accounts just as easily');
   });
 
   it('keeps the timer an opportunity and never a reason', () => {
     expect(BRAIN_SYSTEM_INSTRUCTION).toContain('What is never a reason is the timer');
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('silence here is frequent and correct');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('Silence is for missing, stale, already answered or unintelligible context');
     // The framings that produced filler stay gone.
     for (const removed of ['quiet is the failure', 'turn to speak, not a question of whether to']) {
       expect(BRAIN_SYSTEM_INSTRUCTION).not.toContain(removed);
@@ -371,8 +371,7 @@ describe('what the third live run showed', () => {
   });
 
   it('points Persona Drive at what the session just heard and saw', () => {
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('recentSpeech and recentEvents are what this session has just heard and seen');
-    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('that is where a reason has to come from');
+    expect(BRAIN_SYSTEM_INSTRUCTION).toContain('recentSpeech or recentEvents contain a fresh concrete reason');
   });
 });
 
@@ -383,12 +382,12 @@ describe('how many accounts may answer one moment', () => {
     now: () => 0,
   }).maxReactionsFor(candidates, salience);
 
-  it('gives an ordinary moment one voice however large the crowd', () => {
+  it('allows two distinct voices in a large group while keeping small groups at one', () => {
     // No real chat answers a passing remark in chorus; a share of the crowd alone allowed exactly
     // that, and four connected accounts produced two wordings of one thought a second apart.
     for (const candidates of [1, 4, 10, 30, 200]) {
-      expect(guard(candidates, 0.4)).toBe(1);
-      expect(guard(candidates, 0.5)).toBe(1);
+      expect(guard(candidates, 0.4)).toBe(candidates >= 10 ? 2 : 1);
+      expect(guard(candidates, 0.5)).toBe(candidates >= 10 ? 2 : 1);
     }
   });
 

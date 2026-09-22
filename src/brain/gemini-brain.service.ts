@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { z } from 'zod';
 import { STREAMER_MEMORY_TYPES } from '../global-memory/types';
 import { Logger } from '../logger';
+import { normalizeForLookup } from '../shared/similarity';
 import { PERSONA_MEMORY_TYPES } from '../personas/types';
 import { REACTION_NATURALNESS_PROMPT } from '../reaction/natural-writing-policy';
 import { StreamEvent } from '../stream-brain/types';
@@ -114,12 +115,6 @@ const decisionSchema = z.object({
 }).strict();
 
 const readySchema = z.object({ ready: z.literal(true) }).strict();
-const summarySchema = z.object({ summary: z.string().max(2_000) }).strict();
-
-const SESSION_SUMMARY_RESPONSE_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['summary'],
-  properties: { summary: { type: 'string' } },
-} as const;
 
 export const BRAIN_DECISION_RESPONSE_SCHEMA = {
   type: 'object',
@@ -200,7 +195,7 @@ export const BRAIN_SYSTEM_INSTRUCTION = `You are the decision and writing brain 
 
 Every request carries a triggerKind. external_stream_event is a moment observed on stream. persona_drive is an opportunity to speak with nothing newly observed. session_handover asks you to write down what the stream has been about so far, and nothing else.
 
-Decide in this order, always. First: what just happened, and whether one of these particular people would react to it. Many moments pass without one and reactions: [] is a complete answer, but the test is whether someone would react, not whether the moment was special enough to deserve it. Second: which of these people would actually react — judged INDEPENDENTLY, because each candidate is a separate person, not a contestant for one slot. Several may each have their own real reason, and person B is never suppressed because person A also speaks; nobody is added merely for variety. Availability is not a reason. Having been quiet is not a reason either; it may break a tie between two accounts who both have something, and nothing more. Third: only then, how that particular person would type it. Never work the other way round, from a personality towards a line that shows it off.
+Decide in this order, always. First: what just happened, and whether one of these particular people would react to it. Look for an ordinary grounded reaction, not whether the moment was special enough to deserve it. reactions: [] is appropriate for unclear, stale or uneventful context. Second: which of these people would actually react — judged INDEPENDENTLY, because each candidate is a separate person, not a contestant for one slot. Several may each have their own real reason, and person B is never suppressed because person A also speaks; nobody is added merely for variety. Availability is not a reason. Having been quiet is not a reason either; it may break a tie between two accounts who both have something, and nothing more. Third: only then, how that particular person would type it. Never work the other way round, from a personality towards a line that shows it off.
 
 Two kinds of message look alike and are not. One exists because somebody saw or heard something and had a reaction to it: that is ordinary chat, and it is allowed to be small, obvious and unremarkable — a word, an agreement, a correction, a light dig, a plain opinion, a laugh. The other exists because the chat looked empty and something had to go in it: that one is wrong however well it is written. What separates them is only whether the moment came first.
 
@@ -218,11 +213,11 @@ Speech arrives with the voices marked: "S:" is the streamer, "O:" is someone els
 
 recentChatDelta is what has just been said in chat, by real viewers and by these accounts alike. Read it first. Do not remake a point already there in different words, and do not keep a thread between accounts alive past a couple of exchanges: the stream is what everyone is watching, not the chat. A brief exchange between two of them is fine; a conversation that has drifted off the stream is not.
 
-How many speak follows the moment. Most moments are one account or none. A moment that genuinely lands on a crowd — very funny, shocking, a big fail, a surprising price, a breakdown, or addressed to everyone — can draw two or three DIFFERENT reactions, each its own thought, never rewordings of one. crowdCall in the payload marks the streamer explicitly inviting the whole chat: several answers are then the natural shape, and for a constrained call («киньте плюс») short identical answers from different people are exactly right, while open feedback wants each person naming their own detail. A person may also add one short follow-up thought as another array item with the same username — rarely, only when genuinely distinct; never split one thought. constraints.maxReactions is a ceiling, never a target.
+How many speak follows the moment. For an intelligible new remark, complaint, near miss, greeting or opinion, normally choose one or two fitting viewers who have a grounded reaction. Reserve zero for genuinely uneventful, unclear, stale or already answered observations. Ordinary gameplay and casual speech do not need to be exceptional to deserve a short response. A moment that genuinely lands on a crowd — very funny, shocking, a big fail, a surprising price, a breakdown, or addressed to everyone — can draw two or three DIFFERENT reactions, each its own thought, never rewordings of one. crowdCall in the payload marks the streamer explicitly inviting the whole chat: several answers are then the natural shape, and for a constrained call («киньте плюс») short identical answers from different people are exactly right, while open feedback wants each person naming their own detail. A person may also add one short follow-up thought as another array item with the same username — rarely, only when genuinely distinct; never split one thought. constraints.maxReactions is a ceiling, never a target.
 
 A direct mention makes an answer likely, not automatic: a question wants an answer, a passing use of the name may want nothing.
 
-persona_drive: the backend offers the floor, and whether anyone takes it is your judgement. recentSpeech and recentEvents are what this session has just heard and seen, and that is where a reason has to come from. Take the floor when something in them is still live: a subject from a minute ago, a small thing that happened, an opinion someone would add, a question a person would genuinely want to ask, something they remember that bears on it. The reason must be specific. It does not have to be unique — two viewers can have the same ordinary thought, and a message is not disqualified because another account could also have sent it. What is never a reason is the timer, a quiet chat, an account that has not written in a while, or the fact that candidates were supplied. At most one account speaks, and silence here is frequent and correct. secondsSinceLastObservation says how long ago the stream was last seen; once it is minutes old, whatever was last seen is not what is happening, so do not continue that subject.
+persona_drive: take the floor when recentSpeech or recentEvents contain a fresh concrete reason to react, ask or add an opinion. It need not be unique or clever. What is never a reason is the timer, a quiet chat, an account that has not written in a while, or the fact that candidates were supplied. At most one account speaks. Silence is for missing, stale, already answered or unintelligible context. secondsSinceLastObservation tells you when the scene was last observed; minutes-old context does not establish what is happening now.
 
 Profiles arrive once at the start of a session and stay in force. A profile describes tendencies, not requirements: favourite forms, laughs and examples show how a person tends to sound on average, and most of their messages contain none of them. Never assemble a message out of those parts. weakTopics are subjects they hedge on and unknownTopics ones they plainly do not know, so they may say so briefly or stay out, and never improvise expertise. Let flaws show. Never use a phrase from that character's avoidedExpressions. A person who answers everything competently and agreeably is wrong however well the line is written.
 
@@ -244,6 +239,10 @@ ${REACTION_NATURALNESS_PROMPT}`;
 /** Bootstrap sends the full session profile, so it is allowed proportionally longer than a decision. */
 const BOOTSTRAP_DEADLINE_FACTOR = 2;
 
+class BrainResponseFormatError extends Error {
+  constructor() { super('brain_response_invalid'); this.name = 'BrainResponseFormatError'; }
+}
+
 class BrainInteractionTimeoutError extends Error {
   constructor(timeoutMs: number) {
     super(`brain_interaction_timeout_after_${timeoutMs}ms`);
@@ -258,6 +257,8 @@ export class GeminiBrainService extends EventEmitter {
   private startPromise?: Promise<void>;
   private previousInteractionId?: string;
   private rolloverRequired = false;
+  private observedSessionTail: string[] = [];
+  private lastVisualDecision?: { summary: string; at: number };
   /** Whether a decision is running. Moments arriving now merge into the next one, not a queue. */
   private decisionInFlight = false;
   private sessionGeneration = 0;
@@ -307,6 +308,8 @@ export class GeminiBrainService extends EventEmitter {
     this.cancelPendingBurst();
     this.previousInteractionId = undefined;
     this.rolloverRequired = false;
+    this.observedSessionTail = [];
+    this.lastVisualDecision = undefined;
     this.chatCursor = 0;
     this.pendingDeltas = [];
     this.startPromise = undefined;
@@ -489,8 +492,18 @@ export class GeminiBrainService extends EventEmitter {
       });
       return undefined;
     }
+    const routineVisual = event.type === 'visual' && !event.speech && !isDirectMention(event) && event.importance <= .4;
+    if (routineVisual && this.lastVisualDecision
+      && this.now() - this.lastVisualDecision.at < 90_000
+      && normalizeForLookup(event.summary) === this.lastVisualDecision.summary) {
+      this.logger.info('Brain call skipped; unchanged visual observation', { eventId: event.id });
+      return undefined;
+    }
     if (this.startPromise) await this.startPromise;
     if (this.rolloverRequired) await this.rollover();
+    if (freshnessMs > 0 && this.now() - event.timestamp > freshnessMs) return undefined;
+    this.observedSessionTail.push(JSON.stringify({ at: event.timestamp, observation: event.summary.slice(0, 240) }));
+    this.observedSessionTail = this.observedSessionTail.slice(-8);
     const generation = this.sessionGeneration;
     if (!this.previousInteractionId && this.status.state === 'ERROR') {
       this.patchStatus({ state: 'STARTING', lastError: undefined });
@@ -540,7 +553,7 @@ export class GeminiBrainService extends EventEmitter {
       // unanswered request may have created. Discarding it instead forced a recovery bootstrap:
       // production ran four full 24k-character bootstraps in ten minutes, each one blocking the
       // queue again and causing the next timeout.
-      if (cause instanceof BrainInteractionTimeoutError && generation === this.sessionGeneration) {
+      if ((cause instanceof BrainInteractionTimeoutError || cause instanceof BrainResponseFormatError) && generation === this.sessionGeneration) {
         this.restoreDeltas(capturedDeltas);
         this.patchStatus({ state: 'READY', interactionStartedAt: undefined, lastError: safeError(cause) });
         throw cause;
@@ -588,6 +601,7 @@ export class GeminiBrainService extends EventEmitter {
     const completedAt = this.now();
     const latencyMs = completedAt - emittedAt;
     const apiLatencyMs = completedAt - requestStartedAt;
+    if (routineVisual) this.lastVisualDecision = { summary: normalizeForLookup(event.summary), at: this.now() };
     this.previousInteractionId = response.id;
     this.rolloverRequired = response.usage.inputTokens >= this.options.contextRolloverTokens;
     this.chatCursor = Math.max(this.chatCursor, prepared.recentChatDelta.at(-1)?.timestamp ?? event.timestamp);
@@ -676,10 +690,9 @@ export class GeminiBrainService extends EventEmitter {
   private async rollover(): Promise<void> {
     const generation = this.sessionGeneration;
     this.rolloverRequired = false;
-    // Asked before the chain is dropped, on the chain itself: nobody else can say what this stream
-    // has been about. Cheap next to what it saves — the whole conversation is already cached, and
-    // the answer is a few hundred tokens that travel into the next session.
-    const summary = await this.summariseSessionSoFar();
+    // The bootstrap also reloads durable memory, current events and recent chat. Carry a bounded
+    // verbatim observation tail rather than blocking live reactions on another paid model call.
+    const summary = this.observedSessionTail.join('\n') || undefined;
     this.previousInteractionId = undefined;
     this.patchStatus({
       state: 'STARTING', previousInteractionId: undefined,
@@ -688,50 +701,36 @@ export class GeminiBrainService extends EventEmitter {
     await this.bootstrap('rollover', generation, summary);
   }
 
-  private async summariseSessionSoFar(): Promise<string | undefined> {
-    const previousInteractionId = this.previousInteractionId;
-    if (!previousInteractionId) return undefined;
-    try {
-      const response = await this.withDeadline(this.options.client.create({
-        kind: 'decision',
-        model: this.options.model,
-        input: JSON.stringify({
-          triggerKind: 'session_handover',
-          instruction: 'Соберись: что происходило на стриме с начала сессии. Где стример был и что '
-            + 'делал, о чём говорил, что уже обсудили в чате, какие темы закрыты, что осталось '
-            + 'незаконченным. Только факты этой сессии, без вымысла. Не больше 120 слов.',
-        }),
-        previousInteractionId,
-        systemInstruction: BRAIN_SYSTEM_INSTRUCTION,
-        responseSchema: SESSION_SUMMARY_RESPONSE_SCHEMA,
-        thinkingLevel: 'low',
-        maxOutputTokens: 400,
-        store: true,
-      }));
-      const summary = summarySchema.parse(JSON.parse(response.outputText ?? '')).summary.trim();
-      this.recordInteraction(response.usage, false, 0);
-      this.logger.info('Session summarised before rollover', { characters: summary.length });
-      return summary || undefined;
-    } catch (cause) {
-      // A rollover that cannot summarise still has to happen: growing context is the problem it
-      // exists to solve, and losing the recap is far better than losing the session.
-      this.logger.warn('Could not summarise the session before rollover; continuing without it', { cause });
-      return undefined;
-    }
-  }
-
   private async createDecisionInteraction(input: string, previousInteractionId: string): Promise<BrainInteractionResponse> {
     const request: BrainInteractionRequest = {
       kind: 'decision', model: this.options.model, input, previousInteractionId,
       systemInstruction: BRAIN_SYSTEM_INSTRUCTION,
       responseSchema: BRAIN_DECISION_RESPONSE_SCHEMA,
       thinkingLevel: this.options.thinkingLevel,
-      maxOutputTokens: 1_024,
+      maxOutputTokens: 2_048,
       store: true,
     };
+    const startedAt = this.now();
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.withDeadline(this.options.client.create(request));
+        const totalBudget = this.options.interactionTimeoutMs;
+        const remaining = totalBudget ? totalBudget - (this.now() - startedAt) : undefined;
+        if (remaining !== undefined && remaining <= 0) throw new BrainInteractionTimeoutError(totalBudget!);
+        const response = await this.withDeadline(this.options.client.create(request), remaining && totalBudget ? remaining / totalBudget : 1);
+        try {
+          this.assertComplete(response);
+          decisionSchema.parse(JSON.parse(response.outputText ?? ''));
+          return response;
+        } catch {
+          // Invalid output still costs money. Never chain from it or execute partial reactions.
+          this.recordInteraction(response.usage, false, 0);
+          const elapsed = this.now() - startedAt;
+          const budget = this.options.interactionTimeoutMs || 15_000;
+          if (attempt > 0 || elapsed >= budget / 2) throw new BrainResponseFormatError();
+          this.logger.warn('Brain response invalid; retrying once on the last valid chain', { finishReason: response.finishReason });
+          request.maxOutputTokens = 3_072;
+          continue;
+        }
       } catch (cause) {
         // A deadline miss is terminal, never retried: the point of the deadline is to release the
         // serial queue quickly, and retrying would hold it for another full deadline. It is checked

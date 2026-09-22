@@ -48,6 +48,80 @@ function bootstrap(): BrainBootstrap {
 }
 
 describe('Gemini 3.8 stateful Brain', () => {
+  it('retries malformed decisions once on the last valid chain without losing the event', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const delivered: BrainDecision[] = [];
+    const service = brainService({ create: async request => {
+      requests.push(request);
+      return { id: `M${requests.length}`, status: 'completed',
+        outputText: request.kind === 'bootstrap' ? '{"ready":true}' : requests.length === 2 ? '{"reactions":[{"message":"' : '{"reactions":[],"memoryUpdates":[]}',
+        usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 0, totalTokens: 105 } };
+    } }, { onDecision: async (_event, decision) => { delivered.push(decision); } });
+    await service.startStream();
+    await service.enqueueEvent(firstEvent);
+    expect(delivered).toHaveLength(1);
+    expect(requests.map(r => r.previousInteractionId)).toEqual([undefined, 'M1', 'M1']);
+    expect(service.getStatus().interactions).toBe(3);
+    await service.stopStream();
+  });
+
+  it('does not put a paid summary call ahead of a live event at rollover', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const service = brainService({ create: async request => {
+      requests.push(request);
+      if (request.input.includes('session_handover')) throw Error('Paid handover blocks live event');
+      return { id: `L${requests.length}`, status: 'completed', outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+        usage: { inputTokens: request.kind === 'bootstrap' ? 100 : 800, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 0, totalTokens: 805 } };
+    } }, { contextRolloverTokens: 750 });
+    await service.startStream();
+    await service.enqueueEvent(firstEvent);
+    await service.enqueueEvent({ ...firstEvent, id: 'next' });
+    expect(requests).toHaveLength(4);
+    expect(JSON.parse(requests[2]!.input).previousSessionSummary).toContain(firstEvent.summary);
+    await service.stopStream();
+  });
+
+  it('skips repeated low-signal visual decisions but allows speech, new scenes and urgent visuals', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    let now = firstEvent.timestamp;
+    const service = brainService({ create: async request => {
+      requests.push(request);
+      return { id: `V${requests.length}`, status: 'completed', outputText: request.kind === 'bootstrap' ? '{"ready":true}' : '{"reactions":[],"memoryUpdates":[]}',
+        usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 0, totalTokens: 105 } };
+    } }, { now: () => now });
+    await service.startStream();
+    const visual: StreamEvent = { ...firstEvent, type: 'visual', speech: undefined, summary: 'Man sits at a computer playing Dota', importance: .4 };
+    await service.enqueueEvent(visual);
+    now += 25_000;
+    await service.enqueueEvent({ ...visual, id: 'repeat', timestamp: now });
+    expect(requests).toHaveLength(2);
+    await service.enqueueEvent({ ...visual, id: 'speech', timestamp: now, speech: 'hello chat' });
+    await service.enqueueEvent({ ...visual, id: 'urgent', timestamp: now, importance: .9 });
+    await service.enqueueEvent({ ...visual, id: 'new-scene', timestamp: now, summary: 'A guest enters the kitchen carrying a cake' });
+    expect(requests).toHaveLength(5);
+    now += 91_000;
+    await service.enqueueEvent({ ...visual, id: 'refresh', timestamp: now });
+    expect(requests).toHaveLength(6);
+    await service.stopStream();
+  });
+
+  it('bounds invalid-output retries and keeps the valid chain for the next event', async () => {
+    const requests: BrainInteractionRequest[] = [];
+    const service = brainService({ create: async request => {
+      requests.push(request);
+      return { id: `B${requests.length}`, status: 'completed', outputText: request.kind === 'bootstrap' ? '{"ready":true}' : requests.length <= 3 ? '{' : '{"reactions":[],"memoryUpdates":[]}',
+        usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 5, thoughtTokens: 0, totalTokens: 105 } };
+    } });
+    await service.startStream();
+    await expect(service.enqueueEvent(firstEvent)).rejects.toThrow('brain_response_invalid');
+    expect(requests).toHaveLength(3);
+    await service.enqueueEvent({ ...firstEvent, id: 'next' });
+    expect(requests.map(r => r.previousInteractionId)).toEqual([undefined, 'B1', 'B1', 'B1']);
+    expect(service.getStatus().interactions).toBe(4);
+    expect(service.getStatus().state).toBe('READY');
+    await service.stopStream();
+  });
+
   it('preserves global memory expiry and replacement references through the response parser', async () => {
     const update = { scope: 'global', type: 'plan', summary: 'Розыгрыш завтра', importance: .8, confidence: .9, expiresInHours: 48, supersedesMemoryId: 'old-plan' };
     const delivered: BrainDecision[] = [];
@@ -265,15 +339,14 @@ describe('Gemini 3.8 stateful Brain', () => {
     await service.enqueueEvent({ ...firstEvent, id: 'after-rollover' });
 
     expect(reasons).toEqual(['stream_start', 'rollover']);
-    // A handover turn on the outgoing chain, then the fresh bootstrap carrying its recap: the
-    // rollover exists to bound per-call cost, and it used to pay for that by forgetting the stream.
+    // The new bootstrap carries observed context without a paid handover call blocking the event.
     expect(requests.map(({ kind, previousInteractionId }) => [kind, previousInteractionId])).toEqual([
-      ['bootstrap', undefined], ['decision', 'R1'], ['decision', 'R2'],
-      ['bootstrap', undefined], ['decision', 'R4'],
+      ['bootstrap', undefined], ['decision', 'R1'],
+      ['bootstrap', undefined], ['decision', 'R3'],
     ]);
-    expect(requests[2]?.input).toContain('session_handover');
-    const carried = JSON.parse(requests[3]!.input) as BrainBootstrap;
-    expect(carried.previousSessionSummary).toContain('голубя');
+    expect(requests.some(r => r.input.includes('session_handover'))).toBe(false);
+    const carried = JSON.parse(requests[2]!.input) as BrainBootstrap;
+    expect(carried.previousSessionSummary).toContain(firstEvent.summary);
     expect(service.getStatus().rollovers).toBe(1);
   });
 
