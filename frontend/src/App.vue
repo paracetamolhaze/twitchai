@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { dashboardFetch } from './dashboard-fetch'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { io, Socket } from 'socket.io-client'
 import DashboardOverview from './components/DashboardOverview.vue'
@@ -600,7 +601,7 @@ function requestHeaders(extra?: HeadersInit, hasBody = false): Headers {
 }
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
+  const response = await dashboardFetch(`${API_URL}${path}`, {
     ...options,
     credentials: 'include',
     headers: requestHeaders(options.headers, options.body !== undefined),
@@ -620,7 +621,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 async function checkSession(): Promise<void> {
   checkingSession.value = true
   try {
-    const response = await fetch(`${API_URL}/api/auth/session`, { credentials: 'include' })
+    const response = await dashboardFetch(`${API_URL}/api/auth/session`, { credentials: 'include' })
     authenticated.value = response.ok
     if (response.ok) await loadDashboard()
   } catch {
@@ -711,7 +712,7 @@ async function login(): Promise<void> {
   loading.value = true
   errorMessage.value = ''
   try {
-    const response = await fetch(`${API_URL}/api/auth/login`, {
+    const response = await dashboardFetch(`${API_URL}/api/auth/login`, {
       method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: draftToken.value.trim() }),
     })
@@ -727,7 +728,7 @@ async function login(): Promise<void> {
 }
 
 async function logout(): Promise<void> {
-  await fetch(`${API_URL}/api/auth/logout`, { method: 'POST', credentials: 'include' }).catch(() => undefined)
+  await dashboardFetch(`${API_URL}/api/auth/logout`, { method: 'POST', credentials: 'include' }).catch(() => undefined)
   endLocalSession()
 }
 
