@@ -8,6 +8,14 @@
       "destination": "https://backend-production-7353.up.railway.app/api/:path*"
     },
     {
+      "source": "/socket.io",
+      "destination": "https://backend-production-7353.up.railway.app/socket.io/"
+    },
+    {
+      "source": "/socket.io/",
+      "destination": "https://backend-production-7353.up.railway.app/socket.io/"
+    },
+    {
       "source": "/socket.io/:path*",
       "destination": "https://backend-production-7353.up.railway.app/socket.io/:path*"
     },
@@ -28,6 +36,24 @@
     },
     {
       "source": "/socket.io/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/socket.io",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/socket.io/",
       "headers": [
         {
           "key": "Cache-Control",
