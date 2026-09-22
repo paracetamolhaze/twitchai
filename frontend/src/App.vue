@@ -410,7 +410,7 @@ const overview = reactive<Overview>({
     geminiSessionActive: false, geminiSessionReason: 'application_stopped',
   },
   geminiBrain: {
-    state: 'OFFLINE', model: 'gemini-3.7-flash', thinkingLevel: 'low', interactions: 0, decisions: 0,
+    state: 'OFFLINE', model: 'gemini-3.8-flash', thinkingLevel: 'low', interactions: 0, decisions: 0,
     silentDecisions: 0, generatedReactions: 0, averageLatencyMs: 0, rebuiltSessions: 0,
     rollovers: 0, contextTokens: 0, bootstrapChars: 0, bootstrapInputTokens: 0,
   },
@@ -1863,19 +1863,18 @@ onBeforeUnmount(() => {
         <p v-if="saveMessage" class="notice success">{{ saveMessage }}</p>
 
         <template v-if="activePage === 'overview'">
-          <div class="page-heading"><div><p class="eyebrow">ЦЕНТР УПРАВЛЕНИЯ</p><h1>Обзор</h1></div><p class="muted">Один стрим, один мультимодальный мозг, {{ overview.totalBots }} самостоятельных личностей.</p></div>
+          <div class="page-heading"><div><p class="eyebrow">ЦЕНТР УПРАВЛЕНИЯ</p><h1>Ваш эфир</h1></div><p class="muted">Состояние ботов, сообщения и расходы — всё важное сейчас.</p></div>
           <section class="health-grid" aria-label="Состояние системы">
             <article v-for="item in healthItems" :key="item.label" class="health-card">
               <div><span :class="['status-light', item.tone]"></span><span>{{ item.label }}</span></div>
               <strong>{{ item.status }}</strong><small>{{ item.detail }}</small>
             </article>
           </section>
-          <section class="metric-strip">
-            <div><span>Время работы</span><strong>{{ formatDuration(usage.uptimeSeconds) }}</strong></div>
-            <div><span>Медиапоток захвачен</span><strong>{{ usage.streamMinutes.toFixed(1) }} мин</strong></div>
-            <div><span>Сообщений отправлено</span><strong>{{ usage.sentResponses }}</strong></div>
-            <div><span>Решений промолчать</span><strong>{{ usage.emptyReactionBatches }}</strong></div>
-            <div><span>Переподключений Gemini</span><strong>{{ usage.geminiReconnects }}</strong></div>
+          <section class="metric-strip operator-metrics">
+            <div><span>Подключено ботов</span><strong>{{ overview.activeBots }} / {{ overview.totalBots }}</strong></div>
+            <div><span>Сообщений в чате за эфир</span><strong>{{ usage.currentStream.confirmedDeliveries }}</strong></div>
+            <div><span>Расход на эфир · оценка</span><strong>${{ usage.currentStream.totalAi.estimatedCostUsd.toFixed(3) }}</strong></div>
+            <div><span>Время работы приложения</span><strong>{{ formatDuration(usage.uptimeSeconds) }}</strong></div>
           </section>
           <div class="overview-grid">
             <section class="panel timeline-panel">
@@ -1953,16 +1952,22 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="activePage === 'brain'">
-          <div class="page-heading"><div><p class="eyebrow">ДАТЧИКИ И РЕШЕНИЯ</p><h1>Мозг стрима</h1></div><p class="muted">Слух и зрение ничего не решают: они превращают стрим в слова и описания. Решает кому и что написать один Brain.</p></div>
-          <section class="brain-summary">
-            <div><span>СЛУХ</span><strong>{{ overview.streamBrain.transcription?.model || 'выключен' }}</strong></div>
-            <div><span>ЗРЕНИЕ</span><strong>{{ overview.streamBrain.vision?.model || 'выключено' }}</strong></div>
-            <div><span>BRAIN</span><strong>{{ stateLabel(overview.geminiBrain.state) }}</strong></div>
-            <div><span>Brain-модель / thinking</span><strong>{{ overview.geminiBrain.model }} / {{ overview.geminiBrain.thinkingLevel }}</strong></div>
-            <div><span>Возраст Brain-сессии</span><strong>{{ formatSessionDuration(overview.geminiBrain.sessionStartedAt) }}</strong></div>
-            <div><span>Последнее событие</span><strong>{{ formatTime(overview.streamBrain.lastEventAt) }}</strong></div>
+          <div class="page-heading"><div><p class="eyebrow">ПОНИМАНИЕ ЭФИРА</p><h1>Мозг стрима</h1></div><p class="muted">{{ stateLabel(overview.geminiBrain.state) }} · Последнее событие: {{ formatTime(overview.streamBrain.lastEventAt) }}</p></div>
+          <section class="metric-strip operator-metrics" aria-label="Результат текущего эфира">
+            <div><span>Расход на эфир · оценка</span><strong>${{ usage.currentStream.totalAi.estimatedCostUsd.toFixed(3) }}</strong></div>
+            <div><span>Подтверждено в чате</span><strong>{{ usage.currentStream.confirmedDeliveries }}</strong></div>
+            <div><span>Не подтверждено</span><strong>{{ usage.currentStream.undeliveredMessages }}</strong></div>
+            <div><span>Среднее время решения</span><strong>{{ formatMilliseconds(usage.currentStream.brain.averageLatencyMs) }}</strong></div>
           </section>
-          <section class="panel metric-strip"><div><span>Twitch media</span><strong>→</strong></div><div><span>слух · речь</span><strong>→</strong></div><div><span>зрение · сцена</span><strong>→</strong></div><div><span>Brain · решение</span><strong>→</strong></div><div><span>Policy / Twitch</span><strong>✓</strong></div></section>
+          <section class="panel perception-summary">
+            <div><p class="eyebrow">ЧТО УСЛЫШАЛ</p><p>{{ overview.streamBrain.transcription?.lastTranscript || 'Распознанной речи пока нет.' }}</p></div>
+            <div><p class="eyebrow">ЧТО УВИДЕЛ</p><p>{{ overview.streamBrain.vision?.lastDescription || 'Описания сцены пока нет.' }}</p></div>
+          </section>
+          <p v-if="overview.geminiBrain.lastError" class="notice error">{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</p>
+          <p v-if="overview.streamBrain.lastError" class="notice error">{{ operatorErrorLabel(overview.streamBrain.lastError) }}</p>
+          <details class="operator-details">
+            <summary>Техническая диагностика <span>Токены, модели, счётчики и протокол</span></summary>
+            <p class="muted">Модель: {{ overview.geminiBrain.model }} · Уровень рассуждения: {{ overview.geminiBrain.thinkingLevel }} · Сессия: {{ formatSessionDuration(overview.geminiBrain.sessionStartedAt) }}</p>
           <div class="section-heading"><div><p class="eyebrow">ТЕКУЩИЙ ЭФИР</p><h2>Расход и результат</h2></div></div>
           <section class="metric-strip">
             <div><span>Слух · сегментов</span><strong>{{ usage.currentStream.hearing.calls }}</strong></div>
@@ -1998,7 +2003,7 @@ onBeforeUnmount(() => {
             <div><span>Brain context tokens</span><strong>{{ overview.geminiBrain.contextTokens }}</strong></div>
             <div><span>Bootstrap chars / tokens</span><strong>{{ overview.geminiBrain.bootstrapChars }} / {{ overview.geminiBrain.bootstrapInputTokens }}</strong></div>
           </section>
-          <div class="section-heading"><div><p class="eyebrow">АВТОНОМНЫЙ СЛОЙ</p><h2>Persona Drive · текущий стрим</h2></div><p class="muted">Внутренние спонтанные реплики поверх Gemini 3.7 Brain — Gemini 3.1 Live не получает от Persona Drive ни одного дополнительного вызова.</p></div>
+          <div class="section-heading"><div><p class="eyebrow">АВТОНОМНЫЙ СЛОЙ</p><h2>Persona Drive · текущий стрим</h2></div><p class="muted">Внутренние спонтанные реплики поверх основного Brain — Gemini 3.1 Live не получает от Persona Drive ни одного дополнительного вызова.</p></div>
           <section class="panel metric-strip">
             <div><span>Тиков / eligible</span><strong>{{ usage.currentStream.drive.ticks }} / {{ usage.currentStream.drive.eligibleTicks }}</strong></div>
             <div><span>Brain calls / лимит в час</span><strong>{{ usage.currentStream.drive.brainCalls }} / {{ usage.currentStream.drive.brainCallsBlockedByHourlyLimit }}</strong></div>
@@ -2040,6 +2045,7 @@ onBeforeUnmount(() => {
             <div><h3>Диагностика слоёв</h3><p>Слух: <b>{{ overview.streamBrain.transcription?.model || 'выключен' }}</b> · сегментов <b>{{ overview.streamBrain.transcription?.segmentsSent ?? 0 }}</b> · транскриптов <b>{{ overview.streamBrain.transcription?.transcriptsReceived ?? 0 }}</b> · речи отправлено <b>{{ ((overview.streamBrain.transcription?.audioSecondsSent ?? 0) / 60).toFixed(1) }} мин</b> · тишины срезано <b>{{ ((overview.streamBrain.transcription?.silenceSecondsSkipped ?? 0) / 60).toFixed(1) }} мин</b> · сбоев <b>{{ overview.streamBrain.transcription?.failures ?? 0 }}</b> · задержка <b>{{ formatMilliseconds(overview.streamBrain.transcription?.lastLatencyMs) }}</b></p><p v-if="overview.streamBrain.transcription?.lastTranscript">Последнее услышанное: <b>{{ overview.streamBrain.transcription.lastTranscript }}</b></p><p>Зрение: <b>{{ overview.streamBrain.vision?.model || 'выключено' }}</b> · раз в <b>{{ overview.streamBrain.vision?.everySeconds ?? 0 }} с</b> · кадров получено <b>{{ overview.streamBrain.vision?.framesSeen ?? 0 }}</b> · описаний <b>{{ overview.streamBrain.vision?.described ?? 0 }}</b> · сбоев <b>{{ overview.streamBrain.vision?.failures ?? 0 }}</b> · задержка <b>{{ formatMilliseconds(overview.streamBrain.vision?.lastLatencyMs) }}</b></p><p v-if="overview.streamBrain.vision?.lastDescription">Последнее увиденное: <b>{{ overview.streamBrain.vision.lastDescription }}</b></p><p>Медиапоток: <b>{{ stateLabel(overview.streamBrain.mediaState) }}</b> · захвачено аудио <b>{{ usage.currentStream.capturedAudioMinutes.toFixed(1) }} мин</b> · видео <b>{{ usage.currentStream.capturedVideoMinutes.toFixed(1) }} мин</b></p><p>Brain: <b>{{ stateLabel(overview.geminiBrain.state) }}</b> · последнее решение {{ formatMilliseconds(overview.geminiBrain.lastLatencyMs) }} · среднее {{ formatMilliseconds(overview.geminiBrain.averageLatencyMs) }} · recovery {{ overview.geminiBrain.rebuiltSessions }} · rollover {{ overview.geminiBrain.rollovers }}</p><p v-if="overview.geminiBrain.lastError">Ошибка Brain: <b>{{ operatorErrorLabel(overview.geminiBrain.lastError) }}</b></p><details v-if="overview.geminiBrain.lastError"><summary>Техническое сообщение сервера</summary><code>{{ overview.geminiBrain.lastError }}</code></details><p v-if="overview.streamBrain.geminiState !== 'DISABLED'">Live-сессия (устаревший слой): <b>{{ stateLabel(overview.streamBrain.geminiState) }}</b> · reconnects <b>{{ usage.geminiReconnects }}</b></p></div>
             <pre>{{ (overview.streamBrain.outboundTrace || []).map(item => `${formatTime(item.at)} ${diagnosticOperationLabel(item.type)}${item.bytes !== undefined ? ` (${item.bytes} байт)` : ''}`).join('\n') || 'Исходящих операций пока нет.' }}</pre>
           </section>
+          </details>
           <div class="section-heading reaction-trace-heading">
             <div><p class="eyebrow">СКВОЗНАЯ ЦЕПОЧКА РЕАКЦИИ</p><h2>На какой момент ответил бот</h2></div>
             <p class="muted">Один блок связывает момент стрима с точным сообщением. Время считается с обнаружения события системой; задержка самого видеопотока до обнаружения сюда не входит.</p>
@@ -2063,11 +2069,11 @@ onBeforeUnmount(() => {
                     <b :class="['trace-delivery-status', reaction.status.toLowerCase()]">{{ reactionTraceMessageStatusLabel(reaction.status) }}</b>
                   </div>
                   <blockquote>«{{ reaction.message }}»</blockquote>
-                  <p class="trace-link"><strong>Почему:</strong> Brain 3.7 связал эту реплику именно с описанным выше событием и выбрал @{{ reaction.username }}.</p>
+                  <p class="trace-link"><strong>Почему:</strong> Brain связал эту реплику именно с описанным выше событием и выбрал @{{ reaction.username }}.</p>
                   <div class="trace-timing-grid">
                     <div><span>Подготовка контекста</span><strong>{{ traceContextDuration(trace) }}</strong></div>
                     <div><span>Ожидание в очереди</span><strong>{{ traceQueueWait(trace) }}</strong></div>
-                    <div><span>Решение Brain 3.7</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
+                    <div><span>Решение Brain</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
                     <div><span>От решения до отправки</span><strong>{{ traceDeliveryDuration(reaction) }}</strong></div>
                     <div><span>Всего от обнаружения</span><strong>{{ traceTotalDuration(trace, reaction) }}</strong></div>
                   </div>
@@ -2082,7 +2088,7 @@ onBeforeUnmount(() => {
                 <div class="trace-timing-grid compact">
                   <div><span>Подготовка контекста</span><strong>{{ traceContextDuration(trace) }}</strong></div>
                   <div><span>Ожидание в очереди</span><strong>{{ traceQueueWait(trace) }}</strong></div>
-                  <div><span>Решение Brain 3.7</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
+                  <div><span>Решение Brain</span><strong>{{ traceGeminiDuration(trace) }}</strong></div>
                   <div><span>Вся цепочка</span><strong>{{ elapsed(traceDetectedAt(trace), trace.timing?.completedAt) }}</strong></div>
                 </div>
               </div>
@@ -2167,14 +2173,20 @@ onBeforeUnmount(() => {
         <template v-else-if="activePage === 'rules'">
           <div class="page-heading">
             <div><p class="eyebrow">ЧЕМУ НАУЧИЛИ ОЦЕНКИ</p><h1>Обученные правила</h1></div>
-            <p class="muted">Оценки разбираются пачками, и повторяющиеся замечания превращаются в общие правила. Правила попадают в решения по смыслу, а не по совпадению слов, поэтому действуют и на фразы, которых раньше не было.</p>
+            <p class="muted">Это инструкции для будущих ответов, которые ИИ составляет из ваших оценок сообщений. Саму модель мы не переобучаем.</p>
           </div>
+          <section class="panel learning-guide">
+            <div><span class="step-number">1</span><h3>Оцените ответ</h3><p class="muted">В чате поставьте 👍 или 👎. В комментарии объясните, что понравилось или что исправить.</p></div>
+            <div><span class="step-number">2</span><h3>ИИ найдёт закономерность</h3><p class="muted">Автоматический разбор начинается от 5 новых оценок, не чаще раза в 10 минут. Он может не создать правило, если примеров недостаточно.</p></div>
+            <div><span class="step-number">3</span><h3>Правило учтётся в ответах</h3><p class="muted">Общие правила относятся ко всем, личные — к одному боту, тематические подбираются по теме и ключевым словам. Неудачное правило можно выключить.</p></div>
+          </section>
+          <p class="muted">Не все активные правила используются одновременно: на одно решение выбирается до 3 общих, 1 тематического и 3 личных. Правила с уверенностью ниже 50% пока не используются. Уверенность — оценка ИИ, а не измеренная точность.</p>
           <section class="panel rules-controls">
             <div>
               <div><strong>{{ teacherStatus?.pendingFeedback ?? pendingVerdictCount }}</strong><span class="muted"> оценок ждут обучения. Обучение запускается само, когда их накопится достаточно.</span></div>
               <p v-if="teacherStatusLine" :class="['muted', teacherStatus?.lastRun?.result === 'failed' ? 'teacher-failed' : '']">{{ teacherStatusLine }}</p>
             </div>
-            <button type="button" class="primary" :disabled="rulesBusy" @click="trainNow">Обновить обучение</button>
+            <button type="button" class="primary" :disabled="rulesBusy" @click="trainNow">Разобрать оценки сейчас</button>
           </section>
           <p v-if="trainingResult" class="muted">{{ trainingResult }}</p>
           <section class="panel rules-list">

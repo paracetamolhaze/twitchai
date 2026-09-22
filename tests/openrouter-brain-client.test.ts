@@ -35,7 +35,7 @@ function client(reply: (body: CapturedBody, call: number) => unknown) {
 
 const bootstrap: BrainInteractionRequest = {
   kind: 'bootstrap',
-  model: 'google/gemini-3.7-flash',
+  model: 'google/gemini-3.8-flash',
   input: '{"personas":[]}',
   systemInstruction: 'You are the decision brain.',
   responseSchema: { type: 'object' },

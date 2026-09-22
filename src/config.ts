@@ -138,7 +138,7 @@ const envSchema = z.object({
   TWITCH_CATEGORY_REFRESH_SECONDS: z.coerce.number().min(30).max(3600).default(120),
   GEMINI_API_KEY: z.string().trim().optional(),
   OPENROUTER_API_KEY: z.string().trim().optional(),
-  OPENROUTER_BRAIN_MODEL: z.string().trim().default('google/gemini-3.7-flash'),
+  OPENROUTER_BRAIN_MODEL: z.string().trim().default('google/gemini-3.8-flash'),
   OPENROUTER_TEACHER_MODEL: z.string().trim().optional(),
   OPENROUTER_APP_NAME: z.string().trim().default('twitch-ai'),
   GEMINI_LIVE_MODEL: z.string().trim().default('gemini-3.1-flash-live-preview'),
@@ -158,7 +158,7 @@ const envSchema = z.object({
   GEMINI_LIVE_SPEECH_START_SENSITIVITY: z.enum(['low', 'high']).default('high'),
   GEMINI_LIVE_SPEECH_END_SENSITIVITY: z.enum(['low', 'high']).default('low'),
   GEMINI_LIVE_SPEECH_SILENCE_MS: z.coerce.number().int().min(200).max(5_000).default(1_200),
-  GEMINI_BRAIN_MODEL: z.string().trim().default('gemini-3.7-flash'),
+  GEMINI_BRAIN_MODEL: z.string().trim().default('gemini-3.8-flash'),
   GEMINI_BRAIN_THINKING_LEVEL: z.enum(['low', 'medium', 'high']).default('low'),
   BRAIN_EVENT_MERGE_WINDOW_MS: z.coerce.number().int().min(0).max(2_000).default(250),
   // The Interactions API bills each chained call for the whole reconstructed conversation, so

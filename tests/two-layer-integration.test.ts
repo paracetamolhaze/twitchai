@@ -65,7 +65,7 @@ describe('Live perception → stateful Brain → Twitch integration', () => {
           usage: { inputTokens: 100, cachedInputTokens: 50, outputTokens: 5, thoughtTokens: 5, totalTokens: 110 },
         };
       } },
-      model: 'gemini-3.7-flash', thinkingLevel: 'low', usage, logger,
+      model: 'gemini-3.8-flash', thinkingLevel: 'low', usage, logger,
       bootstrap: async () => ({
         channel: 'streamer', category: 'Dota 2', streamContext: 'ranked', startedAt: Date.now(),
         availableBots: ['gigantiuz'], personas: [personaContext.buildBrainSnapshot('gigantiuz', persona)],

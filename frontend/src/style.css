@@ -19,6 +19,19 @@
 }
 
 * { box-sizing: border-box; }
+.operator-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)) !important; }
+.perception-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; line-height: 1.65; }
+.operator-details { border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin: 24px 0; }
+.operator-details > summary { cursor: pointer; font-weight: 600; }
+.operator-details > summary span { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 12px; }
+.learning-guide { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px; }
+.step-number { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; background: rgba(88,230,169,.12); color: var(--green); font-weight: 600; }
+.learning-guide h3 { margin: 16px 0 8px; }
+@media (max-width: 760px) {
+  .operator-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .perception-summary, .learning-guide { grid-template-columns: 1fr; }
+  .operator-details > summary span { display: block; margin: 8px 0 0; }
+}
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--bg); }
 button, input, textarea, select { font: inherit; }
 button { color: inherit; }

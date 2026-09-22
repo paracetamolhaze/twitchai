@@ -47,7 +47,7 @@ function bootstrap(): BrainBootstrap {
   };
 }
 
-describe('Gemini 3.7 stateful Brain', () => {
+describe('Gemini 3.8 stateful Brain', () => {
   it('bootstraps once and chains small event turns through previous_interaction_id', async () => {
     const requests: BrainInteractionRequest[] = [];
     const decisions: Array<{ event: StreamEvent; decision: BrainDecision }> = [];
@@ -73,7 +73,7 @@ describe('Gemini 3.7 stateful Brain', () => {
     };
     const service = new GeminiBrainService({
       client,
-      model: 'gemini-3.7-flash',
+      model: 'gemini-3.8-flash',
       thinkingLevel: 'low',
       bootstrap: async () => bootstrap(),
       prepareEvent: async (event) => ({
@@ -906,7 +906,7 @@ function brainService(
 ): GeminiBrainService {
   return new GeminiBrainService({
     client,
-    model: 'gemini-3.7-flash',
+    model: 'gemini-3.8-flash',
     thinkingLevel: 'low',
     bootstrap: async () => bootstrap(),
     prepareEvent: async (event) => ({
