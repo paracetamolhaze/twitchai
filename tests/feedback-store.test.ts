@@ -23,6 +23,29 @@ function verdict(overrides: Partial<MessageVerdictRecord> = {}): MessageVerdictR
 const logger = new Logger('TEST', 'error');
 
 describe('PersonaFeedbackStore', () => {
+  it('does not turn a retried click into new evidence or withdraw an unchanged verdict', async () => {
+    const repository = fakeRepository();
+    const store = new PersonaFeedbackStore(repository, logger);
+    const input = { username: 'alexmadkid', reactionId: 'same', message: 'пример', verdict: 'good' as const };
+    const results = await Promise.all([store.record(input), store.record(input)]);
+    expect(results[0]?.id).toBe(results[1]?.id);
+    expect(repository.saved).toHaveLength(1);
+  });
+  it('uses only the latest verdict of a reaction, including after reload', async () => {
+    const repository = fakeRepository();
+    const store = new PersonaFeedbackStore(repository, logger);
+    const input = { username: 'alexmadkid', reactionId: 'same-reaction', message: 'зеленый свет норм зашел' };
+    await store.record({ ...input, verdict: 'bad' });
+    await store.record({ ...input, verdict: 'good' });
+    for (const reload of [false, true]) {
+      if (reload) await store.load();
+      expect(store.approvedExamplesFor(input.username)).toEqual([input.message]);
+      expect(store.isNearDuplicateOfDisliked(input.username, input.message)).toBe(false);
+      expect(store.snapshot()).toMatchObject({ likesAvailable: 1, dislikesAvailable: 0 });
+    }
+    await store.record({ ...input, verdict: 'bad' });
+    expect(store.approvedExamplesFor(input.username)).toEqual([]);
+  });
   it('A. a liked message becomes an eligible positive example for that persona', async () => {
     const store = new PersonaFeedbackStore(fakeRepository(), logger);
     await store.record({ username: 'griffin0502', message: 'го дальше по классике', verdict: 'good' });

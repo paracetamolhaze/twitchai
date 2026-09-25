@@ -319,6 +319,8 @@ export const PERSONA_MEMORY_TYPES = [
 export type PersonaMemoryType = (typeof PERSONA_MEMORY_TYPES)[number];
 
 export interface PersonaMemoryItem {
+  /** Absent only for legacy records, excluded from scoped generation. */
+  channel?: string;
   id: string;
   personaId: string;
   createdAt: number;
@@ -332,6 +334,7 @@ export interface PersonaMemoryItem {
 }
 
 export interface PersonaConversationMessage {
+  channel?: string;
   id: string;
   personaId: string;
   viewerUsername: string;
@@ -349,6 +352,8 @@ export interface PersonaConversationMessage {
  * reads: these are the messages this channel wanted, and these are the ones it did not.
  */
 export interface MessageVerdictRecord {
+  /** Historical revision; excluded from live feedback and Teacher batches. */
+  supersededAt?: number;
   id: string;
   createdAt: number;
   username: string;

@@ -22,6 +22,7 @@ import { CONVERSATION_REVISIONS } from './conversation-refinements';
 export type KnowledgeState = 'knows_well' | 'knows_somewhat' | 'heard_of' | 'uncertain' | 'unknown' | 'outdated';
 
 export interface MindKnowledge {
+  channel?: string;
   topic: string;
   state: KnowledgeState;
   /** Short human note — "слышал: 30 юаней/час" — always treated as data, never as instruction. */
@@ -31,6 +32,7 @@ export interface MindKnowledge {
 }
 
 export interface MindCuriosity {
+  channel?: string;
   id: string;
   topic: string;
   /** The question as this person would hold it, not as a prompt to ask it verbatim. */
@@ -45,6 +47,7 @@ export interface MindCuriosity {
 }
 
 export interface MindOpenLoop {
+  channel?: string;
   id: string;
   kind: 'question_pending' | 'expectation' | 'callback';
   text: string;
@@ -66,6 +69,7 @@ export interface MindLifeConcern {
 }
 
 export interface MindPerson {
+  channel?: string;
   /** Lowercased display name as heard on stream — matched against event text by token. */
   name: string;
   role: string;
@@ -408,7 +412,7 @@ export class PersonaMindStore {
   private readonly logger: Logger;
   private ingestedFacts = 0;
 
-  constructor(private readonly repository: MindRepository, logger: Logger, private readonly now: () => number = Date.now) {
+  constructor(private readonly repository: MindRepository, logger: Logger, private readonly now: () => number = Date.now, private readonly channel?: () => string) {
     this.logger = logger.child('MIND');
   }
 
@@ -439,7 +443,7 @@ export class PersonaMindStore {
         const canonKnowledge = seedMind(persona, username, this.now()).knowledge;
         existing.knowledge = [
           ...existing.knowledge.filter((item) => item.sourceEventId),
-          ...canonKnowledge.filter((item) => !existing.knowledge.some((old) => old.sourceEventId && old.topic === item.topic))
+          ...canonKnowledge
             .map((item) => existing.knowledge.find((old) => !old.sourceEventId && old.topic === item.topic && old.state === item.state) ?? item),
         ].slice(0, MAX_KNOWLEDGE);
         if ((existing.lifeRevision ?? 0) < 1 && CONVERSATION_REVISIONS[username]?.life) {
@@ -479,6 +483,24 @@ export class PersonaMindStore {
     return this.byName.get(username.toLowerCase());
   }
 
+  private inChannel(channel: string | undefined): boolean {
+    return !this.channel || (Boolean(channel) && channel === this.channel().trim().toLowerCase());
+  }
+
+  /** Canon is shared; observations and callbacks are local to the channel that supplied them. */
+  private contextMind(username: string): PersonaMindRecord | undefined {
+    const mind = this.byUsername(username);
+    if (!mind || !this.channel) return mind;
+    return {
+      ...mind,
+      knowledge: mind.knowledge.filter((item) => item.sourceEventId ? this.inChannel(item.channel)
+        : !mind.knowledge.some((other) => other.topic === item.topic && other.sourceEventId && this.inChannel(other.channel))),
+      curiosities: mind.curiosities.filter((item) => !item.sourceEventId || this.inChannel(item.channel)),
+      openLoops: mind.openLoops.filter((item) => this.inChannel(item.channel)),
+      people: mind.people.filter((item) => item.name === 'стример' || this.inChannel(item.channel)),
+    };
+  }
+
   /**
    * The per-event slice: for each offered candidate, the few lines of their life that bear on this
    * moment. A candidate with nothing relevant is omitted entirely — that absence is itself the
@@ -492,7 +514,7 @@ export class PersonaMindStore {
     const supplied: Record<string, SuppliedSources> = {};
 
     for (const username of usernames) {
-      const mind = this.byUsername(username);
+      const mind = this.contextMind(username);
       if (!mind) continue;
       const lines: string[] = [];
       const sources = emptySuppliedSources();
@@ -567,7 +589,7 @@ export class PersonaMindStore {
     const byPersona: Record<string, string[]> = {};
     const supplied: Record<string, SuppliedSources> = {};
     for (const username of usernames) {
-      const mind = this.byUsername(username);
+      const mind = this.contextMind(username);
       if (!mind) continue;
       const lines: string[] = [];
       const sources = emptySuppliedSources();
@@ -607,7 +629,7 @@ export class PersonaMindStore {
     let bestConcernSalience = 0;
     let openLoops = 0;
     for (const username of usernames) {
-      const mind = this.byUsername(username);
+      const mind = this.contextMind(username);
       if (!mind) continue;
       for (const curiosity of mind.curiosities) {
         if (curiosity.status === 'open') bestCuriosityStrength = Math.max(bestCuriosityStrength, curiosity.strength);
@@ -647,8 +669,10 @@ export class PersonaMindStore {
     const lowerText = fullText.toLowerCase();
     const mentioned = new Set(event.directMentions.map((name) => name.toLowerCase()));
     const now = this.now();
+    const channel = this.channel?.().trim().toLowerCase();
 
     for (const username of presentUsernames) {
+      if (channel !== this.channel?.().trim().toLowerCase()) return stats;
       const mind = this.byUsername(username);
       if (!mind) continue;
       stats.considered += 1;
@@ -686,14 +710,16 @@ export class PersonaMindStore {
         curiosity.status = 'answered';
         curiosity.answer = heard;
         curiosity.sourceEventId = event.id;
+        curiosity.channel = channel;
         curiosity.updatedAt = now;
         upsertKnowledge(mind, {
           topic: curiosity.topic, state: 'heard_of', note: `слышал на стриме: «${heard}»`,
-          sourceEventId: event.id, updatedAt: now,
+          sourceEventId: event.id, channel, updatedAt: now,
         });
         mind.openLoops.unshift({
           id: `loop-${event.id.slice(0, 8)}-${mind.openLoops.length}`,
           kind: 'callback',
+          channel,
           text: `на стриме говорили: «${heard}»`,
           status: 'open',
           createdAt: now,
@@ -710,7 +736,7 @@ export class PersonaMindStore {
       // A pending question of their own that this moment concretely answers closes, whoever asked
       // it aloud — the viewer who wondered about the price resolves the loop when anyone answers.
       for (const loop of mind.openLoops) {
-        if (loop.status !== 'open' || loop.kind !== 'question_pending') continue;
+        if (!this.inChannel(loop.channel) || loop.status !== 'open' || loop.kind !== 'question_pending') continue;
         if (!concreteAnswer(loop.text, speechText)) continue;
         loop.status = 'resolved';
         loop.updatedAt = now;
@@ -819,7 +845,7 @@ export class PersonaMindStore {
    * unfairness to repair. Deterministic, capped arrays, microseconds.
    */
   personalRelevance(username: string, eventText: string): number {
-    const mind = this.byUsername(username);
+    const mind = this.contextMind(username);
     if (!mind) return 0;
     let best = 0;
     for (const curiosity of mind.curiosities) {
@@ -938,7 +964,7 @@ function quarantineUnsupportedLearning(mind: PersonaMindRecord): void {
 }
 
 function upsertKnowledge(mind: PersonaMindRecord, entry: MindKnowledge): void {
-  const existing = mind.knowledge.find((item) => item.topic === entry.topic);
+  const existing = mind.knowledge.find((item) => item.topic === entry.topic && item.channel === entry.channel);
   if (existing) {
     // Hearing a concrete fact upgrades ignorance, never downgrades expertise: someone who already
     // knows the subject well does not become "heard_of" because the stream mentioned a number.

@@ -15,6 +15,27 @@ const logger = new Logger('TEST', 'error');
 const NOW = 1_700_000_000_000;
 const DAY = 24 * 60 * 60_000;
 
+it('keeps heard facts and callbacks out of a different channel while preserving authored knowledge', async () => {
+  const repository = new MemoryRepository();
+  await repository.savePersonaMind(mind('bot', {
+    learningRevision: 1,
+    knowledge: [
+      { topic: 'аренда', state: 'heard_of', note: 'секретный факт первого канала', sourceEventId: 'source', channel: 'first', updatedAt: NOW },
+      { topic: 'аренда', state: 'uncertain', note: 'каноническое знание', updatedAt: NOW },
+    ],
+    openLoops: [{ id: 'loop', kind: 'callback', text: 'секретный факт первого канала об аренде', status: 'open', channel: 'first', createdAt: NOW, updatedAt: NOW }],
+  }));
+  let channel = 'second';
+  const store = new PersonaMindStore(repository, logger, () => NOW, () => channel);
+  await store.load();
+  const event = streamEvent({ summary: 'аренда', speech: 'секретный факт первого канала об аренде каноническое знание' });
+  expect(JSON.stringify(store.forEvent(event, ['bot']))).not.toContain('секретный факт');
+  expect(JSON.stringify(store.forEvent(event, ['bot']))).toContain('каноническое знание');
+  expect(JSON.stringify(store.forDrive(['bot']) ?? null)).not.toContain('секретный факт');
+  channel = 'first';
+  expect(JSON.stringify(store.forEvent(event, ['bot']))).toContain('секретный факт');
+});
+
 function streamEvent(overrides: Partial<StreamEvent> = {}): StreamEvent {
   return {
     id: 'event-1', timestamp: NOW, type: 'conversation',

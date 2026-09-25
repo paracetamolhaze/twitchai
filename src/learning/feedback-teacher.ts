@@ -170,6 +170,10 @@ export interface FeedbackTeacherOptions {
   usage: UsageTracker;
   logger: Logger;
   now?: () => number;
+  checkpoint?: {
+    read: () => Promise<unknown>;
+    write: (lastRun: NonNullable<TeacherStatus['lastRun']>) => Promise<void>;
+  };
 }
 
 /**
@@ -185,6 +189,9 @@ export class FeedbackTeacher {
   private readonly now: () => number;
   private running = false;
   private lastRunAt = 0;
+  private timer?: ReturnType<typeof setInterval>;
+  private stopped = false;
+  private activeRun?: Promise<TeacherRunOutcome | undefined>;
   private lastRun?: { at: number; result: 'success' | 'failed'; category?: TeacherFailureCategory; casesConsidered: number };
 
   constructor(private readonly options: FeedbackTeacherOptions) {
@@ -207,26 +214,57 @@ export class FeedbackTeacher {
     };
   }
 
-  /**
-   * Fired opportunistically after a verdict is recorded — not from a timer. There is nothing to
-   * poll for: new evidence only ever appears because the operator just clicked something, so the
-   * click is the signal, and a background loop would spend a wakeup every minute to discover
-   * nothing changed.
-   */
+  /** Check durable backlog at startup and after cooldown, even without another operator click.
+   * Empty/undersized batches only cost a DB read, never a model request. */
+  async start(): Promise<void> {
+    if (this.timer) return;
+    this.stopped = false;
+    const saved = z.object({
+      at: z.number().finite().nonnegative(), result: z.enum(['success', 'failed']), casesConsidered: z.number().int().nonnegative(),
+      category: z.enum(['transport_error', 'incomplete_response', 'empty_response', 'invalid_json', 'schema_mismatch', 'unexpected_error']).optional(),
+    }).safeParse(await this.options.checkpoint?.read().catch((cause: unknown) => {
+      this.logger.warn('Teacher checkpoint read failed; queue checks remain enabled', { cause });
+      return undefined;
+    }));
+    this.lastRun = saved.success ? saved.data : undefined;
+    this.lastRunAt = this.lastRun?.at ?? 0;
+    if (this.stopped) return;
+    this.timer = setInterval(() => {
+      void this.maybeRunAutomatically().catch((cause: unknown) => this.logger.warn('Teacher queue check failed', { cause }));
+    }, 60_000);
+    this.timer.unref();
+    await this.maybeRunAutomatically();
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    await this.activeRun;
+  }
+
   async maybeRunAutomatically(): Promise<TeacherRunOutcome | undefined> {
-    if (this.running) return undefined;
-    if (this.now() - this.lastRunAt < AUTO_RUN_COOLDOWN_MS) return undefined;
-    const pending = await this.options.repository.listUnprocessedMessageVerdicts(MAX_CASES_PER_RUN);
-    if (pending.length < MIN_NEW_VERDICTS_FOR_AUTO_RUN) return undefined;
-    return this.run(pending, 'automatic');
+    return this.execute('automatic');
   }
 
   /** The dashboard button. Ignores the batch-size threshold and the cooldown, never the lock. */
   async runManually(): Promise<TeacherRunOutcome | undefined> {
-    if (this.running) return undefined;
-    const pending = await this.options.repository.listUnprocessedMessageVerdicts(MAX_CASES_PER_RUN);
-    if (pending.length === 0) return undefined;
-    return this.run(pending, 'manual');
+    return this.execute('manual');
+  }
+
+  private execute(trigger: 'automatic' | 'manual'): Promise<TeacherRunOutcome | undefined> {
+    if (this.running || this.stopped) return Promise.resolve(undefined);
+    if (trigger === 'automatic' && this.now() - this.lastRunAt < AUTO_RUN_COOLDOWN_MS) return Promise.resolve(undefined);
+    // Acquire before the first DB await. All entry points share this lock.
+    this.running = true;
+    this.activeRun = (async () => {
+      try {
+        const pending = await this.options.repository.listUnprocessedMessageVerdicts(MAX_CASES_PER_RUN);
+        if (pending.length < (trigger === 'automatic' ? MIN_NEW_VERDICTS_FOR_AUTO_RUN : 1)) return undefined;
+        return await this.run(pending, trigger);
+      } finally { this.running = false; }
+    })();
+    return this.activeRun;
   }
 
   private async run(verdicts: MessageVerdictRecord[], trigger: 'automatic' | 'manual'): Promise<TeacherRunOutcome | undefined> {
@@ -292,7 +330,10 @@ export class FeedbackTeacher {
       this.lastRun = { at: this.now(), result: 'failed', category, casesConsidered: verdicts.length };
       return undefined;
     } finally {
-      this.running = false;
+      if (this.lastRun && this.options.checkpoint) {
+        await this.options.checkpoint.write(this.lastRun)
+          .catch((cause: unknown) => this.logger.warn('Teacher checkpoint failed', { cause }));
+      }
     }
   }
 
@@ -317,6 +358,7 @@ export class FeedbackTeacher {
         thinkingLevel,
         maxOutputTokens: TEACHER_MAX_OUTPUT_TOKENS,
         store: true,
+        signal: AbortSignal.timeout(60_000),
       });
     } catch (cause) {
       this.logger.warn('TEACHER_RESPONSE_RECEIVED', {
@@ -396,8 +438,8 @@ export class FeedbackTeacher {
     for (const action of actions) {
       if (action.action === 'NO_CHANGE') { counts.unchanged += 1; continue; }
 
-      const evidence = action.evidenceIds.filter((id) => caseById.has(id));
-      if (evidence.length !== action.evidenceIds.length) {
+      const evidence = [...new Set(action.evidenceIds)];
+      if (evidence.some((id) => !caseById.has(id))) {
         this.logger.warn('TEACHER_ACTION_REJECTED', { reason: 'unknown_evidence_id', action: action.action });
         counts.rejected += 1;
         continue;
@@ -415,7 +457,7 @@ export class FeedbackTeacher {
         continue;
       }
 
-      const existing = this.options.policyStore.byId(action.ruleId);
+      const existing = [...upserts].reverse().find((rule) => rule.id === action.ruleId) ?? this.options.policyStore.byId(action.ruleId);
       if (!existing) {
         this.logger.warn('TEACHER_ACTION_REJECTED', { reason: 'unknown_rule_id', action: action.action });
         counts.rejected += 1;
@@ -443,7 +485,7 @@ export class FeedbackTeacher {
       }
 
       const evidenceIds = [...new Set([...existing.evidenceIds, ...evidence])];
-      const { positive, negative } = countEvidence(evidence, caseById);
+      const { positive, negative } = countEvidence(evidence.filter((id) => !existing.evidenceIds.includes(id)), caseById);
       upserts.push({
         ...existing,
         rule: action.rule ? action.rule : existing.rule,
@@ -465,7 +507,7 @@ export class FeedbackTeacher {
         ruleId: existing.id, scope: existing.scopeType, confidence: action.confidence, support: evidenceIds.length,
       });
     }
-    return { upserts, counts };
+    return { upserts: [...new Map(upserts.map((rule) => [rule.id, rule])).values()], counts };
   }
 
   private buildCreatedRule(

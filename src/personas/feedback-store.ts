@@ -56,6 +56,7 @@ export class PersonaFeedbackStore {
   private readonly logger: Logger;
   private approvedLiveExamplesUsed = 0;
   private similarityRejected = 0;
+  private writeTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly repository: Pick<AppRepository, 'saveMessageVerdict' | 'listMessageVerdicts'>,
@@ -74,7 +75,17 @@ export class PersonaFeedbackStore {
     this.logger.info('FEEDBACK_STORE_LOADED', { likes: this.countBy('good'), dislikes: this.countBy('bad') });
   }
 
-  async record(input: FeedbackVerdictInput): Promise<MessageVerdictRecord> {
+  record(input: FeedbackVerdictInput): Promise<MessageVerdictRecord> {
+    const write = this.writeTail.then(() => this.persist(input));
+    this.writeTail = write.then(() => undefined, () => undefined);
+    return write;
+  }
+
+  private async persist(input: FeedbackVerdictInput): Promise<MessageVerdictRecord> {
+    const previous = input.reactionId
+      ? this.byUsername.get(normalizeUsername(input.username))?.find((item) => item.record.reactionId === input.reactionId)?.record
+      : undefined;
+    if (previous && previous.verdict === input.verdict && (previous.note ?? '') === (input.note ?? '')) return previous;
     const record: MessageVerdictRecord = { id: randomUUID(), createdAt: Date.now(), ...input };
     await this.repository.saveMessageVerdict(record);
     this.index(record);
@@ -135,7 +146,8 @@ export class PersonaFeedbackStore {
 
   private index(verdict: MessageVerdictRecord): void {
     const key = normalizeUsername(verdict.username);
-    const list = this.byUsername.get(key) ?? [];
+    const list = (this.byUsername.get(key) ?? []).filter((item) => !verdict.reactionId
+      || item.record.reactionId !== verdict.reactionId);
     list.unshift({
       record: verdict,
       ...(verdict.verdict === 'bad' ? { tokens: messageTokens(verdict.message) } : {}),

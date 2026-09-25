@@ -97,11 +97,11 @@ export interface AppRepository {
   replacePersonasWithBackups(replacements: PersonaReplacementWithBackup[]): Promise<void>;
   listPersonaCanonBackups(personaId: string, limit: number): Promise<PersonaCanonBackupRecord[]>;
   savePersonaMemory(memory: PersonaMemoryItem): Promise<void>;
-  listPersonaMemories(personaId: string, limit: number): Promise<PersonaMemoryItem[]>;
+  listPersonaMemories(personaId: string, limit: number, channel?: string): Promise<PersonaMemoryItem[]>;
   deletePersonaMemory(id: string, personaId: string): Promise<boolean>;
   savePersonaConversationMessage(message: PersonaConversationMessage): Promise<void>;
-  listPersonaConversationMessages(personaId: string, viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]>;
-  listRecentPersonaConversationMessages(viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]>;
+  listPersonaConversationMessages(personaId: string, viewerUsername: string, since: number, limit: number, channel?: string): Promise<PersonaConversationMessage[]>;
+  listRecentPersonaConversationMessages(viewerUsername: string, since: number, limit: number, channel?: string): Promise<PersonaConversationMessage[]>;
   listPersonaRelationships(personaId: string): Promise<PersonaRelationship[]>;
   listBots(): Promise<BotAccountRecord[]>;
   upsertBot(bot: BotAccountRecord): Promise<void>;

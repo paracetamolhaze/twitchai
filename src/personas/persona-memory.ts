@@ -3,6 +3,7 @@ import { AppRepository } from '../persistence/repository';
 import { PersonaConversationMessage, PersonaMemoryItem } from './types';
 
 export interface PersonaMemoryOptions {
+  channel?: () => string;
   now?: () => number;
   longTermThreshold?: number;
   sessionThreshold?: number;
@@ -35,12 +36,14 @@ export class PersonaMemory {
   private readonly sessionTtlMs: number;
   private readonly conversationWindowMs: number;
   private readonly random: () => number;
+  private readonly channel: () => string | undefined;
   private readonly conversationClocks = new Map<string, number>();
   /** Runtime-only anti-repeat tracking for spontaneous recall — no schema change needed. */
   private readonly lastRecalledAt = new Map<string, number>();
 
   constructor(private readonly repository: AppRepository, options: PersonaMemoryOptions = {}) {
     this.now = options.now ?? Date.now;
+    this.channel = options.channel ? () => options.channel!().trim().toLowerCase() : () => undefined;
     this.longTermThreshold = options.longTermThreshold ?? 0.7;
     this.sessionThreshold = options.sessionThreshold ?? 0.4;
     this.sessionTtlMs = options.sessionTtlMs ?? 12 * 60 * 60_000;
@@ -58,7 +61,7 @@ export class PersonaMemory {
     const limit = Math.max(1, Math.min(4, options.limit ?? 3));
     const minAgeMs = options.minAgeMs ?? RECALL_MIN_AGE_MS;
     const now = this.now();
-    const candidates = (await this.repository.listPersonaMemories(personaId, 200))
+    const candidates = (await this.repository.listPersonaMemories(personaId, 200, this.channel()))
       .filter((item) => !item.expiresAt || item.expiresAt > now)
       .filter((item) => now - item.createdAt >= minAgeMs)
       .filter((item) => !options.excludeViewerTagged || !item.viewerUsername);
@@ -81,12 +84,17 @@ export class PersonaMemory {
   }
 
   async remember(input: NewPersonaMemory): Promise<PersonaMemoryItem | undefined> {
+    const currentChannel = this.channel();
+    const channel = input.channel?.trim().toLowerCase() ?? currentChannel;
+    if (channel === '') return undefined;
+    if (currentChannel !== undefined && channel !== currentChannel) return undefined;
     const importance = clamp(input.importance);
     if (importance < this.sessionThreshold) return undefined;
     const createdAt = input.createdAt ?? this.now();
     const item: PersonaMemoryItem = {
       id: input.id ?? randomUUID(),
       personaId: input.personaId,
+      ...(channel ? { channel } : {}),
       createdAt,
       type: input.type,
       summary: input.summary.replace(/\s+/g, ' ').trim().slice(0, 1_000),
@@ -106,7 +114,7 @@ export class PersonaMemory {
   async retrieve(personaId: string, query: string, limit = 6): Promise<PersonaMemoryItem[]> {
     const safeLimit = Math.max(1, Math.min(8, limit));
     const now = this.now();
-    const candidates = (await this.repository.listPersonaMemories(personaId, 200))
+    const candidates = (await this.repository.listPersonaMemories(personaId, 200, this.channel()))
       .filter((item) => !item.expiresAt || item.expiresAt > now);
     const queryTokens = semanticTokens(query);
     return candidates
@@ -121,7 +129,7 @@ export class PersonaMemory {
   }
 
   async list(personaId: string, limit = 50): Promise<PersonaMemoryItem[]> {
-    return this.repository.listPersonaMemories(personaId, Math.max(1, Math.min(200, limit)));
+    return this.repository.listPersonaMemories(personaId, Math.max(1, Math.min(200, limit)), this.channel());
   }
 
   async delete(personaId: string, id: string): Promise<boolean> {
@@ -135,15 +143,18 @@ export class PersonaMemory {
     message: string;
     createdAt?: number;
   }): Promise<PersonaConversationMessage | undefined> {
+    const channel = this.channel();
+    if (channel === '') return undefined;
     const message = input.message.replace(/\s+/g, ' ').trim().slice(0, 600);
     if (!message) return undefined;
     const requestedCreatedAt = input.createdAt ?? this.now();
-    const threadKey = `${input.personaId}:${input.viewerUsername.toLowerCase()}`;
+    const threadKey = `${channel ?? ""}:${input.personaId}:${input.viewerUsername.toLowerCase()}`;
     const createdAt = Math.max(requestedCreatedAt, (this.conversationClocks.get(threadKey) ?? requestedCreatedAt - 1) + 1);
     this.conversationClocks.set(threadKey, createdAt);
     const record: PersonaConversationMessage = {
       id: randomUUID(),
       personaId: input.personaId,
+      ...(channel ? { channel } : {}),
       viewerUsername: input.viewerUsername.toLowerCase(),
       role: input.role,
       message,
@@ -161,6 +172,7 @@ export class PersonaMemory {
       viewerUsername.toLowerCase(),
       now - this.conversationWindowMs,
       Math.max(1, Math.min(20, limit)),
+      this.channel(),
     );
     return messages.filter((message) => message.expiresAt > now);
   }
@@ -171,6 +183,7 @@ export class PersonaMemory {
       viewerUsername.toLowerCase(),
       now - this.conversationWindowMs,
       Math.max(1, Math.min(50, limit * 6)),
+      this.channel(),
     );
     const personaIds: string[] = [];
     for (const message of messages) {

@@ -169,11 +169,14 @@ export class Application {
       staleSessionMs: config.globalMemory.sessionStaleMinutes * 60_000,
     });
     this.history = new BotHistory(this.repository, 50);
-    this.personaMemory = new PersonaMemory(this.repository);
+    this.personaMemory = new PersonaMemory(this.repository, { channel: () => this.config.twitch.channel });
     this.personaRuntime = new PersonaRuntimeStore();
     this.feedbackStore = new PersonaFeedbackStore(this.repository, this.logger);
-    this.learnedPolicy = new LearnedPolicyStore(this.repository, this.logger);
-    this.mindStore = new PersonaMindStore(this.repository, this.logger);
+    this.learnedPolicy = new LearnedPolicyStore(this.repository, this.logger, () => this.queueBrainDelta({
+      type: 'CONTEXT_UPDATED',
+      summary: 'Operator learning changed. Earlier learnedPolicy blocks are historical. Apply only the learnedPolicy supplied with the current decision; absent rules are no longer applicable.',
+    }));
+    this.mindStore = new PersonaMindStore(this.repository, this.logger, Date.now, () => this.config.twitch.channel);
     this.personaContext = new PersonaContextBuilder(
       this.personaMemory, this.personaRuntime, undefined, undefined, this.feedbackStore,
     );
@@ -283,6 +286,10 @@ export class Application {
         model: this.config.openRouter.teacherModel,
         repository: this.repository,
         policyStore: this.learnedPolicy,
+        checkpoint: {
+          read: async () => (await this.repository.getSettings()).teacherLastRun,
+          write: async (teacherLastRun) => { await this.repository.setSettings({ teacherLastRun }); },
+        },
         personaProfile: (username) => {
           const candidate = this.botManager.candidates().find((item) => item.username === username);
           if (!candidate) return undefined;
@@ -546,17 +553,13 @@ export class Application {
         }
         const eventId = await this.resolveVerdictEventId(verdict.username, verdict.message, verdict.reactionId);
         await this.feedbackStore.record({ ...verdict, linkKind, ...(eventId ? { eventId } : {}) });
-        // The click is the only thing that ever produces new evidence, so it is also the only thing
-        // worth checking on — a background timer would wake up every minute to find nothing changed.
-        // Deliberately not awaited: a Teacher run takes seconds and the operator's button should not
-        // wait on it. Its own lock, threshold and cooldown decide whether anything actually happens.
+        // A correction withdraws rules supported by the old verdict before the next decision.
+        await this.learnedPolicy.load();
+        // Wake immediately; the periodic durable-queue check also handles cooldown and restarts.
         void this.teacher?.maybeRunAutomatically()
           .catch((cause: unknown) => this.logger.warn('Automatic teacher run failed', { cause }));
-        if (verdict.verdict === 'bad') {
-          this.classifyDislikedMessage(verdict.username, verdict.message, eventId);
-          return;
-        }
-        // A like changes what this account's example pool contains, and the per-event path picks that
+        if (verdict.verdict === 'bad') this.classifyDislikedMessage(verdict.username, verdict.message, eventId);
+        // A verdict changes what this account's example pool contains, and the per-event path picks that
         // up on the very next decision because it rebuilds from the store every time. The session
         // bootstrap does not: its speech fingerprint was composed once and lives in the Brain's
         // interaction chain. Re-send that one persona's snapshot through the same delta the persona
@@ -668,6 +671,7 @@ export class Application {
 
     this.wireEvents();
     await this.api.start();
+    void this.teacher?.start().catch((cause: unknown) => this.logger.warn('Teacher startup failed', { cause }));
     if (!this.config.app.dashboardToken) this.logger.warn('DASHBOARD_TOKEN is missing; protected dashboard API and realtime connections are unavailable');
     if (this.paused) {
       // Perception still has to be started so it is 'running' and a later resume can hand it a
@@ -714,6 +718,7 @@ export class Application {
     this.mediaOfflineGraceTimer = undefined;
     this.mediaOfflineGraceState = undefined;
     await this.api?.stop();
+    await this.teacher?.stop();
     this.coordinator?.logSessionSummary('shutdown');
     await this.coordinator?.stop();
     await this.memory.stop();
@@ -1020,6 +1025,7 @@ export class Application {
     decision: BrainDecision,
     source: { eventId: string; occurredAt: number; tag: string },
   ): Promise<void> {
+    const channel = this.config.twitch.channel;
     const globalUpdates = decision.memoryUpdates.filter((update) => update.scope === 'global');
     if (globalUpdates.length > 0) {
       const result = await this.globalMemory.recordFromBrain({
@@ -1054,6 +1060,7 @@ export class Application {
 
     const candidates = new Map(this.botManager.candidates().map((candidate) => [candidate.username, candidate]));
     for (const update of decision.memoryUpdates) {
+      if (channel !== this.config.twitch.channel) return;
       if (update.scope !== 'persona') continue;
       const candidate = candidates.get(update.username);
       if (!candidate || update.confidence < 0.5) {
@@ -1066,6 +1073,7 @@ export class Application {
       const existing = await this.personaMemory.list(candidate.persona.id, 200);
       if (existing.some((memory) => memory.summary.toLocaleLowerCase() === summary.toLocaleLowerCase())) continue;
       await this.personaMemory.remember({
+        channel,
         personaId: candidate.persona.id,
         type: update.type,
         summary,

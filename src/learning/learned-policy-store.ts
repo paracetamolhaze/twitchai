@@ -58,12 +58,15 @@ export class LearnedPolicyStore {
   private supplied = 0;
   private decisionsWithPolicy = 0;
 
-  constructor(private readonly repository: PolicyRepository, logger: Logger) {
+  constructor(private readonly repository: PolicyRepository, logger: Logger, private readonly onChange?: () => void) {
     this.logger = logger.child('POLICY');
   }
 
   async load(): Promise<void> {
-    this.rules = await this.repository.listLearnedPolicyRules();
+    const next = await this.repository.listLearnedPolicyRules();
+    const changed = JSON.stringify(next) !== JSON.stringify(this.rules);
+    this.rules = next;
+    if (changed) this.onChange?.();
     this.logger.info('LEARNED_POLICY_LOADED', {
       total: this.rules.length,
       active: this.rules.filter((rule) => rule.status === 'active').length,

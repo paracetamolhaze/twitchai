@@ -103,8 +103,8 @@ export class MemoryRepository implements AppRepository {
     if (index >= 0) this.personaMemories[index] = clone(memory);
     else this.personaMemories.push(clone(memory));
   }
-  async listPersonaMemories(personaId: string, limit: number): Promise<PersonaMemoryItem[]> {
-    return this.personaMemories.filter((item) => item.personaId === personaId)
+  async listPersonaMemories(personaId: string, limit: number, channel?: string): Promise<PersonaMemoryItem[]> {
+    return this.personaMemories.filter((item) => item.personaId === personaId && (channel === undefined || item.channel === channel))
       .sort((left, right) => right.createdAt - left.createdAt || right.importance - left.importance || left.id.localeCompare(right.id)).slice(0, limit).map(clone);
   }
   async deletePersonaMemory(id: string, personaId: string): Promise<boolean> {
@@ -115,14 +115,14 @@ export class MemoryRepository implements AppRepository {
   async savePersonaConversationMessage(message: PersonaConversationMessage): Promise<void> {
     this.personaConversationMessages.push(clone(message));
   }
-  async listPersonaConversationMessages(personaId: string, viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]> {
+  async listPersonaConversationMessages(personaId: string, viewerUsername: string, since: number, limit: number, channel?: string): Promise<PersonaConversationMessage[]> {
     return this.personaConversationMessages
-      .filter((item) => item.personaId === personaId && item.viewerUsername === viewerUsername && item.createdAt >= since && item.expiresAt > since)
+      .filter((item) => (channel === undefined || item.channel === channel) && item.personaId === personaId && item.viewerUsername === viewerUsername && item.createdAt >= since && item.expiresAt > since)
       .sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id)).slice(0, limit).reverse().map(clone);
   }
-  async listRecentPersonaConversationMessages(viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]> {
+  async listRecentPersonaConversationMessages(viewerUsername: string, since: number, limit: number, channel?: string): Promise<PersonaConversationMessage[]> {
     return this.personaConversationMessages
-      .filter((item) => item.viewerUsername === viewerUsername.toLowerCase() && item.createdAt >= since && item.expiresAt > since)
+      .filter((item) => (channel === undefined || item.channel === channel) && item.viewerUsername === viewerUsername.toLowerCase() && item.createdAt >= since && item.expiresAt > since)
       .sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id))
       .slice(0, limit)
       .map(clone);
@@ -195,9 +195,25 @@ export class MemoryRepository implements AppRepository {
   }
   async saveReactionExample(example: ReactionExample): Promise<void> { this.examples.push(clone(example)); }
   async listReactionExamples(limit: number): Promise<ReactionExample[]> { return this.examples.slice(-limit).reverse().map(clone); }
-  async saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void> { this.verdicts.push(clone(verdict)); }
+  async saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void> {
+    const replaced = this.verdicts.filter((item) => verdict.reactionId && item.reactionId === verdict.reactionId
+      && item.username.toLowerCase() === verdict.username.toLowerCase() && !item.supersededAt);
+    for (const item of replaced) item.supersededAt = verdict.createdAt;
+    const removed = new Set(replaced.map((item) => item.id));
+    for (const rule of this.learnedRules.values()) {
+      if (!rule.evidenceIds.some((id) => removed.has(id))) continue;
+      rule.evidenceIds = [...new Set(rule.evidenceIds.filter((id) => !removed.has(id)))];
+      rule.supportCount = rule.evidenceIds.length;
+      rule.positiveEvidence = this.verdicts.filter((v) => rule.evidenceIds.includes(v.id) && v.verdict === 'good').length;
+      rule.negativeEvidence = this.verdicts.filter((v) => rule.evidenceIds.includes(v.id) && v.verdict === 'bad').length;
+      rule.confidence = 0; // Needs teacher review; operator-disabled status stays untouched.
+      rule.updatedAt = verdict.createdAt;
+      rule.version += 1;
+    }
+    this.verdicts.push(clone(verdict));
+  }
   async listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
-    return this.verdicts.slice(-limit).reverse().map((verdict) => ({
+    return this.verdicts.filter((v) => !v.supersededAt).slice(-limit).reverse().map((verdict) => ({
       ...clone(verdict),
       ...(this.processedVerdicts.has(verdict.id) ? { processedAt: verdict.createdAt } : {}),
     }));
@@ -214,7 +230,7 @@ export class MemoryRepository implements AppRepository {
   }
 
   async listUnprocessedMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
-    return this.verdicts.filter((item) => !this.processedVerdicts.has(item.id)).slice(0, limit).map(clone);
+    return this.verdicts.filter((item) => !item.supersededAt && !this.processedVerdicts.has(item.id)).slice(0, limit).map(clone);
   }
 
   async saveSentMessageMotive(record: SentMessageMotiveRecord): Promise<void> { this.sentMotives.push(clone(record)); }
@@ -238,9 +254,13 @@ export class MemoryRepository implements AppRepository {
     processedVerdictIds: string[];
     processedAt: number;
   }): Promise<void> {
+    if (input.processedVerdictIds.some((id) => !this.verdicts.some((v) => v.id === id && !v.supersededAt)
+      || this.processedVerdicts.has(id))) throw new Error('stale teacher batch');
     // The Postgres implementation holds one transaction; here the whole method is synchronous
     // between awaits, so it is already all-or-nothing for the same reason.
-    for (const rule of input.upserts) this.learnedRules.set(rule.id, clone(rule));
+    for (const rule of input.upserts) this.learnedRules.set(rule.id, {
+      ...clone(rule), ...(this.learnedRules.get(rule.id)?.status === 'disabled' ? { status: 'disabled' } : {}),
+    });
     for (const id of input.processedVerdictIds) this.processedVerdicts.add(id);
   }
 

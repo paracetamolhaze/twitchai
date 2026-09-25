@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BrainInteractionRequest, BrainInteractionResponse } from '../src/brain/gemini-brain.service';
-import { FeedbackTeacher, MIN_NEW_VERDICTS_FOR_AUTO_RUN } from '../src/learning/feedback-teacher';
+import { FeedbackTeacher, FeedbackTeacherOptions, MIN_NEW_VERDICTS_FOR_AUTO_RUN } from '../src/learning/feedback-teacher';
 import { LearnedPolicyStore } from '../src/learning/learned-policy-store';
 import { LearnedPolicyRule, TeacherAction } from '../src/learning/learned-policy.types';
 import { Logger } from '../src/logger';
@@ -33,6 +33,7 @@ function streamEvent(id: string, overrides: Partial<StreamEvent> = {}): StreamEv
 }
 
 interface HarnessOptions {
+  checkpoint?: FeedbackTeacherOptions['checkpoint'];
   actions?: TeacherAction[];
   fail?: boolean;
   personas?: Record<string, { interests: string[]; expertise: string[]; weakTopics: string[] }>;
@@ -71,6 +72,7 @@ async function harness(verdicts: MessageVerdictRecord[], options: HarnessOptions
   await policyStore.load();
   const usageTracker = new UsageTracker();
   const teacher = new FeedbackTeacher({
+    checkpoint: options.checkpoint,
     client,
     model: 'test/teacher-model',
     repository,
@@ -89,6 +91,72 @@ async function harness(verdicts: MessageVerdictRecord[], options: HarnessOptions
 }
 
 describe('FeedbackTeacher batch learning', () => {
+  it('restores last outcome and cooldown after restart', async () => {
+    vi.useFakeTimers();
+    let saved: unknown;
+    const checkpoint = { read: async () => saved, write: async (value: unknown) => { saved = value; } };
+    const cases = Array.from({ length: 5 }, (_, i) => verdict({ id: `case-${i}` }));
+    const first = await harness(cases, { checkpoint });
+    const second = await harness(cases, { checkpoint });
+    try {
+      await first.teacher.runManually();
+      await second.teacher.start();
+      expect((await second.teacher.status()).lastRun).toMatchObject({ result: 'success', casesConsidered: 5 });
+      expect(second.client.create).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(second.client.create).toHaveBeenCalledTimes(1);
+    } finally { await first.teacher.stop(); await second.teacher.stop(); vi.useRealTimers(); }
+  });
+
+  it('serializes concurrent manual and automatic requests before reading a batch', async () => {
+    const { teacher, client } = await harness(Array.from({ length: 5 }, (_, i) => verdict({ id: `case-${i}` })));
+    await Promise.all([teacher.runManually(), teacher.runManually(), teacher.maybeRunAutomatically()]);
+    expect(client.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts duplicate evidence ids only once', async () => {
+    const { teacher, policyStore } = await harness([verdict({ id: 'case-1' })], {
+      actions: [action({ action: 'CREATE_RULE', rule: 'Не выдумывай события', confidence: 0.8, evidenceIds: ['case-1', 'case-1'] })],
+    });
+    await teacher.runManually();
+    expect(policyStore.active()[0]).toMatchObject({ supportCount: 1, negativeEvidence: 1, evidenceIds: ['case-1'] });
+  });
+
+  it('merges multiple updates to the same rule without losing or double-counting evidence', async () => {
+    const { teacher, policyStore, repository } = await harness([verdict({ id: 'case-1' }), verdict({ id: 'case-2', verdict: 'good' })], {
+      actions: [
+        action({ action: 'UPDATE_RULE', ruleId: 'rule', confidence: 0.7, evidenceIds: ['case-1'] }),
+        action({ action: 'UPDATE_RULE', ruleId: 'rule', confidence: 0.8, evidenceIds: ['case-1', 'case-2'] }),
+      ],
+    });
+    await repository.applyLearnedPolicyBatch({ upserts: [{
+      id: 'rule', scopeType: 'global', scopeKey: '', rule: 'правило', rationale: '', confidence: 0.6,
+      supportCount: 0, positiveEvidence: 0, negativeEvidence: 0, evidenceIds: [], status: 'active',
+      teacherModel: 'test', createdAt: 1000, updatedAt: 1000, version: 1,
+    }], processedVerdictIds: [], processedAt: 1000 });
+    await policyStore.load();
+    await teacher.runManually();
+    expect(policyStore.byId('rule')).toMatchObject({ supportCount: 2, positiveEvidence: 1, negativeEvidence: 1, evidenceIds: ['case-1', 'case-2'] });
+  });
+
+  it('rechecks a backlog after cooldown without another rating and stops cleanly', async () => {
+    vi.useFakeTimers();
+    const { teacher, repository, client } = await harness(Array.from({ length: 5 }, (_, i) => verdict({ id: `first-${i}` })));
+    try {
+      await teacher.start();
+      expect(client.create).toHaveBeenCalledTimes(1);
+      for (let i = 0; i < 5; i++) await repository.saveMessageVerdict(verdict({ id: `second-${i}` }));
+      await teacher.maybeRunAutomatically();
+      expect(client.create).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(client.create).toHaveBeenCalledTimes(2);
+      await teacher.stop();
+      for (let i = 0; i < 5; i++) await repository.saveMessageVerdict(verdict({ id: `third-${i}` }));
+      await vi.advanceTimersByTimeAsync(20 * 60_000);
+      expect(client.create).toHaveBeenCalledTimes(2);
+    } finally { await teacher.stop(); vi.useRealTimers(); }
+  });
+
   it('A. turns a cluster of generic-evaluator dislikes into one global rule, not two literal ones', async () => {
     const verdicts = [
       verdict({ id: 'case-1', message: 'Яндекс это мощно конечно', note: 'просто оценивает уже сказанный факт' }),

@@ -123,27 +123,28 @@ export class PostgresRepository implements AppRepository {
     await this.pool.query('DELETE FROM persona_memories WHERE expires_at IS NOT NULL AND expires_at<=NOW()');
     await this.pool.query(
       `INSERT INTO persona_memories
-       (id, persona_id, created_at, type, summary, importance, tags, viewer_username, event_id, expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       (id, persona_id, created_at, type, summary, importance, tags, viewer_username, event_id, expires_at, channel)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        ON CONFLICT (id) DO UPDATE SET summary=EXCLUDED.summary, importance=EXCLUDED.importance,
        tags=EXCLUDED.tags, expires_at=EXCLUDED.expires_at`,
       [memory.id, memory.personaId, new Date(memory.createdAt), memory.type, memory.summary, memory.importance,
         memory.tags, memory.viewerUsername ?? null, memory.eventId ?? null,
-        memory.expiresAt ? new Date(memory.expiresAt) : null],
+        memory.expiresAt ? new Date(memory.expiresAt) : null, memory.channel ?? null],
     );
   }
 
-  async listPersonaMemories(personaId: string, limit: number): Promise<PersonaMemoryItem[]> {
+  async listPersonaMemories(personaId: string, limit: number, channel?: string): Promise<PersonaMemoryItem[]> {
     const result = await this.pool.query<{
-      id: string; persona_id: string; created_at: Date; type: PersonaMemoryItem['type']; summary: string;
+      channel: string | null; id: string; persona_id: string; created_at: Date; type: PersonaMemoryItem['type']; summary: string;
       importance: number; tags: string[]; viewer_username: string | null; event_id: string | null; expires_at: Date | null;
     }>(
-      `SELECT id, persona_id, created_at, type, summary, importance, tags, viewer_username, event_id, expires_at
-       FROM persona_memories WHERE persona_id=$1 AND (expires_at IS NULL OR expires_at>NOW())
+      `SELECT channel, id, persona_id, created_at, type, summary, importance, tags, viewer_username, event_id, expires_at
+       FROM persona_memories WHERE persona_id=$1 AND ($3::text IS NULL OR channel=$3) AND (expires_at IS NULL OR expires_at>NOW())
        ORDER BY created_at DESC, importance DESC, id ASC LIMIT $2`,
-      [personaId, limit],
+      [personaId, limit, channel ?? null],
     );
     return result.rows.map((row) => ({
+      ...(row.channel ? { channel: row.channel } : {}),
       id: row.id, personaId: row.persona_id, createdAt: row.created_at.getTime(), type: row.type,
       summary: row.summary, importance: Number(row.importance), tags: row.tags,
       ...(row.viewer_username ? { viewerUsername: row.viewer_username } : {}),
@@ -161,42 +162,44 @@ export class PostgresRepository implements AppRepository {
     await this.pool.query('DELETE FROM persona_conversation_messages WHERE expires_at<=NOW()');
     await this.pool.query(
       `INSERT INTO persona_conversation_messages
-       (id, persona_id, viewer_username, role, message, created_at, expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+       (id, persona_id, viewer_username, role, message, created_at, expires_at, channel)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [message.id, message.personaId, message.viewerUsername, message.role, message.message,
-        new Date(message.createdAt), new Date(message.expiresAt)],
+        new Date(message.createdAt), new Date(message.expiresAt), message.channel ?? null],
     );
   }
 
-  async listPersonaConversationMessages(personaId: string, viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]> {
+  async listPersonaConversationMessages(personaId: string, viewerUsername: string, since: number, limit: number, channel?: string): Promise<PersonaConversationMessage[]> {
     const result = await this.pool.query<{
-      id: string; persona_id: string; viewer_username: string; role: PersonaConversationMessage['role'];
+      channel: string | null; id: string; persona_id: string; viewer_username: string; role: PersonaConversationMessage['role'];
       message: string; created_at: Date; expires_at: Date;
     }>(
-      `SELECT id, persona_id, viewer_username, role, message, created_at, expires_at
+      `SELECT channel, id, persona_id, viewer_username, role, message, created_at, expires_at
        FROM persona_conversation_messages
-       WHERE persona_id=$1 AND viewer_username=$2 AND created_at>=$3 AND expires_at>NOW()
+       WHERE ($5::text IS NULL OR channel=$5) AND persona_id=$1 AND viewer_username=$2 AND created_at>=$3 AND expires_at>NOW()
        ORDER BY created_at DESC, id ASC LIMIT $4`,
-      [personaId, viewerUsername.toLowerCase(), new Date(since), limit],
+      [personaId, viewerUsername.toLowerCase(), new Date(since), limit, channel ?? null],
     );
     return result.rows.reverse().map((row) => ({
+      ...(row.channel ? { channel: row.channel } : {}),
       id: row.id, personaId: row.persona_id, viewerUsername: row.viewer_username, role: row.role,
       message: row.message, createdAt: row.created_at.getTime(), expiresAt: row.expires_at.getTime(),
     }));
   }
 
-  async listRecentPersonaConversationMessages(viewerUsername: string, since: number, limit: number): Promise<PersonaConversationMessage[]> {
+  async listRecentPersonaConversationMessages(viewerUsername: string, since: number, limit: number, channel?: string): Promise<PersonaConversationMessage[]> {
     const result = await this.pool.query<{
-      id: string; persona_id: string; viewer_username: string; role: PersonaConversationMessage['role'];
+      channel: string | null; id: string; persona_id: string; viewer_username: string; role: PersonaConversationMessage['role'];
       message: string; created_at: Date; expires_at: Date;
     }>(
-      `SELECT id, persona_id, viewer_username, role, message, created_at, expires_at
+      `SELECT channel, id, persona_id, viewer_username, role, message, created_at, expires_at
        FROM persona_conversation_messages
-       WHERE viewer_username=$1 AND created_at>=$2 AND expires_at>NOW()
+       WHERE ($4::text IS NULL OR channel=$4) AND viewer_username=$1 AND created_at>=$2 AND expires_at>NOW()
        ORDER BY created_at DESC, id ASC LIMIT $3`,
-      [viewerUsername.toLowerCase(), new Date(since), limit],
+      [viewerUsername.toLowerCase(), new Date(since), limit, channel ?? null],
     );
     return result.rows.map((row) => ({
+      ...(row.channel ? { channel: row.channel } : {}),
       id: row.id, personaId: row.persona_id, viewerUsername: row.viewer_username, role: row.role,
       message: row.message, createdAt: row.created_at.getTime(), expiresAt: row.expires_at.getTime(),
     }));
@@ -398,21 +401,53 @@ export class PostgresRepository implements AppRepository {
   }
 
   async saveMessageVerdict(verdict: MessageVerdictRecord): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO message_verdicts (id, created_at, username, message, verdict, note, event_summary, event_id,
-         reaction_id, link_kind)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [verdict.id, new Date(verdict.createdAt), verdict.username, verdict.message, verdict.verdict,
-        verdict.note ?? null, verdict.eventSummary ?? null, verdict.eventId ?? null,
-        verdict.reactionId ?? null, verdict.linkKind ?? 'legacy'],
-    );
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Same lock as Teacher commit: a correction cannot race a stale model result into storage.
+      await client.query('SELECT pg_advisory_xact_lock(8436172202)');
+      if (verdict.reactionId) {
+        await client.query(
+          `UPDATE message_verdicts SET superseded_at=$1
+           WHERE lower(username)=lower($2) AND reaction_id=$3 AND superseded_at IS NULL`,
+          [new Date(verdict.createdAt), verdict.username, verdict.reactionId],
+        );
+        // Keep historical verdict rows, but withdraw rules whose foundation was corrected.
+        await client.query(`
+          WITH affected AS (
+            SELECT r.id, COALESCE(jsonb_agg(DISTINCT to_jsonb(v.id::text))
+              FILTER (WHERE v.id IS NOT NULL AND v.superseded_at IS NULL), '[]'::jsonb) AS ids,
+              COUNT(DISTINCT v.id) FILTER (WHERE v.superseded_at IS NULL AND v.verdict='good') AS positive,
+              COUNT(DISTINCT v.id) FILTER (WHERE v.superseded_at IS NULL AND v.verdict='bad') AS negative
+            FROM learned_policy_rules r
+            CROSS JOIN LATERAL jsonb_array_elements_text(r.evidence_ids) e(id)
+            LEFT JOIN message_verdicts v ON v.id::text=e.id
+            GROUP BY r.id HAVING BOOL_OR(v.superseded_at IS NOT NULL)
+          )
+          UPDATE learned_policy_rules r SET evidence_ids=a.ids, support_count=jsonb_array_length(a.ids),
+            positive_evidence=a.positive, negative_evidence=a.negative, confidence=0,
+            updated_at=$1, version=r.version+1 FROM affected a WHERE r.id=a.id`, [new Date(verdict.createdAt)]);
+      }
+      await client.query(
+        `INSERT INTO message_verdicts (id, created_at, username, message, verdict, note, event_summary, event_id,
+           reaction_id, link_kind)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [verdict.id, new Date(verdict.createdAt), verdict.username, verdict.message, verdict.verdict,
+          verdict.note ?? null, verdict.eventSummary ?? null, verdict.eventId ?? null,
+          verdict.reactionId ?? null, verdict.linkKind ?? 'legacy'],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally { client.release(); }
   }
 
   async listMessageVerdicts(limit: number): Promise<MessageVerdictRecord[]> {
     const result = await this.pool.query<MessageVerdictRow>(
       `SELECT id, created_at, username, message, verdict, note, event_summary, event_id, processed_at,
               reaction_id, link_kind
-       FROM message_verdicts ORDER BY created_at DESC LIMIT $1`,
+       FROM message_verdicts WHERE superseded_at IS NULL ORDER BY created_at DESC, id DESC LIMIT $1`,
       [limit],
     );
     return result.rows.map(toMessageVerdict);
@@ -422,7 +457,7 @@ export class PostgresRepository implements AppRepository {
     const result = await this.pool.query<MessageVerdictRow>(
       `SELECT id, created_at, username, message, verdict, note, event_summary, event_id, processed_at,
               reaction_id, link_kind
-       FROM message_verdicts WHERE processed_at IS NULL ORDER BY created_at ASC LIMIT $1`,
+       FROM message_verdicts WHERE superseded_at IS NULL AND processed_at IS NULL ORDER BY created_at ASC, id ASC LIMIT $1`,
       [limit],
     );
     return result.rows.map(toMessageVerdict);
@@ -510,6 +545,15 @@ export class PostgresRepository implements AppRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(8436172202)');
+      if (input.processedVerdictIds.length) {
+        const current = await client.query(
+          'SELECT id FROM message_verdicts WHERE id=ANY($1::uuid[]) AND superseded_at IS NULL AND processed_at IS NULL',
+          [input.processedVerdictIds],
+        );
+        if (current.rowCount !== new Set(input.processedVerdictIds).size) throw new Error('stale teacher batch');
+      }
+
       for (const rule of input.upserts) {
         await client.query(
           `INSERT INTO learned_policy_rules
@@ -520,7 +564,8 @@ export class PostgresRepository implements AppRepository {
              scope_type=EXCLUDED.scope_type, scope_key=EXCLUDED.scope_key, rule=EXCLUDED.rule,
              rationale=EXCLUDED.rationale, confidence=EXCLUDED.confidence,
              support_count=EXCLUDED.support_count, positive_evidence=EXCLUDED.positive_evidence,
-             negative_evidence=EXCLUDED.negative_evidence, status=EXCLUDED.status,
+             negative_evidence=EXCLUDED.negative_evidence,
+             status=CASE WHEN learned_policy_rules.status='disabled' THEN 'disabled' ELSE EXCLUDED.status END,
              teacher_model=EXCLUDED.teacher_model, evidence_ids=EXCLUDED.evidence_ids,
              updated_at=EXCLUDED.updated_at, version=EXCLUDED.version`,
           [rule.id, rule.scopeType, rule.scopeKey, rule.rule, rule.rationale, rule.confidence,
