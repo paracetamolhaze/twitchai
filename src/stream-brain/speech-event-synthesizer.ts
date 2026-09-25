@@ -130,6 +130,8 @@ export class SpeechEventSynthesizer {
     this.clearTimer();
     this.buffer = [];
     this.firstBufferedAt = undefined;
+    this.currentScene = undefined;
+    this.lastEmittedAt = 0;
   }
 
   private scheduleWait(): void {

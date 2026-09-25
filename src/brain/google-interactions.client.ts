@@ -29,7 +29,7 @@ export class GoogleInteractionsClient implements BrainInteractionClient {
         max_output_tokens: request.maxOutputTokens,
       },
       store: request.store,
-    });
+    }, { fetchOptions: { signal: request.signal ?? AbortSignal.timeout(60_000) }, maxRetries: 0 });
     const usage = response.usage;
     return {
       id: response.id,

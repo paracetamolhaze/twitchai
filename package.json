@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.17.1",
+    "@ricky0123/vad-node": "0.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",

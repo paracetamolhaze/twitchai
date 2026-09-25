@@ -71,6 +71,7 @@ export class OpenRouterBrainClient implements BrainInteractionClient {
       const messages = this.buildMessages(request);
       const response = await this.fetchImpl(ENDPOINT, {
         method: 'POST',
+        signal: request.signal ?? AbortSignal.timeout(60_000),
         headers: {
           Authorization: `Bearer ${this.options.apiKey}`,
           'Content-Type': 'application/json',

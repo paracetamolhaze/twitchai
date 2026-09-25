@@ -92,6 +92,74 @@ describe('withoutRepeatedTail', () => {
 });
 
 describe('SpeechTranscriber', () => {
+  it('can retry recovered billing after the first post-backoff window contains no speech', async () => {
+    vi.useFakeTimers();
+    try {
+      let speech = true;
+      const backend = { name: 'test', transcribe: vi.fn()
+        .mockRejectedValueOnce(new Error('402 insufficient balance'))
+        .mockResolvedValue({ text: 'S: снова слышно настоящую речь' }) };
+      const { instance, heard } = transcriber({ backend, windowMs: 1000,
+        speechPresence: { hasSpeech: async () => speech } });
+      instance.acceptPcm(pcm(1000, .2));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(300001);
+      speech = false;
+      instance.acceptPcm(pcm(1000, .2));
+      await vi.advanceTimersByTimeAsync(0);
+      speech = true;
+      instance.acceptPcm(pcm(1000, .2));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(backend.transcribe).toHaveBeenCalledTimes(2);
+      expect(heard).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
+  });
+  it('does not let speech from the overlap authorize a new music-only window', async () => {
+    const checks: number[] = [];
+    const { instance } = transcriber({ windowMs: 2000, overlapMs: 1000,
+      speechPresence: { hasSpeech: async audio => { checks.push(audio.length / 32); return true; } } });
+    instance.acceptPcm(pcm(4000, .2));
+    await vi.waitFor(() => expect(checks).toHaveLength(2));
+    expect(checks).toEqual([2000, 2000]);
+  });
+  it('does not ask a generative model to invent speech over instrumental audio', async () => {
+    const { LocalSpeechPresence } = await import('../src/transcription/speech-presence');
+    const { instance, created, heard } = transcriber({ windowMs: 3000, speechPresence: new LocalSpeechPresence() });
+    instance.acceptPcm(pcm(3000, .2));
+    await vi.waitFor(() => expect(instance.getStats().nonSpeechSecondsSkipped).toBe(3), { timeout: 10000 });
+    expect(created).not.toHaveBeenCalled();
+    expect(heard).toEqual([]);
+  }, 15000);
+
+  it('fails closed if the acoustic detector fails, without claiming an API charge', async () => {
+    const onUsage = vi.fn();
+    const { instance, created, heard } = transcriber({ windowMs: 1000, onUsage,
+      speechPresence: { hasSpeech: async () => { throw new Error('detector failed'); } } });
+    instance.acceptPcm(pcm(1000, .2));
+    await vi.waitFor(() => expect(instance.getStats().failures).toBe(1));
+    expect(created).not.toHaveBeenCalled();
+    expect(heard).toEqual([]);
+    expect(onUsage).not.toHaveBeenCalled();
+  });
+  it('does not publish an older request after a newer window already arrived', async () => {
+    const finish: Array<(value: {text: string}) => void> = [];
+    const { instance, heard } = transcriber({ windowMs: 1000, overlapMs: 0,
+      backend: { name: 'test', transcribe: () => new Promise(resolve => finish.push(resolve)) } });
+    instance.acceptPcm(pcm(2000, .2));
+    finish[1]!({ text: 'S: уже вышел на улицу' });
+    await vi.waitFor(() => expect(heard).toHaveLength(1));
+    finish[0]!({ text: 'S: еще сижу дома' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(heard.map(line => line.text)).toEqual(['S: уже вышел на улицу']);
+  });
+
+  it('drops the production Russian no-speech explanation instead of treating it as a quote', async () => {
+    const { instance, heard } = transcriber({ windowMs: 1000,
+      backend: { name: 'test', transcribe: async () => ({text: 'начинается с пустой строки, так как никто не говорит.'}) } });
+    instance.acceptPcm(pcm(1000, .2));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(heard).toEqual([]);
+  });
   it('holds one fresh window while both transcription slots are busy', async () => {
     const release: Array<(result: {text: string}) => void> = [];
     const backend = { name: 'test', transcribe: vi.fn(() => new Promise<{text: string}>(resolve => release.push(resolve))) };
@@ -177,7 +245,7 @@ describe('SpeechTranscriber', () => {
     expect(seconds(sizes[1]!)).toBeCloseTo(3, 1);
   });
 
-  it('tells the listener what the stream is about and what is on screen', async () => {
+  it('supplies spelling hints without allowing text or scene hints to substitute for audio', async () => {
     // Names alone left "Парис" for a nickname and павербанк spelled two ways in consecutive
     // windows. The subject and the picture are what a human listener would already have.
     const { instance, hints } = transcriber({
@@ -188,8 +256,8 @@ describe('SpeechTranscriber', () => {
     instance.acceptPcm(pcm(2_000, 0.2));
     instance.acceptPcm(pcm(1_000, 0));
     await vi.waitFor(() => expect(hints).toHaveLength(1));
-    expect(hints[0]).toContain('ИРЛ Шанхай');
-    expect(hints[0]).toContain('павербанк');
+    expect(hints[0]).not.toContain('ИРЛ Шанхай');
+    expect(hints[0]).not.toContain('павербанк');
     expect(hints[0]).toContain('gudini_younger');
   });
 
@@ -234,7 +302,7 @@ describe('SpeechTranscriber', () => {
     expect(instance.getStats().segmentsSent).toBe(0);
   });
 
-  it('tells the listener which names are in play and what was said a moment ago', async () => {
+  it('keeps spelling hints without recycling previous generated speech', async () => {
     // A window heard on its own has no idea a stream is called gudini_younger. Continuous
     // listening got that for free; this is what buys it back.
     const { instance, hints } = transcriber({ vocabulary: () => ['gudini_younger', 'karlbekner'] });
@@ -247,7 +315,8 @@ describe('SpeechTranscriber', () => {
     instance.acceptPcm(pcm(2_000, 0.2));
     instance.acceptPcm(pcm(1_000, 0));
     await vi.waitFor(() => expect(hints).toHaveLength(2));
-    expect(hints[1]).toContain('привет как дела');
+    expect(hints[1]).not.toContain('привет как дела');
+    expect(hints[1]).toContain('karlbekner');
   });
 
   it('reports what it spent per window, whether or not words came back', async () => {

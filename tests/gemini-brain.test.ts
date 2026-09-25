@@ -547,6 +547,7 @@ describe('Gemini 3.8 stateful Brain', () => {
     vi.useFakeTimers();
     const onDecision = vi.fn(async () => undefined);
     let decisionCalls = 0;
+    let timedOutRequest: BrainInteractionRequest | undefined;
     const client: BrainInteractionClient = {
       create: async (request) => {
         if (request.kind === 'bootstrap') {
@@ -558,7 +559,7 @@ describe('Gemini 3.8 stateful Brain', () => {
         decisionCalls += 1;
         // The production failure was one call running 97s: its own reaction context expired at 45s
         // and the two events behind it waited 87s and 73s just to have their context prepared.
-        if (decisionCalls === 1) return new Promise(() => {});
+        if (decisionCalls === 1) { timedOutRequest = request; return new Promise(() => {}); }
         return {
           id: 'B', status: 'completed', outputText: '{"reactions":[],"memoryUpdates":[]}',
           usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 1, thoughtTokens: 0, totalTokens: 11 },
@@ -572,6 +573,7 @@ describe('Gemini 3.8 stateful Brain', () => {
     const stuckSettled = stuck.then(() => 'resolved', () => 'rejected');
     await vi.advanceTimersByTimeAsync(1_500);
     expect(await stuckSettled).toBe('rejected');
+    expect((timedOutRequest as BrainInteractionRequest & { signal?: AbortSignal })?.signal?.aborted).toBe(true);
 
     // The queue must be usable again immediately; the deadline exists to release it, and a second
     // deadline's worth of retrying would defeat that, so a timeout is never retried.

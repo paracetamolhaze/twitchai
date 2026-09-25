@@ -160,6 +160,12 @@ describe('what the brain is told about writing like a viewer', () => {
  * where each of these failures actually lived.
  */
 describe('what the live run showed', () => {
+  it('does not prime repeated rejected laughter through Artyom vocabulary or examples', () => {
+    const persona = generatePersonaV3('aaaarrtyom');
+    const fingerprint = snapshotBuilder.buildBrainSnapshot('aaaarrtyom', persona).speechFingerprint;
+    expect(fingerprint).not.toMatch(/(?:^|[^\p{L}])(?:лол|ахах[а-я]*)(?!\p{L})/iu);
+    expect(persona.speech.abbreviations).toContain('лол');
+  });
   it('does not hand the model a literal laugh token to paste in front of a thought', () => {
     // "ХА. Это ещё постараться надо" — canon has laughStyles ["ХА","хех"] and a message example
     // "ХА. вот это учёт", so the same two characters arrived twice and came back as a prefix.

@@ -1,6 +1,7 @@
 import { BillingBackoff, isBillingFailure } from '../billing-backoff';
 import { Logger } from '../logger';
 import { TranscriptionBackend } from './transcription-backend';
+import { SpeechPresence } from './speech-presence';
 
 const SAMPLE_RATE = 16_000;
 const BYTES_PER_SAMPLE = 2;
@@ -9,6 +10,7 @@ const FRAME_BYTES = (SAMPLE_RATE / 1000) * FRAME_MS * BYTES_PER_SAMPLE;
 
 export interface SpeechTranscriberOptions {
   backend: TranscriptionBackend;
+  speechPresence?: SpeechPresence;
   logger: Logger;
   /**
    * Names in play — the streamer, the accounts, whatever the stream keeps coming back to. Sent
@@ -16,9 +18,9 @@ export interface SpeechTranscriberOptions {
    * its own loses against a session that listens continuously.
    */
   vocabulary?: () => string[];
-  /** What the stream is about, in the operator's own words. */
+  /** Legacy input, intentionally ignored: text context is not audible evidence. */
   streamContext?: () => string;
-  /** What the watching layer last described, so a heard word can be matched to a seen thing. */
+  /** Legacy input, intentionally ignored: visible objects do not establish spoken words. */
   currentScene?: () => string | undefined;
   onUnavailable?: () => void;
   onTranscript: (text: string, meta: { audioMs: number; latencyMs: number }) => void | Promise<void>;
@@ -55,6 +57,7 @@ export interface SpeechTranscriberStats {
   audioSecondsSent: number;
   silenceSecondsSkipped: number;
   droppedAudioSeconds?: number;
+  nonSpeechSecondsSkipped?: number;
   failures: number;
   lastTranscript?: string;
   lastLatencyMs?: number;
@@ -62,20 +65,7 @@ export interface SpeechTranscriberStats {
   lastError?: string;
 }
 
-/**
- * Hearing as a sensor rather than a conversation.
- *
- * Audio is cut into windows and each is transcribed on its own: nothing is retained between them,
- * so a second of audio is paid for exactly once. The layer this replaces was a stateful session
- * that re-read its whole retained window on every turn, billing roughly eight times per second
- * heard, and it could go deaf while still reporting itself connected.
- *
- * It listens to everything audible rather than trying to find the speech first. Deciding that
- * locally was a mistake worth naming: a floor measured from the room rises to meet continuous
- * conversation, and a restaurant left 24 seconds heard out of 38 minutes. An hour of audio is
- * about ninety thousand tokens — three cents — so there is nothing to save by guessing, and
- * everything to lose. Only a genuinely dead stream is skipped.
- */
+/** Independent audio windows, an acoustic speech gate, and bounded transcription concurrency. */
 export class SpeechTranscriber {
   private readonly logger: Logger;
   private readonly audibleRms: number;
@@ -85,8 +75,6 @@ export class SpeechTranscriber {
   private readonly overlapFrames: number;
   /** Tail of the window just sent, prepended to the next one so a cut word survives somewhere. */
   private overlap: Buffer[] = [];
-  /** The last few windows of text, for the hint and for spotting the words this stream repeats. */
-  private readonly recentTranscripts: string[] = [];
 
   private window: Buffer[] = [];
   private windowMsFilled = 0;
@@ -95,6 +83,8 @@ export class SpeechTranscriber {
   private carry = Buffer.alloc(0);
   private inFlight = 0;
   private generation = 0;
+  private nextSequence = 0;
+  private publishedSequence = -1;
   private pendingAudio?: { pcm: Buffer; audioMs: number; at: number };
   private readonly billing = new BillingBackoff();
   private readonly stats: SpeechTranscriberStats = {
@@ -137,6 +127,7 @@ export class SpeechTranscriber {
 
   reset(): void {
     this.generation += 1;
+    delete this.stats.lastTranscript;
     this.pendingAudio = undefined;
     this.overlap = [];
     this.window = [];
@@ -188,42 +179,11 @@ export class SpeechTranscriber {
     void this.transcribe(pcm, windowMsFilled);
   }
 
-  /**
-   * What a listener would already know before hearing this window.
-   *
-   * Names alone were not enough: a stream about carrying a power bank around Shanghai produced
-   * "Парис" for a nickname, "Тайкофф", "по скрбе", and павербанк spelled two different ways in
-   * consecutive windows. Given the subject, what is on screen, and the words this conversation
-   * keeps using, those stop being guesses.
-   */
+  /** Names may correct spelling; generated history is never audio evidence. */
   private buildHint(): string {
     const names = (this.options.vocabulary?.() ?? []).filter(Boolean).slice(0, 40);
-    const previous = this.recentTranscripts.slice(-2).join(' ').slice(-300);
-    return [
-      this.options.streamContext?.() ? `Stream: ${this.options.streamContext?.()}` : '',
-      this.options.currentScene?.() ? `On screen: ${this.options.currentScene?.()}` : '',
-      names.length > 0 ? `Names: ${names.join(', ')}` : '',
-      this.recurringWords().length > 0 ? `Words this conversation keeps using: ${this.recurringWords().join(', ')}` : '',
-      previous ? `Said just before this: ${previous}` : '',
-    ].filter(Boolean).join('\n');
-  }
-
-  /**
-   * Words the last few minutes kept returning to, which is where the mishearing hurts most: a term
-   * the stream says ten times should not be spelled three ways.
-   */
-  private recurringWords(): string[] {
-    const counts = new Map<string, number>();
-    for (const line of this.recentTranscripts) {
-      for (const word of line.toLowerCase().match(/[\p{L}\p{N}-]{4,}/gu) ?? []) {
-        counts.set(word, (counts.get(word) ?? 0) + 1);
-      }
-    }
-    return [...counts.entries()]
-      .filter(([, count]) => count >= 3)
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, 12)
-      .map(([word]) => word);
+    // Guessed speech must not become the next request's evidence. A scene is not audible words.
+    return names.length > 0 ? `Names (spelling only): ${names.join(', ')}` : '';
   }
 
   private recordDroppedAudio(audioMs: number): void {
@@ -233,22 +193,39 @@ export class SpeechTranscriber {
 
   private async transcribe(pcm: Buffer, audioMs: number): Promise<void> {
     const generation = this.generation;
-    if (!this.billing.acquire()) return;
-    const billingRevision = this.billing.revision;
+    const sequence = this.nextSequence++;
     this.inFlight += 1;
-    this.stats.segmentsSent += 1;
-    this.stats.audioSecondsSent += audioMs / 1000;
     const startedAt = Date.now();
+    const uploadedSeconds = pcm.length / (SAMPLE_RATE * BYTES_PER_SAMPLE);
+    let requestStarted = false;
+    let usageRecorded = false;
     try {
+      // The overlap repairs cut words; it must not turn a new music-only window into speech.
+      const freshPcm = pcm.subarray(Math.max(0, pcm.length - audioMs * SAMPLE_RATE * BYTES_PER_SAMPLE / 1000));
+      if (this.options.speechPresence && !await this.options.speechPresence.hasSpeech(freshPcm)) {
+        this.stats.nonSpeechSecondsSkipped = (this.stats.nonSpeechSecondsSkipped ?? 0) + audioMs / 1000;
+        return;
+      }
+      if (generation !== this.generation) return;
+      if (!this.billing.acquire()) return;
+      const billingRevision = this.billing.revision;
+      this.stats.segmentsSent += 1;
+      this.stats.audioSecondsSent += uploadedSeconds;
+      requestStarted = true;
       const result = await this.options.backend.transcribe(wav(pcm), this.buildHint());
       this.billing.success(billingRevision);
       const latencyMs = Date.now() - startedAt;
       this.options.onUsage?.({
         ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
-        audioSeconds: audioMs / 1000,
+        audioSeconds: uploadedSeconds,
         failed: false,
       });
+      usageRecorded = true;
       if (this.billing.retryAt || generation !== this.generation) return;
+      if (sequence < this.publishedSequence) {
+        this.recordDroppedAudio(audioMs);
+        return;
+      }
       delete this.stats.billingRetryAt;
       delete this.stats.lastError;
       if (result.text !== undefined && looksLikeModelMeta(result.text)) {
@@ -285,23 +262,21 @@ export class SpeechTranscriber {
       const text = withoutRepeatedTail(this.stats.lastTranscript, contract?.text);
       if (!text) return;
       this.stats.transcriptsReceived += 1;
+      this.publishedSequence = sequence;
       this.stats.lastTranscript = text;
-      this.recentTranscripts.push(text);
-      if (this.recentTranscripts.length > 12) this.recentTranscripts.shift();
       this.stats.lastLatencyMs = latencyMs;
       await this.options.onTranscript(text, { audioMs, latencyMs });
     } catch (cause) {
-      this.billing.failure(cause);
+      if (requestStarted) this.billing.failure(cause);
       if (isBillingFailure(cause)) {
         this.stats.billingRetryAt = this.billing.retryAt;
         this.stats.lastError = 'Недостаточно средств для распознавания речи. Проверяем восстановление раз в 5 минут.';
         delete this.stats.lastTranscript;
-        this.recentTranscripts.length = 0;
         this.options.onUnavailable?.();
         this.reset();
       }
       this.stats.failures += 1;
-      this.options.onUsage?.({ audioSeconds: audioMs / 1000, failed: true });
+      if (requestStarted && !usageRecorded) this.options.onUsage?.({ audioSeconds: uploadedSeconds, failed: true });
       this.logger.warn('Speech transcription failed', { audioMs, cause });
     } finally {
       this.inFlight -= 1;
@@ -326,6 +301,7 @@ export function looksLikeModelMeta(text: string): boolean {
   const value = text.trim();
   if (!value) return false;
   return /^(?:thought|thinking|okay,? (?:the|so the) user)\b/i.test(value)
+    || /(?:пуст(?:ая|ой|ую) строк|транскрипци[яию]).{0,80}(?:никто не говорит|нет речи|речь отсутствует)/iu.test(value)
     || /\bthe user (?:wants|is asking|asked for|requested)\b/i.test(value)
     || /\b(?:provided|attached) (?:video|audio) (?:clip|file|segment)\b/i.test(value)
     || /\btranscription of the (?:speech|audio|video)\b/i.test(value)
@@ -435,7 +411,7 @@ export function enforceTranscriptContract(text: string): TranscriptContractResul
       rejected.push({ reason: 'model_meta_prose', preview });
       continue;
     }
-    const labeled = /^[\p{Lu}]:\s/u.test(trimmed) || /(?:^|\s)[SO]:\s/.test(trimmed);
+    const labeled = /^[\p{Lu}]:\s/u.test(trimmed) || /(?:^|\s)[SOU]:\s/.test(trimmed);
     if (!labeled && UNLABELED_ENGLISH_PROSE.test(trimmed)) {
       rejected.push({ reason: 'unlabeled_english_prose', preview });
       continue;

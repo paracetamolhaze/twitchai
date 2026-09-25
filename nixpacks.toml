@@ -3,7 +3,7 @@ nixPkgs = ["nodejs_20", "ffmpeg", "streamlink"]
 
 [phases.install]
 cmds = [
-  "npm ci --include=dev"
+  "ONNXRUNTIME_NODE_INSTALL=skip npm ci --include=dev"
 ]
 
 [phases.build]

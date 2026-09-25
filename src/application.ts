@@ -40,6 +40,7 @@ import { ChatMessage, StreamBrainStatus, StreamEvent } from './stream-brain/type
 import { SpeechEventSynthesizer } from './stream-brain/speech-event-synthesizer';
 import { OpenRouterSceneDescriber, SceneWatcher } from './vision/scene-watcher';
 import { SpeechTranscriber } from './transcription/speech-transcriber';
+import { LocalSpeechPresence } from './transcription/speech-presence';
 import {
   GroqWhisperBackend,
   OpenRouterTranscriptionBackend,
@@ -397,6 +398,7 @@ export class Application {
     if (transcriptionMode !== 'live' && backend) {
       this.transcriber = new SpeechTranscriber({
         backend,
+        speechPresence: new LocalSpeechPresence(),
         logger: this.logger,
         vocabulary: () => {
           const snapshot = this.contextStore.snapshot();
@@ -715,7 +717,8 @@ export class Application {
     this.coordinator?.logSessionSummary('shutdown');
     await this.coordinator?.stop();
     await this.memory.stop();
-    this.transcriber?.flush();
+    this.transcriber?.reset();
+    this.sceneWatcher?.stop();
     this.speechEvents?.stop();
     this.personaDrive?.stop();
     await this.geminiBrain?.stopStream();
@@ -839,6 +842,8 @@ export class Application {
           const finalState = this.mediaOfflineGraceState;
           this.mediaOfflineGraceState = undefined;
           this.clearTranscriptAccumulator();
+          this.transcriber?.reset();
+          this.speechEvents?.stop();
           this.mediaStreaming = false;
           this.brainSessionReady = Promise.resolve();
           this.coordinator.clearPendingContexts();
@@ -1147,7 +1152,7 @@ export class Application {
   }
 
   private handleSpokenTranscript(text: string): void {
-    if (!text.trim()) return;
+    if (!text.trim() || this.paused || this.stopping || !this.mediaStreaming) return;
     // With Live retired this is the only thing that turns a stream into decisions, so the words
     // are paced into moments here rather than by a model watching alongside.
     this.speechEvents?.accept(text);
@@ -1423,6 +1428,9 @@ export class Application {
         this.coordinator.clearPendingContexts();
         this.coordinator.logSessionSummary('stopped_by_operator');
         this.clearTranscriptAccumulator();
+        this.transcriber?.reset();
+        this.speechEvents?.stop();
+        this.sceneWatcher?.stop();
         await this.perception.reconfigureMedia('', this.config.stream.visionFps);
         await this.geminiBrain?.stopStream();
         await this.botManager.stop();
@@ -1451,22 +1459,31 @@ export class Application {
     const mediaChanged = nextChannel !== this.config.twitch.channel || nextVisionFps !== this.config.stream.visionFps;
     if (mediaChanged) {
       const channelChanged = nextChannel !== this.config.twitch.channel;
-      if (channelChanged) await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
+      if (channelChanged) {
+        this.streamGeneration += 1;
+        this.mediaStreaming = false;
+        this.transcriber?.reset();
+        this.speechEvents?.stop();
+        this.sceneWatcher?.stop();
+        this.personaDrive?.stop();
+        this.clearTranscriptAccumulator();
+        this.coordinator.clearPendingContexts();
+        if (this.mediaOfflineGraceTimer) clearTimeout(this.mediaOfflineGraceTimer);
+        this.mediaOfflineGraceTimer = undefined;
+        this.mediaOfflineGraceState = undefined;
+        await this.geminiBrain?.stopStream();
+        await this.enqueueGlobalMemoryLifecycle(() => this.closeGlobalMemorySession('interrupted'));
+      }
       this.config.twitch.channel = nextChannel;
       this.config.stream.visionFps = nextVisionFps;
       this.contextStore.configure({ channel: nextChannel });
-      await this.perception.reconfigureMedia(nextChannel, nextVisionFps);
       if (channelChanged) {
         await this.botManager.reconfigureChannel(nextChannel);
         this.startCategoryMonitor();
       }
+      await this.perception.reconfigureMedia(this.paused ? '' : nextChannel, nextVisionFps);
       persisted.channel = nextChannel;
       persisted.visionFps = nextVisionFps;
-    }
-    if (mediaChanged && this.paused) {
-      // Editing the channel or the frame rate while stopped stores the new value; it must not be
-      // what quietly brings perception back up.
-      await this.perception.reconfigureMedia('', this.config.stream.visionFps);
     }
     this.runtimeSettings = { ...this.runtimeSettings, ...persisted };
     await this.repository.setSettings(persisted);

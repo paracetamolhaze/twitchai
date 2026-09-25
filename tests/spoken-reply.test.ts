@@ -10,6 +10,13 @@ const event: StreamEvent = {
 };
 
 describe('spoken reply attribution', () => {
+  it.each([
+    ['стяжками собери потом', 'S: Стяжками собери потом. Такими типа вот этими?'],
+    ['полотенцем протри перекладину', 'S: Полотенцем протри перекладину. Хорошая мысль, кстати.'],
+    ['кожу не обезжирил просто', 'S: Кожу не обжир- не обезжирил просто. Не обезжирил? Из-за этого типа?'],
+  ])('keeps the author of a short distinctive quote: %s', (text, speech) => {
+    expect(findSpokenReply({ ...event, speech }, [{ ...message, message: text }])?.username).toBe('karlbekner');
+  });
   it('matches a recent read-out without depending on punctuation or case', () => {
     expect(findSpokenReply(event, [{ ...message, message: message.message.toUpperCase() }])?.username).toBe('karlbekner');
   });
@@ -17,6 +24,7 @@ describe('spoken reply attribution', () => {
     expect(findSpokenReply({ ...event, speech: 'S: облака буду на клей крепить, сетку не хочу' }, [message])).toBeUndefined();
   });
   it('does not attribute quotes spoken by another person or across different speakers', () => {
+    expect(findSpokenReply({ ...event, speech: event.speech!.replace('S:', 'U:') }, [message])).toBeUndefined();
     expect(findSpokenReply({ ...event, speech: event.speech!.replace('S:', 'O:') }, [message])).toBeUndefined();
     expect(findSpokenReply({ ...event, speech: 'S: они на клей обычно O: идут или на сетку' }, [message])).toBeUndefined();
   });

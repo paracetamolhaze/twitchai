@@ -138,9 +138,10 @@ export class TwitchBotManager extends EventEmitter {
 
   async reconfigureChannel(channel: string): Promise<void> {
     if (channel === this.channel) return;
+    const wasRunning = this.running;
     await this.stop();
     this.channel = channel;
-    if (channel) await this.start();
+    if (channel && wasRunning) await this.start();
   }
 
   listStatuses(): BotAccountRecord[] { return [...this.bots.values()].map((bot) => structuredClone(bot.status)); }

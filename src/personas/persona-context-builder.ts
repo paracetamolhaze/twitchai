@@ -1,6 +1,7 @@
 import { ChatMessage, StreamEvent } from '../stream-brain/types';
 import { BrainPersonaSnapshot } from '../brain/types';
 import { isAccountClassificationQuestion } from '../shared/account-classification';
+import { hasLaughterDecoration } from '../reaction/naturalness-guard';
 import { PersonaFeedbackStore } from './feedback-store';
 import { PersonaMemory, relevanceScore, semanticTokens } from './persona-memory';
 import { PersonaRuntimeStore } from './persona-runtime-store';
@@ -176,7 +177,8 @@ export class PersonaContextBuilder {
     // payload is a marker that gets used, however it is labelled, so the literal laugh list is gone
     // (the canon keeps it; this describes how the person laughs instead), the duplicate is removed
     // from the vocabulary line, and examples that lead with a signature phrase are held back.
-    const favouriteExpressions = safeTexts(persona.speech.favoriteExpressions, 2);
+    const withoutLaughMarkers = (words: string[]): string[] => words.filter(word => !hasLaughterDecoration(`слово ${word}`));
+    const favouriteExpressions = safeTexts(withoutLaughMarkers(persona.speech.favoriteExpressions), 2);
     const signatures = new Set(favouriteExpressions.map(normalizedPhrase));
     const liveExamples = this.feedbackStore?.approvedExamplesFor(username) ?? [];
     const shapeExamples = selectShapeExamples(persona, 3, textFilter, liveExamples);
@@ -188,7 +190,7 @@ export class PersonaContextBuilder {
       persona.speech.capitalizationStyle,
       `сарказм ${persona.behavior.sarcasmLevel}, сленг ${persona.behavior.slangLevel}`,
       swearsHowMuch(persona.speech.profanityLevel),
-      `лексика: ${safeTexts(persona.speech.vocabulary.filter((word) => !signatures.has(normalizedPhrase(word))), 6).join(', ')}`,
+      `лексика: ${safeTexts(withoutLaughMarkers(persona.speech.vocabulary).filter((word) => !signatures.has(normalizedPhrase(word))), 6).join(', ')}`,
       `изредка, далеко не в каждом сообщении: ${favouriteExpressions.join(', ')}`,
       laughTendency(persona),
       `как выглядят его сообщения в среднем, не что писать: ${shapeExamples.join(' / ')}`,
@@ -578,7 +580,7 @@ function canonDocuments(persona: BotPersona): CanonDocument[] {
 function selectShapeExamples(persona: BotPersona, limit: number, filter: ModelTextFilter, liveExamples: string[] = []): string[] {
   const ordinary: string[] = [];
   const signature: string[] = [];
-  for (const example of [...liveExamples, ...persona.speech.messageExamples]) {
+  for (const example of [...liveExamples, ...persona.speech.messageExamples.filter(text => !hasLaughterDecoration(text))]) {
     (leadsWithSignature(example, persona) ? signature : ordinary).push(example);
   }
   const picked = selectDiverseExamples(ordinary, limit, filter);

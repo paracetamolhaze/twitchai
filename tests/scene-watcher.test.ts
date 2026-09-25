@@ -21,6 +21,16 @@ function watcher(describe_: (frame: Buffer, hint: string) => Promise<string | un
 const frame = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
 
 describe('SceneWatcher', () => {
+  it('does not publish an old frame after stop and forgets its scene for a new stream', async () => {
+    let finish!: (text: string) => void;
+    const { instance, scenes } = watcher(() => new Promise(resolve => { finish = resolve; }));
+    instance.acceptFrame(frame);
+    instance.stop();
+    finish('Старая сцена другого канала');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(scenes).toEqual([]);
+    expect(instance.currentScene()).toBeUndefined();
+  });
   it('describes the first frame at once instead of waiting out the interval', async () => {
     // Waiting a full interval to learn where we are means the first thing anyone says is answered
     // against nothing.

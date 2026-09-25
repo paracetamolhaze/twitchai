@@ -9,7 +9,8 @@ FROM node:22-bookworm-slim AS build
 WORKDIR /app
 # Only the manifests first, so a source-only change reuses the cached install layer.
 COPY package.json package-lock.json ./
-RUN npm ci --include=dev
+# Voice detection uses the bundled CPU runtime; do not download CUDA/TensorRT libraries.
+RUN ONNXRUNTIME_NODE_INSTALL=skip npm ci --include=dev
 COPY tsconfig.json tsconfig.test.json ./
 COPY src ./src
 RUN npm run build:backend
@@ -17,7 +18,7 @@ RUN npm run build:backend
 FROM node:22-bookworm-slim AS production-deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN ONNXRUNTIME_NODE_INSTALL=skip npm ci --omit=dev
 
 FROM node:22-bookworm-slim AS runtime
 WORKDIR /app

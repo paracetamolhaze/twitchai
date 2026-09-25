@@ -81,6 +81,14 @@ describe('TwitchBotManager isolation', () => {
     return { manager, clients, personas };
   }
 
+  it('changing channel while paused does not reconnect bots', async () => {
+    const { manager } = await setup([{ username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true }]);
+    await manager.stop();
+    await manager.reconfigureChannel('new-channel');
+    expect(manager.listStatuses().every(bot => !bot.chatConnected && bot.connectionState === 'DISCONNECTED')).toBe(true);
+    await manager.stop();
+  });
+
   it('ignores local self echoes and observes the reader through another connected account', async () => {
     const { manager, clients } = await setup([
       { username: 'gigantiuz', oauthToken: 'gigantiuz', enabled: true },
