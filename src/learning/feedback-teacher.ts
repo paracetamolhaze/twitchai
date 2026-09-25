@@ -56,7 +56,10 @@ const actionSchema = z.object({
   scopeType: z.enum(['global', 'persona', 'topic']),
   scopeKey: z.string().trim().max(80),
   rule: z.string().trim().max(MAX_RULE_CHARS),
-  rationale: z.string().trim().max(MAX_RATIONALE_CHARS),
+  // Explanatory UI copy is not an executable rule. Do not reject a whole paid batch
+  // merely because a provider exceeded the requested rationale length.
+  rationale: z.string().trim().transform((value) => value.length <= MAX_RATIONALE_CHARS
+    ? value : `${value.slice(0, MAX_RATIONALE_CHARS - 1).trimEnd()}…`),
   confidence: z.coerce.number().min(0).max(1),
   evidenceIds: z.array(z.string().trim().max(64)).max(MAX_CASES_PER_RUN),
 }).strict();
@@ -86,10 +89,10 @@ export const TEACHER_RESPONSE_SCHEMA = {
           ruleId: { type: 'string', description: 'Existing rule id for UPDATE_RULE/DISABLE_RULE. Empty string otherwise.' },
           scopeType: { type: 'string', enum: ['global', 'persona', 'topic'] },
           scopeKey: { type: 'string', description: 'Account username for persona scope, a short topic phrase for topic scope, empty for global.' },
-          rule: { type: 'string', description: 'Short functional imperative. Empty when not creating or rewording.' },
-          rationale: { type: 'string' },
+          rule: { type: 'string', description: 'Short functional imperative, at most 220 characters. Empty when not creating or rewording.' },
+          rationale: { type: 'string', description: 'One brief explanation, at most 300 characters.' },
           confidence: { type: 'number', minimum: 0, maximum: 1 },
-          evidenceIds: { type: 'array', items: { type: 'string' }, description: 'Feedback case ids from this batch that support the action.' },
+          evidenceIds: { type: 'array', items: { type: 'string' }, description: 'Unique feedback case ids from this batch that support the action.' },
         },
       },
     },
@@ -100,7 +103,7 @@ export const TEACHER_SYSTEM_INSTRUCTION = `You read a channel operator's own ver
 
 Each case carries the message, the operator's verdict (good or bad), an optional note in their own words, the moment it answered (what was said, what was on screen, who was being addressed), and — where it matters — that account's own interests, expertise and weak topics.
 
-Write rule and rationale fields in plain Russian so the channel operator can understand them. Keep schema keys and action identifiers unchanged.
+Write rule and rationale fields in plain Russian so the channel operator can understand them. Keep rule within 220 characters and rationale within 300 characters. Keep schema keys and action identifiers unchanged.
 
 Your job is to name the decision mistake, not the words. "Do not restate an opinion the stream has already expressed just to agree with it" is a rule. "Never say мощно" is not, and is never acceptable: a rule naming one phrase teaches nothing about the next phrase, and phrases quoted as forbidden come back as things to say. Write each rule as one short imperative about when to speak, what makes a message worth sending, or what to avoid concluding — generalizable to a message nobody has written yet.
 
@@ -416,7 +419,7 @@ export class FeedbackTeacher {
     this.logger.info('TEACHER_RESPONSE_RECEIVED', {
       ...diagnostic, parsed: true, schemaValid: true, actionCount: validated.data.actions.length,
     });
-    return { ok: true, payload, response };
+    return { ok: true, payload: validated.data, response };
   }
 
   /**

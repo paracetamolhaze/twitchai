@@ -91,6 +91,15 @@ async function harness(verdicts: MessageVerdictRecord[], options: HarnessOptions
 }
 
 describe('FeedbackTeacher batch learning', () => {
+  it('accepts a valid rule with an overlong display rationale without another paid retry', async () => {
+    const { teacher, client, policyStore, repository } = await harness([verdict({ id: 'case-1' })], {
+      actions: [action({ action: 'CREATE_RULE', rule: 'Не придумывай события', rationale: 'Пояснение '.repeat(55), confidence: 0.8, evidenceIds: ['case-1'] })],
+    });
+    expect((await teacher.runManually())?.created).toBe(1);
+    expect(client.create).toHaveBeenCalledTimes(1);
+    expect(policyStore.active()[0]?.rationale.length).toBeLessThanOrEqual(300);
+    expect(await repository.listUnprocessedMessageVerdicts(100)).toHaveLength(0);
+  });
   it('restores last outcome and cooldown after restart', async () => {
     vi.useFakeTimers();
     let saved: unknown;
