@@ -153,6 +153,54 @@ async function setup(
 afterEach(() => vi.useRealTimers());
 
 describe('single-session reaction protocol', () => {
+  it.each([
+    ['Обезжирить не забудь.', 'Обезжирить не забудь'],
+    ['Обезжирить не забудь.  ', 'Обезжирить не забудь'],
+    ['Сначала обезжирить. Потом клеить.', 'Сначала обезжирить. Потом клеить'],
+    ['Обезжирить не забудь?', 'Обезжирить не забудь?'],
+    ['Обезжирить не забудь!', 'Обезжирить не забудь!'],
+    ['Обезжирить не забудь...', 'Обезжирить не забудь...'],
+  ])('sends and records the same final punctuation for %s', async (input, expected) => {
+    vi.useFakeTimers();
+    const { coordinator, sent, history } = await setup();
+    await coordinator.prepareBrainEvent(event, 0);
+    await coordinator.submitBatch({ eventId: event.id, reactions: [
+      { username: 'bot-one', message: input, motive: 'advise', sourceType: 'event_observation' },
+    ] });
+    await vi.runAllTimersAsync();
+    expect(sent).toEqual([{ username: 'bot-one', message: expected }]);
+    expect((await history.recent('bot-one')).at(-1)?.message).toBe(expected);
+    await coordinator.stop();
+  });
+
+  it.each(['event_observation', 'chat_reply'])('keeps the author of a spoken quote available for the streamer clarification (%s), without question punctuation', async sourceType => {
+    vi.useFakeTimers();
+    let now = event.timestamp;
+    const { coordinator, sent, setCandidates } = await setup(true, () => now);
+    const message = 'они на клей обычно идут или на сетку';
+    await coordinator.prepareBrainEvent({ ...event, speech: 'S: хочу облака повесить, не понимаю как', summary: 'хочу облака повесить' }, 0);
+    await coordinator.submitBatch({ eventId: event.id, reactions: [{ username: 'bot-one', message, motive: 'ask', sourceType: 'event_observation' }] });
+    await vi.runAllTimersAsync();
+    expect(sent).toEqual([{ username: 'bot-one', message }]);
+    now += 29_000;
+    setCandidates([{ ...bot('bot-one', 0), lastReactionAt: now - 29_000 }, bot('bot-two', 1)]);
+    const prepared = await coordinator.prepareBrainEvent({ ...event, id: 'clarify-clouds', timestamp: now,
+      type: 'question', speech: 'S: А они на клей обычно идут или на сетку? Облака, ты имеешь в виду? Или что? Вот эти облака?',
+      summary: 'Стример уточняет про облака', audience: 'unclear',
+    }, now - 1);
+    expect(prepared.availableBots).toEqual(['bot-one']);
+    expect(prepared.event.directMentions).toEqual(['bot-one']);
+    expect(prepared.event.audience).toBe('twitch_chat');
+    const result = await coordinator.submitBatch({ eventId: 'clarify-clouds', reactions: [
+      { username: 'bot-one', message: 'да, про эти облака на потолок', motive: 'answer', sourceType },
+    ] });
+    expect(result.rejected).toEqual([]);
+    expect(result.accepted.map(item => item.username)).toEqual(['bot-one']);
+    await vi.runAllTimersAsync();
+    expect(sent.at(-1)?.message).toBe('да, про эти облака на потолок');
+    await coordinator.stop();
+  });
+
   it('does not send an accepted message after its event expires in the scheduler', async () => {
     vi.useFakeTimers();
     let now = event.timestamp;

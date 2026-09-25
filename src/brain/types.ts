@@ -114,6 +114,8 @@ export interface BrainDynamicDelta {
 }
 
 export interface BrainEventInput {
+  /** The streamer read this recently submitted message aloud. Continue as its author. */
+  streamerReplyTo?: { username: string; message: string; sentAt: number };
   triggerKind: 'external_stream_event';
   event: StreamEvent;
   availableBots: string[];

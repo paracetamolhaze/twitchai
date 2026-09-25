@@ -301,7 +301,10 @@ export class ReactionPolicyGuard {
   }
 }
 
-function normalizeMessage(value: string): string { return value.replace(/\s+/g, ' ').trim(); }
+function normalizeMessage(value: string): string {
+  // Operator style: drop a final full stop, preserving inner punctuation and ellipses.
+  return value.replace(/\s+/g, ' ').trim().replace(/(?<!\.)\.$/u, '').trimEnd();
+}
 function isClassificationEvent(trigger: ReactionTrigger): boolean {
   if (trigger.kind !== 'stream_event') return false;
   const { event } = trigger;

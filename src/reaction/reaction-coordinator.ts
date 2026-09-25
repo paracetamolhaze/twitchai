@@ -21,6 +21,7 @@ import { ChatCallKind, crowdResponseCeiling, detectChatCall, isConstrainedCall, 
 import { computeChatRegister } from '../stream-brain/chat-register';
 import { topicRelevance } from '../shared/topics';
 import { shortlistCandidates } from './candidate-shortlist';
+import { findSpokenReply } from './spoken-reply';
 import { emptyProvenancePools, ProvenancePools, ProvenanceVerdict, validateMotiveProvenance } from './motive-provenance';
 import { hasLaughterDecoration, isEventParaphrase, NaturalnessGuard, NaturalnessInput } from './naturalness-guard';
 import { PolicyBatchResult, ReactionPolicyGuard } from './reaction-policy-guard';
@@ -119,6 +120,9 @@ interface PendingDelivery {
  * same text: attributing the wrong one would be worse than attributing none.
  */
 interface RecentSend {
+  username: string;
+  message: string;
+  submitted: boolean;
   eventId: string;
   timedOut?: boolean;
   reactionId: string;
@@ -1187,6 +1191,14 @@ export class ReactionCoordinator extends EventEmitter {
   /** Builds the small delta sent to the stateful Brain. Full persona profiles live in bootstrap. */
   async prepareBrainEvent(event: StreamEvent, chatAfter: number, emittedAt = this.now()): Promise<BrainEventInput> {
     if (this.stopped) throw new Error('reaction_coordinator_stopped');
+    const spokenReply = findSpokenReply(event, this.recentSends.filter(send => send.submitted));
+    if (spokenReply) {
+      event = { ...event, type: 'direct_mention', directMentions: [spokenReply.username],
+        audience: 'twitch_chat', audienceConfidence: 0.95 };
+      this.logger.info('Streamer quoted a recent bot message', {
+        eventId: event.id, username: spokenReply.username, message: spokenReply.message,
+      });
+    }
     const snapshot = this.options.contextStore.snapshot();
     this.options.memory.recordEvent(event, snapshot);
     const allCandidates = this.options.candidates();
@@ -1211,6 +1223,7 @@ export class ReactionCoordinator extends EventEmitter {
     // «сколько стоит?» followed by silence when the price finally lands is not how a person who
     // just asked behaves. Busy-state and the global rate limit still apply.
     const recencyExempt = new Map<string, RecencyBypassReason>();
+    if (spokenReply) recencyExempt.set(spokenReply.username.toLowerCase(), 'direct_reply');
     const candidates = directTargets.size > 0
       ? named
       : named.filter((candidate) => {
@@ -1531,6 +1544,9 @@ export class ReactionCoordinator extends EventEmitter {
       // showing the model the answer key would let it cite sources it never actually used.
       ...(mindContext ? { mindContext: { guidance: mindContext.guidance, byPersona: mindContext.byPersona } } : {}),
       availableBots: offered.map((candidate) => candidate.username),
+      ...(spokenReply ? { streamerReplyTo: {
+        username: spokenReply.username, message: spokenReply.message, sentAt: spokenReply.sentAt,
+      } } : {}),
       recentAccountMessages: recentAccountMessages.filter((item) => item.messages.length > 0),
       recalledMemories: recalledMemories.filter((item) => item.memories.length > 0),
       candidateStates: offered.map((candidate) => {
@@ -1770,6 +1786,8 @@ export class ReactionCoordinator extends EventEmitter {
         return;
       }
       const sentAt = sendResult.submittedAt;
+      const rememberedSend = this.recentSends.find(send => send.reactionId === plan.reactionId);
+      if (rememberedSend) { rememberedSend.submitted = true; rememberedSend.sentAt = sentAt; }
       // Read just before flipping hasSentAiMessage, so a message that turns out to be the first one
       // this session ever lands still gets its age recorded — after onMessageSent() runs, this would
       // already read hasSentAiMessage: true and the moment would be gone.
@@ -1871,7 +1889,8 @@ export class ReactionCoordinator extends EventEmitter {
   }
 
   private rememberSend(eventId: string, reactionId: string, username: string, message: string, sentAt: number): void {
-    this.recentSends.push({ eventId, reactionId, key: deliveryKey(username, message), sentAt, attributed: false });
+    this.recentSends.push({ eventId, reactionId, username, message, submitted: false,
+      key: deliveryKey(username, message), sentAt, attributed: false });
     if (this.recentSends.length > RECENT_SEND_LIMIT) {
       this.recentSends.splice(0, this.recentSends.length - RECENT_SEND_LIMIT);
     }
