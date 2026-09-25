@@ -152,6 +152,24 @@ describe('fixture J — a knowledge-driven question the stream never suggested',
 });
 
 describe('fixture B — a knowledge gap becomes knowledge when the stream answers it', () => {
+  it('does not turn a generic desire to try food into an answered question because somebody said try and a number', async () => {
+    const curious = mind('food_guy', {
+      curiosities: [{ id: 'c1', topic: 'пицца', question: 'интересно попробовать: пицца', status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW }],
+    });
+    const { store } = await storeWith([curious]);
+    await store.observeEvent(streamEvent({ speech: 'попробовать? Тайки будут 155. Снайпер опять убежал', summary: 'попробовать? Тайки будут 155. Снайпер опять убежал' }), ['food_guy']);
+    expect(store.byUsername('food_guy')?.curiosities[0]?.status).toBe('open');
+    expect(store.byUsername('food_guy')?.knowledge).toEqual([]);
+  });
+
+  it('does not take a number in a separate sentence as the answer to a price question', async () => {
+    const curious = mind('pc_guy', {
+      curiosities: [{ id: 'c1', topic: 'компьютерный клуб', question: 'сколько стоит час в компьютерном клубе', status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW }],
+    });
+    const { store } = await storeWith([curious]);
+    await store.observeEvent(streamEvent({ speech: 'S: Сколько стоит час в компьютерном клубе? Не знаю. Сегодня 30 зрителей', summary: '' }), ['pc_guy']);
+    expect(store.byUsername('pc_guy')?.curiosities[0]?.status).toBe('open');
+  });
   it('closes the curiosity, records the sourced fact, and opens a callback the person can use later', async () => {
     const curious = mind('pc_guy', {
       curiosities: [{ id: 'c1', topic: 'цены в компьютерном клубе в Китае', question: 'сколько стоит час в компьютерном клубе', status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW }],

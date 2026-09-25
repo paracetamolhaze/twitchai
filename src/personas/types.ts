@@ -275,6 +275,7 @@ export interface PersonaDisclosure {
 export interface BotPersona {
   schemaVersion: typeof PERSONA_SCHEMA_VERSION;
   generationVersion: number;
+  conversationRevision?: number;
   source: PersonaSource;
   generatedFromUsername?: string;
   manuallyEdited: boolean;

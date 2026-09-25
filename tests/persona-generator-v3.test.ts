@@ -78,7 +78,7 @@ describe('Deep Persona Generator v3', () => {
       relatives: { min: 3 },
       timelineEvents: { min: 5 },
       facts: { min: 6 },
-      opinions: { min: 5 },
+      opinions: { min: 6 },
     });
     expect(report.structureRanges.speechExamples!.min).toBeGreaterThanOrEqual(15);
     expect(report.countryOfBirthDistribution).toMatchObject({ Казахстан: 3, Беларусь: 3, Таджикистан: 1 });

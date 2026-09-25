@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { refineConversation } from './conversation-refinements';
 import { personaSchema } from './schema';
 import { PERSONA_BLUEPRINTS, PersonaBlueprint } from './generator-v3-data';
 import { BotPersona, PERSONA_GENERATION_VERSION, PERSONA_SCHEMA_VERSION } from './types';
@@ -21,7 +22,7 @@ export function generatePersonaV3(username: string, options: GeneratePersonaV3Op
     ? `${blueprint.firstName} «${blueprint.preferredName}» · ${normalized}`
     : `${blueprint.firstName} · ${normalized}`;
 
-  return personaSchema.parse({
+  return personaSchema.parse(refineConversation(personaSchema.parse({
     schemaVersion: PERSONA_SCHEMA_VERSION,
     generationVersion: PERSONA_GENERATION_VERSION,
     source: 'generated',
@@ -90,7 +91,7 @@ export function generatePersonaV3(username: string, options: GeneratePersonaV3Op
     disclosure: structuredClone(blueprint.disclosure),
     streamerRelationship: structuredClone(blueprint.streamerRelationship),
     relationships: [],
-  });
+  })));
 }
 
 export function personaGenerationFingerprint(persona: BotPersona): string {

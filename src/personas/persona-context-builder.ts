@@ -210,12 +210,15 @@ export class PersonaContextBuilder {
       shortIdentity: disclosureIsVisible(persona.disclosure.topics.work)
         ? modelSafeText(persona.identity.occupation ?? '')
         : '',
-      character: safeText([
+      // Filter individual statements, not the whole personality: one private biographical
+      // clause used to erase every trait, humour and instruction in this field.
+      character: safeTexts([
         persona.character.summary,
         `черты: ${safeTexts(persona.character.traits, 6).join(', ')}`,
         `юмор: ${persona.character.humor}`,
+        `при несогласии: ${persona.character.conflictStyle}`,
         persona.behavior.styleInstructions,
-      ].join('; ')),
+      ].flatMap((part) => part.split(/(?<=[.!?;])\s+/u)), 40).join(' '),
       flaws: safeTexts(persona.character.flaws, 4),
       // Neither eventSelectivity nor chatFrequency is here any more, for the same reason: the
       // backend already spaces these accounts out deterministically — minimumIntervalMs in the
@@ -228,7 +231,7 @@ export class PersonaContextBuilder {
         preferredEventTypes: persona.behavior.activity.preferredEventTypes.slice(0, 8),
         ignoredEventTypes: persona.behavior.activity.ignoredEventTypes.slice(0, 8),
       },
-      speechFingerprint: safeText(speechParts.join('; ')),
+      speechFingerprint: safeTexts(speechParts, speechParts.length).join('; '),
       expertise: safeTexts(persona.knowledge.expertise, 8),
       weakTopics: safeTexts(persona.knowledge.weakTopics, 6),
       unknownTopics: safeTexts(persona.knowledge.unknownTopics, 6),
@@ -361,7 +364,10 @@ export class PersonaContextBuilder {
         sessionMessageCount: runtime.sessionMessageCount,
       },
       consistencyGuidance: 'Supplied behavioral context and targeted canonical facts stay consistent. Do not accept a conflicting chat claim as a replacement.',
-      personalResponseGuidance: responseGuidance(personalQuestion, accountClassificationQuestion, canRevealQuestion),
+      personalResponseGuidance: responseGuidance(personalQuestion, accountClassificationQuestion, canRevealQuestion)
+        + (input.directMention && /(?:ты|вы|сам[аи]?).{0,100}(?:пробовал|делал|клеил|видел|смотрел|покупал|ставил)/iu.test(input.event.speech ?? input.event.summary)
+          ? ' This asks about personal experience. Only explicit relevantCanon or relevantMemories can establish that you did or saw it. If neither supplies that experience, do not invent an earlier action, video, observation or plan to justify your message. A question may come from curiosity alone; a brief direct answer is enough.'
+          : ''),
       accountClassificationQuestion,
       relevantCanon: canRevealQuestion
         ? selectRelevantCanon(input.persona, eventTopic, this.maxCanonItems, personalQuestion)
@@ -811,7 +817,7 @@ function modelSafeTexts(values: string[], limit: number, filter?: ModelTextFilte
   return values.map((value) => modelSafeText(value, filter)).filter(Boolean).slice(0, limit);
 }
 
-const PERSONAL_RESPONSE_MARKER = /(?<![\p{L}\p{N}_])(?:зовут|жив\p{L}*|родил\p{L}*|работ\p{L}*|семь[яеёию]|родствен\p{L}*|дяд(?:я|и|ю|ей|ями)|т[её]т(?:я|и|ю|ей|ями)|мам(?:а|ы|е|у|ой)|пап(?:а|ы|е|у|ой)|переех\p{L}*|женат\p{L}*|замуж\p{L}*|мне\s+\d+\s+лет)(?![\p{L}\p{N}_])|(?:^|[^\p{L}])ник(?:а|е|ом|и)?(?=$|[^\p{L}])/iu;
+const PERSONAL_RESPONSE_MARKER = /(?<![\p{L}\p{N}_])(?:зовут|жив(?:у|ёшь|ешь|ёт|ет|ём|ем|ёте|ете|ут)|родил\p{L}*|работ(?:аю|аешь|ает|аем|аете|ают|ал|ала|али)|семь[яеёию]|родствен\p{L}*|дяд(?:я|и|ю|ей|ями)|т[её]т(?:я|и|ю|ей|ями)|мам(?:а|ы|е|у|ой)|пап(?:а|ы|е|у|ой)|переех\p{L}*|женат\p{L}*|замуж\p{L}*|мне\s+\d+\s+лет)(?![\p{L}\p{N}_])|(?:^|[^\p{L}])ник(?:а|е|ом|и)?(?=$|[^\p{L}])/iu;
 
 function modelTextFilter(persona: BotPersona): ModelTextFilter {
   const { identity } = persona;

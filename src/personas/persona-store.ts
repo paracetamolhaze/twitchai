@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { refineConversation } from './conversation-refinements';
 import { AppRepository } from '../persistence/repository';
 import { personaTemplateForUsername } from './defaults';
 import { generatePersonaV3 } from './generator-v3';
@@ -76,7 +77,12 @@ export class PersonaStore {
     for (const persona of this.personas.values()) {
       persona.relationships = persona.relationships.filter((relationship) =>
         relationship.targetPersonaId !== persona.id && this.personas.has(relationship.targetPersonaId));
-      await this.persist(persona);
+      const refined = refineConversation(persona);
+      if (refined !== persona) {
+        await this.backup(persona, this.accountByPersonaId.get(persona.id) ?? persona.generatedFromUsername ?? '', 'conversation-quality-revision-1');
+        this.personas.set(refined.id, personaSchema.parse(refined));
+      }
+      await this.persist(refined);
     }
   }
 

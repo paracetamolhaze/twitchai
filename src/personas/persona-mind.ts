@@ -3,6 +3,8 @@ import { topicRelevance } from '../shared/topics';
 import { relevanceScore, semanticTokens } from './persona-memory';
 import { StreamEvent } from '../stream-brain/types';
 import { BotPersona } from './types';
+import { concreteAnswer } from './mind-evidence';
+import { CONVERSATION_REVISIONS } from './conversation-refinements';
 
 /**
  * The dynamic half of a person, kept apart from the authored canon on purpose.
@@ -95,6 +97,11 @@ export interface PersonaMindRecord {
   moment: MindMoment;
   createdAt: number;
   updatedAt: number;
+  /** Originals retained for recovery; never supplied as model context. */
+  quarantinedLearning?: Array<{ curiosity: MindCuriosity; knowledge: MindKnowledge[]; loops: MindOpenLoop[] }>;
+  learningRevision?: number;
+  lifeRevision?: number;
+  retiredLife?: MindLifeConcern[];
 }
 
 /** The raw entries actually shown to the Brain for one candidate, categorized by source type —
@@ -408,6 +415,11 @@ export class PersonaMindStore {
   async load(): Promise<void> {
     this.byName.clear();
     for (const record of await this.repository.listPersonaMinds()) {
+      if ((record.learningRevision ?? 0) < 1) {
+        quarantineUnsupportedLearning(record);
+        record.learningRevision = 1;
+        await this.repository.savePersonaMind(record);
+      }
       this.byName.set(record.username.toLowerCase(), record);
     }
     this.logger.info('PERSONA_MINDS_LOADED', { minds: this.byName.size });
@@ -421,7 +433,30 @@ export class PersonaMindStore {
   async ensureSeeded(candidates: Array<{ username: string; persona: BotPersona }>): Promise<number> {
     let seeded = 0;
     for (const { username, persona } of candidates) {
-      if (this.byName.has(username.toLowerCase())) continue;
+      const existing = this.byName.get(username.toLowerCase());
+      if (existing) {
+        const before = JSON.stringify(existing);
+        const canonKnowledge = seedMind(persona, username, this.now()).knowledge;
+        existing.knowledge = [
+          ...existing.knowledge.filter((item) => item.sourceEventId),
+          ...canonKnowledge.filter((item) => !existing.knowledge.some((old) => old.sourceEventId && old.topic === item.topic))
+            .map((item) => existing.knowledge.find((old) => !old.sourceEventId && old.topic === item.topic && old.state === item.state) ?? item),
+        ].slice(0, MAX_KNOWLEDGE);
+        if ((existing.lifeRevision ?? 0) < 1 && CONVERSATION_REVISIONS[username]?.life) {
+          const oldTemplates = new Set(['на работе снова плотные дни', 'копятся бытовые дела', 'что-то из техники начало барахлить', 'зовут встретиться на выходных', 'прикидывает планы на следующий месяц']);
+          const random = seededRandom(`${username}:life-revision-1`);
+          for (let index = 0; index < existing.life.length; index += 1) {
+            const old = existing.life[index]!;
+            if (!oldTemplates.has(old.concern)) continue;
+            (existing.retiredLife ??= []).push(structuredClone(old));
+            const replacement = renewalConcern(random, this.now(), existing);
+            existing.life[index] = { ...old, concern: replacement.concern, kind: replacement.kind };
+          }
+          existing.lifeRevision = 1;
+        }
+        if (JSON.stringify(existing) !== before) await this.repository.savePersonaMind(existing);
+        continue;
+      }
       const record = seedMind(persona, username, this.now());
       await this.repository.savePersonaMind(record);
       this.byName.set(username.toLowerCase(), record);
@@ -606,11 +641,10 @@ export class PersonaMindStore {
       considered: 0, observed: 0, memoryWrites: 0, knowledgeUpdates: 0, loopsResolved: 0,
       observedUsernames: [],
     };
-    const speechText = [event.speech, event.summary].filter(Boolean).join(' ');
+    const speechText = event.speech ?? '';
     if (!speechText) return stats;
     const fullText = [speechText, event.visualContext, event.gameContext].filter(Boolean).join(' ');
     const lowerText = fullText.toLowerCase();
-    const hasConcreteFact = /\d/.test(speechText);
     const mentioned = new Set(event.directMentions.map((name) => name.toLowerCase()));
     const now = this.now();
 
@@ -641,14 +675,14 @@ export class PersonaMindStore {
         // note inside their DOMAIN knowledge — the canonical topic alias plus any digit was enough.
         // A world fact heard on stream may resolve a curiosity only when it actually bears on what
         // the person was wondering; a topical mention with numbers in it merely keeps it fresh.
-        const answersTheQuestion = topicRelevance(speechText, curiosity.question) >= MIN_RELEVANCE;
-        if (!hasConcreteFact || !answersTheQuestion) {
+        const answer = concreteAnswer(curiosity.question, speechText);
+        if (!answer) {
           // The topic came up but the question was not answered: the curiosity stays open, fresher.
           curiosity.updatedAt = now;
           changed = true;
           continue;
         }
-        const heard = excerpt(speechText);
+        const heard = excerpt(answer, 360);
         curiosity.status = 'answered';
         curiosity.answer = heard;
         curiosity.sourceEventId = event.id;
@@ -677,8 +711,7 @@ export class PersonaMindStore {
       // it aloud — the viewer who wondered about the price resolves the loop when anyone answers.
       for (const loop of mind.openLoops) {
         if (loop.status !== 'open' || loop.kind !== 'question_pending') continue;
-        if (!hasConcreteFact) continue;
-        if (topicRelevance(speechText, loop.text) < relevanceFloor) continue;
+        if (!concreteAnswer(loop.text, speechText)) continue;
         loop.status = 'resolved';
         loop.updatedAt = now;
         stats.loopsResolved += 1;
@@ -762,7 +795,7 @@ export class PersonaMindStore {
         // new concern, and a day where nothing happened is a valid day — the V1 version spawned
         // one the moment the list emptied, which made every quiet week instantly busy again.
         // Seeded by (username, day), so the same restart replays the same quiet days.
-        mind.life.push(renewalConcern(random, now));
+        mind.life.push(renewalConcern(random, now, mind));
         changed = true;
       }
 
@@ -827,6 +860,9 @@ export class PersonaMindStore {
     lastMotives: MotiveRecord[];
     seedVersion: number;
     updatedAt: number;
+    quarantinedLearningCount: number;
+    learningRevision: number;
+    lifeRevision: number;
   }> {
     return [...this.byName.values()]
       .sort((left, right) => left.username.localeCompare(right.username))
@@ -841,6 +877,9 @@ export class PersonaMindStore {
         lastMotives: this.lastMotives(mind.username),
         seedVersion: mind.seedVersion,
         updatedAt: mind.updatedAt,
+        quarantinedLearningCount: mind.quarantinedLearning?.length ?? 0,
+        learningRevision: mind.learningRevision ?? 0,
+        lifeRevision: mind.lifeRevision ?? 0,
       }));
   }
 
@@ -849,7 +888,7 @@ export class PersonaMindStore {
   }
 }
 
-function renewalConcern(random: () => number, now: number): MindLifeConcern {
+function renewalConcern(random: () => number, now: number, mind: PersonaMindRecord): MindLifeConcern {
   const templates: Array<{ kind: MindLifeConcern['kind']; concern: string }> = [
     { kind: 'work', concern: 'на работе снова плотные дни' },
     { kind: 'errand', concern: 'копятся бытовые дела' },
@@ -857,7 +896,10 @@ function renewalConcern(random: () => number, now: number): MindLifeConcern {
     { kind: 'social', concern: 'зовут встретиться на выходных' },
     { kind: 'plan', concern: 'прикидывает планы на следующий месяц' },
   ];
-  const template = pick(random, templates);
+  const personal = CONVERSATION_REVISIONS[mind.username]?.life ?? [];
+  const fresh = personal.filter((concern) => !mind.life.some((item) => item.concern === concern));
+  const concern = fresh.length ? pick(random, fresh) : undefined;
+  const template = concern ? { kind: personalConcernKind(concern), concern } : pick(random, templates);
   return {
     id: `life-${Math.floor(random() * 1e9).toString(36)}`,
     concern: template.concern,
@@ -867,6 +909,32 @@ function renewalConcern(random: () => number, now: number): MindLifeConcern {
     startedAt: now,
     updatedAt: now,
   };
+}
+
+function personalConcernKind(concern: string): MindLifeConcern['kind'] {
+  if (/семь|близк|встре|разговор/u.test(concern)) return 'social';
+  if (/покуп|перифер|мыш/u.test(concern)) return 'device';
+  if (/домаш|дома|стол|инструмент|файл/u.test(concern)) return 'home';
+  if (/учеб/u.test(concern)) return 'work';
+  return 'plan';
+}
+
+function quarantineUnsupportedLearning(mind: PersonaMindRecord): void {
+  for (const curiosity of mind.curiosities) {
+    if (curiosity.status !== 'answered' || !curiosity.answer || !curiosity.sourceEventId
+      || concreteAnswer(curiosity.question, curiosity.answer)) continue;
+    const knowledge = mind.knowledge.filter((item) => item.sourceEventId === curiosity.sourceEventId && item.topic === curiosity.topic);
+    const sharedValidSource = mind.curiosities.some((other) => other !== curiosity
+      && other.sourceEventId === curiosity.sourceEventId && other.answer && concreteAnswer(other.question, other.answer));
+    const loops = sharedValidSource ? [] : mind.openLoops.filter((item) => item.kind === 'callback'
+      && item.id.startsWith(`loop-${curiosity.sourceEventId!.slice(0, 8)}-`));
+    (mind.quarantinedLearning ??= []).push({ curiosity: structuredClone(curiosity), knowledge: structuredClone(knowledge), loops: structuredClone(loops) });
+    mind.knowledge = mind.knowledge.filter((item) => !knowledge.includes(item));
+    mind.openLoops = mind.openLoops.filter((item) => !loops.includes(item));
+    curiosity.status = 'open';
+    delete curiosity.answer;
+    delete curiosity.sourceEventId;
+  }
 }
 
 function upsertKnowledge(mind: PersonaMindRecord, entry: MindKnowledge): void {

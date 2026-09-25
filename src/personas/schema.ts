@@ -138,6 +138,7 @@ export const personaBehaviorSchema = z.object({
 export const personaSchema: z.ZodType<BotPersona> = z.object({
   schemaVersion: z.literal(PERSONA_SCHEMA_VERSION),
   generationVersion: z.number().int().min(0).max(10_000),
+  conversationRevision: z.number().int().min(0).max(10_000).optional(),
   source: z.enum(['generated', 'manual']),
   generatedFromUsername: optionalText(100),
   manuallyEdited: z.boolean(),
@@ -213,6 +214,7 @@ export function upgradePersona(input: unknown, fallbackIndex = 0): BotPersona {
   const persona: BotPersona = {
     schemaVersion: PERSONA_SCHEMA_VERSION,
     generationVersion: integer(raw.generationVersion, 0, 0, 10_000),
+    ...(typeof raw.conversationRevision === 'number' ? { conversationRevision: integer(raw.conversationRevision, 0, 0, 10_000) } : {}),
     source: raw.source === 'generated' ? 'generated' : 'manual',
     ...optional('generatedFromUsername', textOrUndefined(raw.generatedFromUsername)),
     manuallyEdited: typeof raw.manuallyEdited === 'boolean' ? raw.manuallyEdited : true,
