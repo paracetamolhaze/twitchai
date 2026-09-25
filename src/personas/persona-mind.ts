@@ -964,6 +964,10 @@ function quarantineUnsupportedLearning(mind: PersonaMindRecord): void {
 }
 
 function upsertKnowledge(mind: PersonaMindRecord, entry: MindKnowledge): void {
+  // A channel-local observation must not shadow authored expertise. The heard quote is
+  // already stored as a channel-local callback; competence remains part of the canon.
+  if (mind.knowledge.some((item) => item.topic === entry.topic && !item.sourceEventId
+    && (item.state === 'knows_well' || item.state === 'knows_somewhat'))) return;
   const existing = mind.knowledge.find((item) => item.topic === entry.topic && item.channel === entry.channel);
   if (existing) {
     // Hearing a concrete fact upgrades ignorance, never downgrades expertise: someone who already

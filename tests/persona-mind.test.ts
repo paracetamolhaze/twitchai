@@ -63,11 +63,11 @@ function mind(username: string, overrides: Partial<PersonaMindRecord> = {}): Per
   };
 }
 
-async function storeWith(minds: PersonaMindRecord[], now: () => number = () => NOW) {
+async function storeWith(minds: PersonaMindRecord[], now: () => number = () => NOW, channel?: () => string) {
   const repository = new MemoryRepository();
   await repository.initialize();
   for (const record of minds) await repository.savePersonaMind(record);
-  const store = new PersonaMindStore(repository, logger, now);
+  const store = new PersonaMindStore(repository, logger, now, channel);
   await store.load();
   return { store, repository };
 }
@@ -538,7 +538,7 @@ describe('finding 7 — a heard world fact is not domain knowledge', () => {
     expect(store.byUsername('pc_guy')?.curiosities[0]?.status).toBe('answered');
   });
 
-  it('hearing a fact never downgrades real expertise, and the note names its source', async () => {
+  it.each([undefined, 'first'])('hearing a fact never downgrades expertise with channel %s', async (channel) => {
     const expert = mind('expert', {
       knowledge: [{ topic: 'цены в компьютерном клубе', state: 'knows_well', updatedAt: NOW }],
       curiosities: [{
@@ -546,7 +546,7 @@ describe('finding 7 — a heard world fact is not domain knowledge', () => {
         status: 'open', strength: 0.9, createdAt: NOW, updatedAt: NOW,
       }],
     });
-    const { store } = await storeWith([expert]);
+    const { store } = await storeWith([expert], () => NOW, channel ? () => channel : undefined);
     await store.observeEvent(streamEvent({
       summary: 'S: час в компьютерном клубе стоит 30 юаней',
       speech: 'S: час в компьютерном клубе стоит 30 юаней',
